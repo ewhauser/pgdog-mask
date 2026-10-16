@@ -14,7 +14,7 @@ Postgres then computes the masked values, so filters, sorting and aggregates can
 
 ## Requirements
 
-The plugin uses PgDog's plugin API 0.7 (statement, error and catalog hooks), which lives on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`) until it's upstream. `Cargo.toml` pins `pgdog-plugin` to a commit there.
+The plugin uses PgDog's plugin API 0.7 (statement, mask, error and catalog hooks), which is only on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`). It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form. `Cargo.toml` pins `pgdog-plugin` to a commit there.
 
 PgDog only loads plugins with the same plugin API version that were built by the same Rust compiler. Build PgDog from the pinned commit with the same toolchain as this plugin. `rust-toolchain.toml` matches PgDog's.
 

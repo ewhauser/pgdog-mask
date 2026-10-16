@@ -18,10 +18,12 @@ hero:
 ---
 
 :::caution[Requires a PgDog fork]
-pgdog-mask uses PgDog's plugin API 0.7, which is on the
+pgdog-mask uses PgDog's plugin API 0.7, which is only on the
 [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api)
-fork until it's merged upstream. Build PgDog from the commit pgdog-mask pins.
-See [compatibility](./reference/compatibility/).
+fork. It has been proposed upstream in
+[pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but
+there's no guarantee it will be accepted, or accepted in this form. Build
+PgDog from the commit pgdog-mask pins. See [compatibility](./reference/compatibility/).
 :::
 
 ## Masking that holds up against real SQL
