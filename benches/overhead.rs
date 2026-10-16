@@ -1,13 +1,13 @@
 //! Per-statement overhead of the masking plugin.
 //!
-//! `cargo bench -p pgdog-masking --bench overhead`
+//! `cargo bench -p pgdog-mask --bench overhead`
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pgdog_masking::config::Config;
-use pgdog_masking::engine::Engine;
+use pgdog_mask::config::Config;
+use pgdog_mask::engine::Engine;
 use pgdog_plugin::{Identity, StatementContext, StatementKind};
 use serde_json::{Value, json};
 

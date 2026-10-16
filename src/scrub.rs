@@ -54,7 +54,7 @@ pub fn scrub_detail(body: &[u8]) -> Option<Vec<u8>> {
 
 /// Replacement for a message that couldn't be parsed.
 fn malformed() -> Vec<u8> {
-    b"SERROR\0VERROR\0CXX000\0Merror details removed by pgdog_masking\0\0".to_vec()
+    b"SERROR\0VERROR\0CXX000\0Merror details removed by pgdog_mask\0\0".to_vec()
 }
 
 #[cfg(test)]

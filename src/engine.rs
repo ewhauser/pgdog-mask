@@ -280,7 +280,7 @@ impl Engine {
         let policies = Policies::new(config)?;
         let epoch = self.settings.load().epoch + 1;
         info!(
-            "[pgdog_masking] loaded {} policies, {} masked columns (mode: {:?})",
+            "[pgdog_mask] loaded {} policies, {} masked columns (mode: {:?})",
             policies.config.policies.len(),
             policies.config.masked_columns.len(),
             policies.config.general.mode,
@@ -302,7 +302,7 @@ impl Engine {
         match self.load(&path) {
             Ok(()) => true,
             Err(err) => {
-                error!("[pgdog_masking] failed to reload {}: {err}", path.display());
+                error!("[pgdog_mask] failed to reload {}: {err}", path.display());
                 false
             }
         }
@@ -313,7 +313,7 @@ impl Engine {
         let catalog = match Catalog::from_json(snapshot) {
             Ok(catalog) => Arc::new(catalog),
             Err(err) => {
-                error!("[pgdog_masking] failed to parse schema for \"{database}\": {err}");
+                error!("[pgdog_mask] failed to parse schema for \"{database}\": {err}");
                 return;
             }
         };
@@ -325,7 +325,7 @@ impl Engine {
                 &assignments.database_tags,
             ) {
                 warn!(
-                    "[pgdog_masking] tag \"{tag}\" was removed from column {schema}.{table}.{column} in database \"{database}\"; it's no longer masked by that tag"
+                    "[pgdog_mask] tag \"{tag}\" was removed from column {schema}.{table}.{column} in database \"{database}\"; it's no longer masked by that tag"
                 );
             }
         }
@@ -549,7 +549,7 @@ fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) 
         } => {
             if !raw.is_empty() {
                 info!(
-                    "[pgdog_masking] user \"{}\" searched raw values of {:?}",
+                    "[pgdog_mask] user \"{}\" searched raw values of {:?}",
                     user, raw
                 );
             }
@@ -565,7 +565,7 @@ fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) 
         } => {
             if !raw.is_empty() {
                 info!(
-                    "[pgdog_masking] user \"{}\" searched raw values of {:?}",
+                    "[pgdog_mask] user \"{}\" searched raw values of {:?}",
                     user, raw
                 );
             }
@@ -607,9 +607,9 @@ impl Engine {
 /// mode, where logging them is the point.
 fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: bool) -> Decision {
     let prefix = if shadow {
-        "[pgdog_masking] (shadow)"
+        "[pgdog_mask] (shadow)"
     } else {
-        "[pgdog_masking]"
+        "[pgdog_mask]"
     };
     match &decision {
         Decision::Rewrite { .. } => {

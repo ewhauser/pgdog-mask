@@ -1,6 +1,6 @@
-# pgdog-masking
+# pgdog-mask
 
-Dynamic data masking for PgDog, modeled on Snowflake's dynamic data masking. Design: [docs/DATA_MASKING.md](../../docs/DATA_MASKING.md).
+Dynamic data masking for [PgDog](https://github.com/pgdogdev/pgdog), modeled on Snowflake's dynamic data masking. Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 For PgDog users with masking policies, the plugin parses each statement before PgDog does. It then resolves every column reference to `schema.table.column`, and replaces each reference to a masked column with the policy's mask expression. This applies wherever the reference appears:
 - the select list, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY` and window clauses;
@@ -10,12 +10,27 @@ For PgDog users with masking policies, the plugin parses each statement before P
 
 Postgres then computes the masked values, so filters, sorting and aggregates can't reveal the real ones. Users whose policies mask nothing are passed through untouched.
 
+## Requirements
+
+The plugin uses PgDog's plugin API 0.6 (statement, transform and schema hooks), which lives on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`) until it's upstream. `Cargo.toml` pins `pgdog-plugin` to a commit there.
+
+PgDog only loads plugins with the same plugin API version that were built by the same Rust compiler. Build PgDog from the pinned commit with the same toolchain as this plugin. `rust-toolchain.toml` matches PgDog's.
+
+## Building
+
+```bash
+cargo build --release
+# target/release/libpgdog_mask.so (Linux) or libpgdog_mask.dylib (macOS)
+```
+
+Put the library where PgDog can `dlopen` it, such as `LD_LIBRARY_PATH` or a system library path, or give its full path as the plugin `name`.
+
 ## Enabling
 
 ```toml
 # pgdog.toml
 [[plugins]]
-name = "pgdog_masking"
+name = "pgdog_mask"
 config = "masking.toml"
 required = true   # never serve traffic without masking
 ```
@@ -132,11 +147,18 @@ All of these fail closed with SQLSTATE `42501`:
 
 ## Tests
 
+Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database. Override these with the usual `PG*` variables.
+
 ```bash
-cargo test -p pgdog-masking            # unit tests + canary leak tests (needs Postgres)
-bash integration/masking/run.sh        # end-to-end through PgDog
-bash integration/masking/compat.sh     # Go drivers and ORMs (pgx, pq, gorm) with every user masked
+cargo test                       # unit tests + canary leak tests
+bash integration/run.sh          # end-to-end through PgDog
+bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, gorm) with every user masked
+bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin
 ```
+
+The integration scripts build PgDog from the repository and commit `pgdog-plugin` is pinned to in `Cargo.toml`, in `target/pgdog/<commit>`. Set `PGDOG_BIN` to use your own build instead.
+- `compat.sh` also uses PgDog's integration suites and needs its databases (`integration/setup.sh` in PgDog's repository).
+- `bench.sh` needs `pgbench -i -s 20 masking_bench` and `integration/bench/setup.sql`.
 
 `compat.sh` runs the Go integration suites through PgDog with every user masked, so every statement the drivers send is analyzed. Results should match `integration/go/run.sh`, which runs without the plugin.
 
@@ -144,7 +166,7 @@ The canary tests seed masked columns with unique values, run an adversarial corp
 
 ## Performance
 
-Decisions are cached per statement and masking profile, and statements that differ only in their literals share one analysis (statement shapes), so simple-protocol clients that inline values don't re-analyze every statement. Per statement, measured with `cargo bench -p pgdog-masking --bench overhead`:
+Decisions are cached per statement and masking profile, and statements that differ only in their literals share one analysis (statement shapes), so simple-protocol clients that inline values don't re-analyze every statement. Per statement, measured with `cargo bench -p pgdog-mask --bench overhead`:
 
 | | |
 |---|---|
@@ -153,7 +175,13 @@ Decisions are cached per statement and masking profile, and statements that diff
 | masked user, new literals (simple protocol) | 2–6µs |
 | masked user, new statement shape | 3–35µs (once per shape) |
 
-End to end, `integration/masking/bench/bench.sh` runs pgbench against Postgres, PgDog, and PgDog with the plugin for exempt and masked users. Prepared statements and point queries show no measurable overhead. A 34-column `SELECT table.*` with masked columns over the simple protocol runs about 16% slower for masked users. Most of that is Postgres planning and evaluating the expanded, masked select list, which `*` expansion requires.
+End to end, `integration/bench/bench.sh` runs pgbench against Postgres, PgDog, and PgDog with the plugin for exempt and masked users. Prepared statements and point queries show no measurable overhead. A 34-column `SELECT table.*` with masked columns over the simple protocol runs about 16% slower for masked users. Most of that is Postgres planning and evaluating the expanded, masked select list, which `*` expansion requires.
+
+## Upgrading PgDog
+
+1. Point both `pgdog-plugin` and `pgdog-stats` in `Cargo.toml` at the new commit.
+2. Copy PgDog's schema loader queries (`pgdog/src/backend/schema/{relations,columns_catalog,views,functions,operators}.sql`) into `tests/support/sql`.
+3. Run the tests and `integration/run.sh`.
 
 ## Error details
 

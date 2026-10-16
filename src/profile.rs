@@ -213,7 +213,7 @@ impl Assignments {
                 match config.tag_policy(tag).and_then(|p| policy_index(&p.name)) {
                     Some(policy) => this.assign_missing(schema, table, column, policy),
                     None => warn!(
-                        "[pgdog_masking] column {schema}.{table}.{column} has tag \"{tag}\", which has no [[tags]] entry; it isn't masked"
+                        "[pgdog_mask] column {schema}.{table}.{column} has tag \"{tag}\", which has no [[tags]] entry; it isn't masked"
                     ),
                 }
             }

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pgdog
+          POSTGRES_PASSWORD: pgdog
+          POSTGRES_DB: pgdog
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain in rust-toolchain.toml, which matches PgDog's.
+      - name: Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit and canary tests
+        run: cargo test
+
+      # PgDog's Linux build links with clang and mold.
+      - name: Build dependencies for PgDog
+        run: sudo apt-get update && sudo apt-get install -y mold postgresql-client
+
+      - name: End-to-end tests through PgDog
+        run: bash integration/run.sh

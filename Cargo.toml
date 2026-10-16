@@ -1,31 +1,39 @@
 [package]
-name = "pgdog-masking"
+name = "pgdog-mask"
 version = "0.1.0"
-edition.workspace = true
+edition = "2024"
 description = "Dynamic data masking plugin for PgDog"
+publish = false
 
 [lib]
+name = "pgdog_mask"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-pgdog-plugin.workspace = true
-pg_raw_parse.workspace = true
+# Plugin API 0.6 (statement, transform and schema hooks) lives on the fork until
+# it's upstream. PgDog must be built from the same commit: plugins are only loaded
+# when the plugin API version and the Rust compiler version match. The
+# integration scripts read this revision to build PgDog.
+pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "ba3ec112d92595b34be9df8f837d8e1c1a4624da" }
+# Must match the pg_raw_parse PgDog uses at that revision.
+pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
 arc-swap = "1"
+indexmap = { version = "2.14", features = ["serde"] }
 lru = "0.16"
-parking_lot.workspace = true
+parking_lot = "0.12"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json.workspace = true
+serde_json = "1"
 thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
-indexmap.workspace = true
-regex = "1"
 
 [dev-dependencies]
+futures-util = "0.3"
+# Schema snapshot types, to build snapshots exactly as PgDog does.
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "ba3ec112d92595b34be9df8f837d8e1c1a4624da" }
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
-futures-util.workspace = true
-pgdog-stats = { path = "../../pgdog-stats" }
 
 [[bench]]
 name = "overhead"

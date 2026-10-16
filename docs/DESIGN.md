@@ -1,6 +1,8 @@
 # Dynamic Data Masking for PgDog — Design
 
-Status: draft · Scope: `pgdog-plugin` API extensions + a new `plugins/pgdog-masking` plugin
+> This project ([pgdog-mask](../README.md)) is the plugin. The PgDog changes it needs (plugin API 0.6, §8) are on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog), branch `masking/plugin-api`. Paths like `pgdog/src/...` refer to that repository.
+
+Status: P1 and P2 implemented · Scope: `pgdog-plugin` API extensions + this plugin
 
 ## 1. Summary
 
@@ -67,7 +69,7 @@ The result-transform channel stays, for three narrower jobs:
 | Policy return type = input type | enforced at load time; masks are wrapped in an explicit cast to the column type |
 | Applies through views | views that reference masked columns are inlined with masking applied (§6.6) |
 | `CURRENT_ROLE()` / `IS_ROLE_IN_SESSION()` | masking roles resolved from PgDog's authenticated identity (§5) |
-| `SYSTEM$GET_TAG`, policy references views | `pgdog-masking explain` CLI + shadow-mode logs + admin stats |
+| `SYSTEM$GET_TAG`, policy references views | `pgdog-mask explain` CLI + shadow-mode logs + admin stats |
 
 The deliberate difference is how the condition is evaluated. Snowflake evaluates `CURRENT_ROLE()` inside SQL. PgDog evaluates role conditions **in the proxy at plan time** and constant-folds them. Unmasked identities therefore get the original SQL byte-for-byte, and masked identities get only the mask expression, never a `CASE` that includes the raw branch.
 
@@ -112,11 +114,11 @@ Why these two points:
 ### 4.1 Crate layout
 
 ```
-plugins/pgdog-masking/
+
   masking-core/     # pure library: policy model, identity → profile, analyzer, rewriter, proxy masks.
                     # No pgdog dependency beyond pg_raw_parse + pgdog-postgres-types. Fully unit testable.
   masking-plugin/   # cdylib: implements pgdog_plugin::Plugin, caches, schema snapshots, config reload
-  masking-cli/      # `pgdog-masking explain|validate|lint` using masking-core against a live DB schema
+  masking-cli/      # `pgdog-mask explain|validate|lint` using masking-core against a live DB schema
 ```
 
 ---
@@ -288,7 +290,7 @@ As built in P2:
 - **Extensions.** Functions owned by an extension are user-defined functions in a non-SQL language, so they're blocked unless the extension is in `extension_allowlist` or the function is in `udf_allowlist`. The §6.5 denylist (`dblink*`, `query_to_xml`, …) applies even to allowlisted functions.
 - **Operators** outside `pg_catalog` that could match by name are treated as calls to their functions. Without operand types every same-named operator in the `search_path` is a candidate, so an extension operator such as `citext`'s `=` blocks every `=` for masked users until its extension is allowlisted.
 
-Trigger functions run server-side as a consequence of writes. For example, an audit trigger may copy a raw row into a table the restricted user can read. They are not analyzed. `pgdog-masking lint` flags tables written by triggers on masked tables that restricted users can `SELECT`.
+Trigger functions run server-side as a consequence of writes. For example, an audit trigger may copy a raw row into a table the restricted user can read. They are not analyzed. `pgdog-mask lint` flags tables written by triggers on masked tables that restricted users can `SELECT`.
 
 ### 6.8 Searching on masked columns (`search = "raw"`)
 
@@ -323,7 +325,7 @@ The configuration lives in its own TOML file, referenced from `pgdog.toml`:
 
 ```toml
 [[plugins]]
-name = "pgdog_masking"
+name = "pgdog_mask"
 config = "masking.toml"
 ```
 
@@ -416,7 +418,7 @@ expression = "CASE WHEN opted_in THEN val ELSE NULL END"
 name = "customer_id_token"
 data_type = "text"
 mask = "hmac_sha256"          # proxy mask (§7.2)
-key_env = "PGDOG_MASKING_KEY"
+key_env = "PGDOG_MASK_KEY"
 fallback = "null"             # SQL mask used everywhere except passthrough projections
 
 # Column assignments. Omitting `name` applies to every table in the schema
@@ -450,7 +452,7 @@ policy = "dob"
 name = "pii.email"
 policy = "email"
 
-# Auto-tagging by column name. Matches are reported by `pgdog-masking lint`.
+# Auto-tagging by column name. Matches are reported by `pgdog-mask lint`.
 [[classifiers]]
 database = "prod"
 column_regex = "^(e_?mail|email_address)$"
@@ -484,7 +486,7 @@ The analyzer only routes a reference to the proxy channel when it is a passthrou
 
 1. TOML schema validation and policy/type compatibility.
 2. Every SQL template is parsed. Templates may reference only `val` and declared `arguments`, and may call only allowlisted (immutable or stable, built-in) functions.
-3. **Live validation**: each template is prepared against the database as `SELECT (<template>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, to catch type errors before traffic does. `pgdog-masking validate` runs the same check in CI.
+3. **Live validation**: each template is prepared against the database as `SELECT (<template>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, to catch type errors before traffic does. `pgdog-mask validate` runs the same check in CI.
 4. Assignments are checked against the schema snapshot. A column that doesn't exist warns. Sharding keys and tenant columns are rejected.
 5. Rules with `search = "raw"` warn when they enable range or pattern operators, or when they target a low-entropy type (`date`, `boolean`, small enums).
 
@@ -717,7 +719,7 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 **Assumptions the deployment must enforce:**
 
 1. Clients cannot reach Postgres directly.
-2. The Postgres role PgDog uses for restricted identities (`server_user`) should not own the tables and should not be able to create functions or views. That is defense in depth if the analyzer has a bug. `pgdog-masking lint` checks for this.
+2. The Postgres role PgDog uses for restricted identities (`server_user`) should not own the tables and should not be able to create functions or views. That is defense in depth if the analyzer has a bug. `pgdog-mask lint` checks for this.
 3. Policy configuration and HMAC keys are protected like credentials.
 
 **Known residual risks, documented for users:**
@@ -734,8 +736,8 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 - **Shadow mode** (`mode = "shadow"`): full analysis, with no rewrite or block. Every decision that *would* apply is logged at `info` with the user, profile, policies hit, fingerprint, and the would-be SQL. This is the recommended rollout step.
 - **Decision log**: structured log line per `Rewrite`/`Block` (first occurrence per fingerprint + profile, then sampled), using the existing plugin logging init (`logging_init`).
 - **Metrics**: counters for continue/rewrite/block per policy, cache hit rate, analyzer latency histogram, proxy-mask latency. They are exposed through plugin logs initially; a generic plugin-metrics API is a follow-up.
-- **`pgdog-masking explain --user U [--application-name A] "SQL"`**: prints the profile, every resolved column reference with its policy, and the rewritten SQL, using a schema pulled from the target database. It is the same `masking-core` code, so its output matches production.
-- **`pgdog-masking lint`**: reports unassigned columns matching classifiers, unkeyed `hash` on low-cardinality types, masked columns that are sharding keys, and the privileges of `server_user`.
+- **`pgdog-mask explain --user U [--application-name A] "SQL"`**: prints the profile, every resolved column reference with its policy, and the rewritten SQL, using a schema pulled from the target database. It is the same `masking-core` code, so its output matches production.
+- **`pgdog-mask lint`**: reports unassigned columns matching classifiers, unkeyed `hash` on low-cardinality types, masked columns that are sharding keys, and the privileges of `server_user`.
 
 ---
 
@@ -744,7 +746,7 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 1. **`masking-core` unit tests**: a golden corpus of `(sql, profile) → expected rewritten SQL | block`. It covers every row of §6.3 and §6.5 and seeds from the ORM/job-queue query survey already in the repo (commit `59491209`, the subquery suite). Each case also asserts that the rewritten SQL parses and round-trips through `deparse`.
 2. **Canary leak tests (integration)**: seed masked columns with unique canary values (`'CANARY-SSN-7f3a…'`). Run the corpus and an adversarial suite through PgDog as a restricted identity. Assert that **no canary bytes appear anywhere in the client byte stream**: rows, `RowDescription`, errors, notices, COPY data. This tests the invariant directly instead of the implementation.
 3. **Equivalence tests**: for exempt profiles the rewritten SQL is byte-identical. For masked profiles, `RowDescription` names, types and formats match the unmasked query, and row counts match for queries without predicates on masked columns.
-4. **Protocol matrix**: simple, extended named and unnamed, pipelined, `Execute` without `Describe`, binary result formats (pgx, JDBC, asyncpg), SQL `PREPARE`/`EXECUTE`, cursors, multi-statement, COPY text/CSV/binary. Run in `integration/masking/` with Python, Ruby, Go and Java drivers, following the existing `integration/plugins/` harness.
+4. **Protocol matrix**: simple, extended named and unnamed, pipelined, `Execute` without `Describe`, binary result formats (pgx, JDBC, asyncpg), SQL `PREPARE`/`EXECUTE`, cursors, multi-statement, COPY text/CSV/binary. Run in `integration/` with Python, Ruby, Go and Java drivers, following the existing `integration/plugins/` harness.
 5. **Sharded runs**: the same suites against the 2-shard integration setup, including cross-shard aggregates and `ORDER BY` on masked columns.
 6. **Grammar fuzzing**: generate random queries over a schema with masked columns (sqlsmith-style, on top of `pg_raw_parse`), run them through the analyzer, and assert two things: the rewritten SQL never leaks a canary when executed, and every outcome is `Continue`/`Rewrite`/`Block`, never a panic.
 7. **Core API tests**: capability gating, plugin ordering, `catch_unwind` fail-closed behavior, `REQUIRED` startup failure, re-preparing on a changed rewrite, and transform `Fail` closing the connection. These are done on `masking/plugin-api` (§8.7).
@@ -753,28 +755,27 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 
 ## 14. Delivery plan
 
-### 14.1 Branches
+### 14.1 Repositories
 
 ```
-main
- └─ masking/plugin-api        # narrow core patch: pgdog-plugin 0.6.0 + host hooks (§8). Reviewed and merged on its own.
-     └─ masking/plugin        # plugins/pgdog-masking (masking-core, masking-plugin, masking-cli) + integration/masking
+ewhauser/pgdog
+ └─ masking/plugin-api   # narrow core patch: pgdog-plugin 0.6.0 + host hooks (§8)
+ewhauser/pgdog-mask      # this plugin, depending on pgdog-plugin at a pinned masking/plugin-api commit
 ```
 
-- `masking/plugin-api` is kept small enough to review as a unit. It is four logical commits (§8.7), each building and passing tests, squashable into one patch. It doesn't ship ahead of the plugin. It is merged when the plugin's P1 proves the API out, and API feedback from plugin work is folded back into this branch.
-- `masking/plugin` is rebased onto `masking/plugin-api` whenever that branch changes. It contains no core changes. If the plugin needs something from core, the change goes into `masking/plugin-api`.
-- This design doc goes on `masking/plugin`.
+- `masking/plugin-api` is the patch to upstream into PgDog. It is a few logical commits (§8.7), each building and passing tests. It contains no masking code. If the plugin needs something from core, the change goes there, and `Cargo.toml` here moves to the new commit.
+- The plugin is its own project. It was developed on a `masking/plugin` branch in PgDog and extracted with its history.
 
 ### 14.2 Phases
 
-**P1 status.** P1 is implemented in `plugins/pgdog-masking`, with these differences from the plan:
+**P1 status.** P1 is implemented in this repository, with these differences from the plan:
 - **One crate, not three.** Modules `analyzer`, `config`, `profile`, `catalog`, `mask` and `engine` replace `masking-core`/`masking-plugin`. There is no `masking-cli` yet.
 - **Built-in functions** were identified from an embedded list of PostgreSQL 16 `pg_catalog` function names, since the schema snapshot had no `pg_proc`. P2 replaced it.
 - **Views failed closed** unless they were in `view_allowlist` or had masked columns of their own. P2 added view inlining.
 - **`MERGE`, aliased joins, and `*` across `USING`/`NATURAL` joins** over masked columns are blocked, not rewritten.
 - **Output names** of rewritten column references are pinned with `AS`, and leading comments (routing hints) are kept on rewritten statements.
 - **Prepared statement re-checks** use a variant tag that is the hash of the rewritten SQL.
-- **Tests:** an analyzer unit corpus, canary leak tests against Postgres (`tests/canary.rs`), and end-to-end tests through PgDog (`integration/masking/run.sh`).
+- **Tests:** an analyzer unit corpus, canary leak tests against Postgres (`tests/canary.rs`), and end-to-end tests through PgDog (`integration/run.sh`).
 
 **P2 status.** Implemented on top of the full-catalog snapshot (§8.4):
 - **Views** are inlined with masks applied, or queried like tables with lineage-based masks (§6.6). `view_allowlist` is no longer the only way to read a view.

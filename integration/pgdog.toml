@@ -1,8 +1,8 @@
 [general]
 
 [[plugins]]
-name = "pgdog_masking"
-config = "integration/masking/masking.toml"
+name = "pgdog_mask"
+config = "integration/masking.toml"
 required = true
 
 [[databases]]

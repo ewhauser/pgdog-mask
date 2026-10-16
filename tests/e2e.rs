@@ -1,11 +1,11 @@
 //! End-to-end tests through PgDog with the plugin loaded.
 //!
-//! Run with `bash integration/masking/run.sh`; skipped unless `PGDOG_MASKING_E2E=1`.
+//! Run with `bash integration/run.sh`; skipped unless `PGDOG_MASK_E2E=1`.
 use futures_util::{StreamExt as _, pin_mut};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage, error::SqlState};
 
 fn enabled() -> bool {
-    std::env::var("PGDOG_MASKING_E2E").is_ok_and(|v| v == "1")
+    std::env::var("PGDOG_MASK_E2E").is_ok_and(|v| v == "1")
 }
 
 async fn connect(user: &str) -> Client {

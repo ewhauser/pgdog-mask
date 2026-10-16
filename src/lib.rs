@@ -45,14 +45,14 @@ impl Plugin for MaskingPlugin {
 
     extern "C-unwind" fn config(config: PluginConfig<'_>) -> bool {
         if config.plugin_config.is_empty() {
-            error!("[pgdog_masking] no config file; set \"config\" in [[plugins]]");
+            error!("[pgdog_mask] no config file; set \"config\" in [[plugins]]");
             return false;
         }
         let path = PathBuf::from(&*config.plugin_config);
         match ENGINE.load(&path) {
             Ok(()) => true,
             Err(err) => {
-                error!("[pgdog_masking] failed to load {}: {err}", path.display());
+                error!("[pgdog_mask] failed to load {}: {err}", path.display());
                 false
             }
         }

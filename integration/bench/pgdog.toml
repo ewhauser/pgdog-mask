@@ -2,8 +2,8 @@
 workers = 4
 
 [[plugins]]
-name = "pgdog_masking"
-config = "integration/masking/bench/masking.toml"
+name = "pgdog_mask"
+config = "integration/bench/masking.toml"
 required = true
 
 [[databases]]

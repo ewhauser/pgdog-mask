@@ -2,16 +2,18 @@
 //! own catalog queries, serialized into the snapshot PgDog sends to plugins.
 use std::collections::HashMap;
 
-use pgdog_masking::catalog::Catalog;
+use pgdog_mask::catalog::Catalog;
 use pgdog_stats::{Column, Function, Operator, Relation, Schema, SchemaInner, SecurityLabel};
 use tokio_postgres::{Client, SimpleQueryMessage};
 
-const QUERIES: &str = "../../../../pgdog/src/backend/schema";
-const RELATIONS: &str = include_str!("../../../../pgdog/src/backend/schema/relations.sql");
-const COLUMNS: &str = include_str!("../../../../pgdog/src/backend/schema/columns_catalog.sql");
-const VIEWS: &str = include_str!("../../../../pgdog/src/backend/schema/views.sql");
-const FUNCTIONS: &str = include_str!("../../../../pgdog/src/backend/schema/functions.sql");
-const OPERATORS: &str = include_str!("../../../../pgdog/src/backend/schema/operators.sql");
+// PgDog's schema loader queries (pgdog/src/backend/schema/*.sql), copied from the
+// PgDog revision in Cargo.toml. Update them together.
+const QUERIES: &str = "tests/support/sql";
+const RELATIONS: &str = include_str!("sql/relations.sql");
+const COLUMNS: &str = include_str!("sql/columns_catalog.sql");
+const VIEWS: &str = include_str!("sql/views.sql");
+const FUNCTIONS: &str = include_str!("sql/functions.sql");
+const OPERATORS: &str = include_str!("sql/operators.sql");
 
 type Row = Vec<Option<String>>;
 

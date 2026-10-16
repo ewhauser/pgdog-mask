@@ -9,17 +9,17 @@
 //!
 //! The schema is loaded with PgDog's own catalog queries.
 //!
-//! Requires Postgres; set `PGDOG_MASKING_TEST_URL` to override the default
+//! Requires Postgres; set `PGDOG_MASK_TEST_URL` to override the default
 //! `host=127.0.0.1 user=pgdog password=pgdog dbname=pgdog`.
 mod support;
 
 use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt as _, pin_mut, stream};
-use pgdog_masking::analyzer::{Context, Outcome, analyze, analyze_shape};
-use pgdog_masking::config::Config;
-use pgdog_masking::profile::{Assignments, Policies};
-use pgdog_masking::scrub::scrub_detail;
+use pgdog_mask::analyzer::{Context, Outcome, analyze, analyze_shape};
+use pgdog_mask::config::Config;
+use pgdog_mask::profile::{Assignments, Policies};
+use pgdog_mask::scrub::scrub_detail;
 use tokio_postgres::error::DbError;
 use tokio_postgres::{AsyncMessage, Client, NoTls, SimpleQueryMessage};
 
@@ -85,11 +85,11 @@ struct Connection {
 }
 
 async fn connect() -> Connection {
-    let url = std::env::var("PGDOG_MASKING_TEST_URL")
+    let url = std::env::var("PGDOG_MASK_TEST_URL")
         .unwrap_or_else(|_| "host=127.0.0.1 user=pgdog password=pgdog dbname=pgdog".into());
     let (client, mut connection) = tokio_postgres::connect(&url, NoTls)
         .await
-        .expect("connect to Postgres (set PGDOG_MASKING_TEST_URL)");
+        .expect("connect to Postgres (set PGDOG_MASK_TEST_URL)");
     let notices = Arc::new(Mutex::new(vec![]));
     let sink = notices.clone();
     tokio::spawn(async move {
