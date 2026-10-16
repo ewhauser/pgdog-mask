@@ -96,7 +96,7 @@ fn snapshot() -> String {
     let extra: Vec<String> = (0..30).map(|i| format!("attr_{i}")).collect();
     customers.extend(extra.iter().map(|c| (c.as_str(), "text")));
 
-    json!({"inner": {
+    json!({"format_version": pgdog_plugin::SCHEMA_SNAPSHOT_VERSION, "inner": {
         "search_path": ["$user", "public"],
         "full_catalog": true,
         "functions": [],

@@ -14,7 +14,7 @@ crate-type = ["rlib", "cdylib"]
 # it's upstream. PgDog must be built from the same commit: plugins are only loaded
 # when the plugin API version and the Rust compiler version match. The
 # integration scripts read this revision to build PgDog.
-pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "ba3ec112d92595b34be9df8f837d8e1c1a4624da" }
+pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "03e43475618b8aadffa4a1048c96176aad08fe4a" }
 # Must match the pg_raw_parse PgDog uses at that revision.
 pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
 arc-swap = "1"
@@ -31,7 +31,7 @@ tracing = "0.1"
 [dev-dependencies]
 futures-util = "0.3"
 # Schema snapshot types, to build snapshots exactly as PgDog does.
-pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "ba3ec112d92595b34be9df8f837d8e1c1a4624da" }
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "03e43475618b8aadffa4a1048c96176aad08fe4a" }
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
 

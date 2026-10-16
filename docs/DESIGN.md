@@ -610,7 +610,7 @@ pub trait Plugin {
 }
 ```
 
-When a cluster's shard 0 schema finishes loading, through the existing `SchemaLoader` path, PgDog serializes it with `serde_json` and calls every `SCHEMA` plugin. That covers startup, `RELOAD`, and reloads triggered by `reload_schema_on_ddl`. `epoch` is a global counter that increases with every snapshot. The snapshot is the existing `pgdog_stats::Schema` (relations, columns, data types, ordinal positions, primary and foreign keys, search_path). JSON keeps plugins from depending on that struct's memory layout.
+When a cluster's shard 0 schema finishes loading, through the existing `SchemaLoader` path, PgDog serializes it with `serde_json` and calls every `SCHEMA` plugin. That covers startup, `RELOAD`, and reloads triggered by `reload_schema_on_ddl`. `epoch` is a global counter that increases with every snapshot. The JSON carries `format_version` (`pgdog_plugin::SCHEMA_SNAPSHOT_VERSION`). The plugin rejects versions it doesn't know, which leaves masked users blocked until a supported snapshot arrives. If a load fails, PgDog retries and sends nothing, so the plugin keeps its previous snapshot. The snapshot is the existing `pgdog_stats::Schema` (relations, columns, data types, ordinal positions, primary and foreign keys, search_path). JSON keeps plugins from depending on that struct's memory layout.
 
 Until the plugin has a snapshot for a database, the masking plugin blocks statements from restricted profiles with SQLSTATE `57P03` (fail closed).
 
@@ -641,8 +641,11 @@ pub trait Plugin {
 ```
 
 - **Where it runs.** `process_server_message` calls `transform_server_message` after PgDog's own per-message bookkeeping (explain capture, advisory locks, transaction state). That bookkeeping keeps seeing Postgres' original messages; the client sees the transformed ones. Multi-shard merge, sort and aggregate have already finished.
-- **Which statement.** Transforms belong to the statement executing in the current request: the `Query`, or the `Bind`. Transforms attached to statements that are only prepared are released immediately.
-- **Release.** A transform is released after `ReadyForQuery`, when the next request starts, or when the client disconnects (`Drop`).
+- **Ownership.** A transform belongs to what the plugin attached it to, and server messages are attributed to their owner by tracking the client messages still waiting for responses:
+  - a simple `Query` (or fast-path call) owns its transforms until its client-visible `ReadyForQuery`, including COPY data exchanged in between;
+  - a prepared statement (`Parse`) owns them until it's closed or replaced, so `Describe` responses go through them;
+  - a portal (`Bind`) owns them until it's closed or replaced, or the transaction ends, so resumed `Execute`s go through them.
+- **Release.** Each handle is released exactly once, when its owner ends or the client disconnects.
 - **Result formats** are captured from the `Bind` in the statement-plugin layer. No backend changes were needed.
 - **Failure.** On `fail`, or a hook error, PgDog:
   1. cancels the query;

@@ -164,6 +164,7 @@ pub struct Catalog {
 
 #[derive(Deserialize)]
 struct Snapshot {
+    format_version: u32,
     inner: SnapshotInner,
 }
 
@@ -221,6 +222,15 @@ impl Catalog {
     /// Parse a schema snapshot sent by PgDog.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         let snapshot: Snapshot = serde_json::from_str(json)?;
+        // A format this plugin doesn't know could be misread; treat it as no
+        // snapshot, which blocks masked users.
+        if snapshot.format_version != pgdog_plugin::SCHEMA_SNAPSHOT_VERSION {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "unsupported schema snapshot format {} (supported: {})",
+                snapshot.format_version,
+                pgdog_plugin::SCHEMA_SNAPSHOT_VERSION
+            )));
+        }
         let inner = snapshot.inner;
         let relations = inner
             .relations
@@ -403,7 +413,7 @@ mod test {
 
     #[test]
     fn test_from_json() {
-        let json = r#"{"inner":{"search_path":["$user","public"],"relations":{"public":{"users":{
+        let json = r#"{"format_version":1,"inner":{"search_path":["$user","public"],"relations":{"public":{"users":{
             "schema":"public","name":"users","type_":"table","owner":"pgdog","persistence":"permanent",
             "access_method":"heap","description":"","oid":1,"parent_table_schema":null,"parent_table_name":null,
             "columns":{
@@ -444,5 +454,19 @@ mod test {
         assert!(catalog.functions(None, "last4", &[]).is_empty());
         assert!(catalog.is_system_function("lower"));
         assert!(!catalog.is_system_function("last4"));
+    }
+
+    #[test]
+    fn test_unknown_snapshot_format() {
+        let err = Catalog::from_json(r#"{"format_version":999,"inner":{}}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported schema snapshot format"),
+            "{err}"
+        );
+        assert!(
+            Catalog::from_json(r#"{"inner":{}}"#).is_err(),
+            "unversioned"
+        );
     }
 }

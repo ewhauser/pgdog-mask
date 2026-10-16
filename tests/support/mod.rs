@@ -154,6 +154,17 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
         system_functions,
         ..Default::default()
     });
-    let snapshot = serde_json::to_string(&schema).expect("serialize snapshot");
+    // Versioned the way PgDog sends it.
+    #[derive(serde::Serialize)]
+    struct Snapshot<'a> {
+        format_version: u32,
+        #[serde(flatten)]
+        schema: &'a Schema,
+    }
+    let snapshot = serde_json::to_string(&Snapshot {
+        format_version: pgdog_plugin::SCHEMA_SNAPSHOT_VERSION,
+        schema: &schema,
+    })
+    .expect("serialize snapshot");
     Catalog::from_json(&snapshot).expect("plugin parses the snapshot")
 }
