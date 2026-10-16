@@ -28,15 +28,20 @@ See [compatibility](./reference/compatibility/).
 
 pgdog-mask is a [PgDog](https://github.com/pgdogdev/pgdog) plugin modeled on Snowflake's dynamic data masking. Policies are attached to columns, and each policy chooses a mask based on who is asking. The stored data never changes.
 
-Masking happens in the statement, not the results. Every reference to a masked column, in the select list, `WHERE`, joins, `ORDER BY`, aggregates, subqueries, `RETURNING` or `COPY`, is replaced with the policy's mask before PgDog sends the statement on. Filters, sorting and aggregates therefore can't be used to recover the real values.
+A column is masked in one of two ways:
+
+- **SQL masks**, in the statement. Every reference to the column, in the select list, `WHERE`, joins, `ORDER BY`, aggregates, subqueries, `RETURNING` or `COPY`, is replaced with the policy's mask before PgDog sends the statement on, so filters, sorting and aggregates can't be used to recover real values.
+- **Proxy masks**, in the results. The plugin computes the masked value in code, for keyed hashes, format-preserving encryption, vault tokens or your own Rust, and replaces the real value in the rows Postgres returns.
 
 ```sql
--- A support agent sends:
+-- With an SQL mask on ssn, a support agent sends:
 SELECT name, ssn FROM users WHERE ssn LIKE '123%';
--- Postgres receives:
+-- and Postgres receives:
 SELECT name, ('XXX-XX-' || right(ssn, 4))::text AS ssn
 FROM users WHERE ('XXX-XX-' || right(ssn, 4))::text LIKE '123%';
 ```
+
+See [how masking works](./start/overview/) for both.
 
 1. [Install the plugin](./start/install/) and load it into PgDog.
 2. [Mask your first column](./start/first-policy/) and check it as a masked user.
