@@ -38,7 +38,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let (verdict, touched) = match relation.definition.as_deref() {
             None => (
                 Verdict::Blocked(format!(
-                    "view {label} has no definition in the schema snapshot, so it can't be checked for masked columns"
+                    "view {label} has no definition in the catalog, so it can't be checked for masked columns"
                 )),
                 false,
             ),

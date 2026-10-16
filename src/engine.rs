@@ -1,14 +1,14 @@
 //! Plugin state: configuration, schemas, caches, and statement decisions.
 use std::collections::HashMap;
-use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher, RandomState};
+use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use pgdog_plugin::{
-    MessageCodes, StatementContext, StatementKind, StatementOutput, TransformContext,
-    TransformOutput,
+    Access, Deny, ErrorFields, Redaction, Session, SqlState, Verdict, redact::field::DETAIL,
 };
 use tracing::{Level, debug, enabled, error, info, warn};
 
@@ -16,15 +16,10 @@ use crate::analyzer::{Context, Outcome, analyze, shape};
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies, Profile};
-use crate::scrub::scrub_detail;
 use crate::tags;
 
-const PERMISSION_DENIED: &str = "42501";
+/// `cannot_connect_now`: the schema of the database isn't loaded yet.
 const CANNOT_CONNECT_NOW: &str = "57P03";
-
-/// Transform handle for removing `DETAIL` from errors and notices. Scrubbing
-/// keeps no state, so every statement shares it.
-const SCRUB: u64 = 1;
 
 /// Loaded configuration.
 struct Settings {
@@ -175,13 +170,8 @@ struct Database {
 /// Cached decision for a statement shape.
 #[derive(Debug, Clone)]
 enum ShapeDecision {
-    Continue {
-        scrub: bool,
-    },
-    Rewrite {
-        template: Arc<shape::Template>,
-        scrub: bool,
-    },
+    Continue,
+    Rewrite(Arc<shape::Template>),
     Block(String),
 }
 
@@ -189,51 +179,29 @@ impl ShapeDecision {
     /// `None` if the rewrite can't be turned into a template.
     fn new(decision: Decision, literals: usize) -> Option<Self> {
         Some(match decision {
-            Decision::Continue { scrub } => Self::Continue { scrub },
+            Decision::Continue => Self::Continue,
             Decision::Block(reason) => Self::Block(reason),
-            Decision::Rewrite { sql, scrub, .. } => Self::Rewrite {
-                template: Arc::new(shape::Template::new(&sql, literals)?),
-                scrub,
-            },
+            Decision::Rewrite(sql) => {
+                Self::Rewrite(Arc::new(shape::Template::new(&sql, literals)?))
+            }
         })
     }
 
     /// The decision for a statement with this shape and these literals.
     fn render(self, literals: &[String]) -> Option<Decision> {
         Some(match self {
-            Self::Continue { scrub } => Decision::Continue { scrub },
+            Self::Continue => Decision::Continue,
             Self::Block(reason) => Decision::Block(reason),
-            Self::Rewrite { template, scrub } => {
-                let sql = template.render(literals)?;
-                Decision::Rewrite {
-                    variant: variant(&sql),
-                    sql,
-                    scrub,
-                }
-            }
+            Self::Rewrite(template) => Decision::Rewrite(template.render(literals)?),
         })
     }
 }
 
-/// Identifies a rewrite, so PgDog re-prepares statements whose rewrite changed.
-fn variant(sql: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    sql.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// What to do with a statement, cached by statement and profile.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    /// `scrub`: remove `DETAIL` from errors and notices.
-    Continue {
-        scrub: bool,
-    },
-    Rewrite {
-        sql: String,
-        variant: u64,
-        scrub: bool,
-    },
+    Continue,
+    Rewrite(String),
     Block(String),
 }
 
@@ -246,6 +214,10 @@ pub struct Engine {
     /// Decisions for statement shapes, i.e., statements with literals replaced
     /// by placeholders. See [`crate::analyzer::shape`].
     shapes: ArcSwap<Cache<ShapeDecision>>,
+    /// Changes whenever decisions may change: new settings or a new catalog.
+    generation: AtomicU64,
+    /// Numbers catalogs as they arrive.
+    catalog_epoch: AtomicU64,
 }
 
 impl Default for Engine {
@@ -263,7 +235,19 @@ impl Engine {
             databases: ArcSwap::default(),
             shapes: ArcSwap::from_pointee(Cache::new(cache.per_shard * CACHE_SHARDS)),
             cache: ArcSwap::from_pointee(cache),
+            generation: AtomicU64::new(1),
+            catalog_epoch: AtomicU64::new(0),
         })
+    }
+
+    /// Generation of the plugin's decisions, see [`pgdog_plugin::Plugin::generation`].
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Decisions made so far may no longer hold.
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Load the configuration file.
@@ -291,6 +275,7 @@ impl Engine {
         self.shapes
             .store(Arc::new(Cache::new(cache.per_shard * CACHE_SHARDS)));
         self.cache.store(Arc::new(cache));
+        self.invalidate();
         Ok(())
     }
 
@@ -308,15 +293,10 @@ impl Engine {
         }
     }
 
-    /// Store a schema snapshot.
-    pub fn schema(&self, database: &str, epoch: u64, snapshot: &str) {
-        let catalog = match Catalog::from_json(snapshot) {
-            Ok(catalog) => Arc::new(catalog),
-            Err(err) => {
-                error!("[pgdog_mask] failed to parse schema for \"{database}\": {err}");
-                return;
-            }
-        };
+    /// Store a database's catalog.
+    pub fn catalog(&self, database: &str, catalog: &pgdog_plugin::Catalog) {
+        let catalog = Arc::new(Catalog::from_plugin(catalog));
+        let epoch = self.catalog_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         let settings = self.settings.load();
         let assignments = Assignments::new(&settings.policies, database, &catalog);
         if let Some(previous) = self.databases.load().get(database) {
@@ -340,6 +320,7 @@ impl Engine {
             databases.insert(database.to_owned(), database_state.clone());
             databases
         });
+        self.invalidate();
     }
 
     /// Resolve masked columns of a database again after the settings changed.
@@ -363,115 +344,131 @@ impl Engine {
         database
     }
 
+    /// Run `f` with the profile of a user, computing it on first use.
+    fn with_profile<R>(
+        settings: &Settings,
+        session: &Session<'_>,
+        f: impl FnOnce(&Profile) -> R,
+    ) -> R {
+        let profiles = settings.profiles.load();
+        match profiles
+            .get(&*session.user)
+            .and_then(|databases| databases.get(&*session.database))
+        {
+            Some(profile) => f(profile),
+            None => f(&settings.add_profile(&session.user, &session.database)),
+        }
+    }
+
     /// Decide what to do with a statement.
-    pub fn statement(&self, context: &StatementContext<'_>) -> StatementOutput {
+    pub fn statement(&self, session: &Session<'_>, sql: &str) -> Verdict {
         let settings = self.settings.load();
         let mode = settings.policies.config.general.mode;
         if mode == Mode::Off {
-            return StatementOutput::cont();
+            return Verdict::Allow;
         }
 
-        let identity = &context.identity;
-        let profiles = settings.profiles.load();
-        let added;
-        let profile: &Profile = match profiles
-            .get(&*identity.user)
-            .and_then(|databases| databases.get(&*identity.database))
+        Self::with_profile(&settings, session, |profile| {
+            if profile.exempt {
+                return Verdict::Allow;
+            }
+
+            match (self.decide(session, sql, &settings, profile), mode) {
+                (Decision::Rewrite(sql), Mode::Enforce) => Verdict::rewrite(sql),
+                (Decision::Block(reason), Mode::Enforce) => Verdict::Deny(denied(reason)),
+                // Shadow mode: decisions are logged when they're made.
+                _ => Verdict::Allow,
+            }
+        })
+    }
+
+    /// Fast-path function calls can't be analyzed: masked users can't make them.
+    pub fn function_call(&self, session: &Session<'_>, function: u32) -> Access {
+        let settings = self.settings.load();
+        let mode = settings.policies.config.general.mode;
+        if mode == Mode::Off {
+            return Access::Allow;
+        }
+
+        Self::with_profile(&settings, session, |profile| {
+            if profile.exempt {
+                return Access::Allow;
+            }
+            let decision = log_decision(
+                &session.user,
+                "",
+                &format!("fast-path call of function {function}"),
+                Decision::Block("fast-path function calls are not allowed for masked users".into()),
+                mode == Mode::Shadow,
+            );
+            match (decision, mode) {
+                (Decision::Block(reason), Mode::Enforce) => Access::Deny(denied(reason)),
+                _ => Access::Allow,
+            }
+        })
+    }
+
+    /// Remove `DETAIL` from the errors and notices masked users get: it can
+    /// hold the values of masked columns, e.g. a `CHECK` violation's
+    /// `Failing row contains (1, 123-45-6789, ...)`.
+    pub fn redact_error(&self, session: &Session<'_>, error: &ErrorFields<'_>) -> Redaction {
+        let settings = self.settings.load();
+        let general = &settings.policies.config.general;
+        if general.mode != Mode::Enforce
+            || !general.scrub_error_detail
+            || error.get(DETAIL).is_none()
         {
-            Some(profile) => profile,
-            None => {
-                added = settings.add_profile(&identity.user, &identity.database);
-                &added
-            }
-        };
-        if profile.exempt {
-            return StatementOutput::cont();
+            return Redaction::Keep;
         }
 
-        let decision = self.decide(context, &settings, profile);
-        let scrub = |output: StatementOutput, scrub: bool| {
-            if scrub && settings.policies.config.general.scrub_error_detail {
-                output.with_transform(SCRUB, MessageCodes::none().with('E').with('N'))
+        Self::with_profile(&settings, session, |profile| {
+            if profile.exempt {
+                Redaction::Keep
             } else {
-                output
+                Redaction::Replace(error.without(&[DETAIL]))
             }
-        };
-
-        match (decision, mode) {
-            (Decision::Continue { scrub: touched }, Mode::Enforce) => {
-                scrub(StatementOutput::cont(), touched)
-            }
-            (Decision::Continue { .. }, _) => StatementOutput::cont(),
-            (
-                Decision::Rewrite {
-                    sql,
-                    variant,
-                    scrub: touched,
-                },
-                Mode::Enforce,
-            ) => scrub(StatementOutput::rewrite(sql, variant), touched),
-            (Decision::Block(reason), Mode::Enforce) => {
-                let code = if reason.starts_with("masking schema") {
-                    CANNOT_CONNECT_NOW
-                } else {
-                    PERMISSION_DENIED
-                };
-                StatementOutput::block(code, reason)
-            }
-            // Shadow mode: decisions are logged when they're made.
-            _ => StatementOutput::cont(),
-        }
+        })
     }
 
     fn decide(
         &self,
-        context: &StatementContext<'_>,
+        session: &Session<'_>,
+        sql: &str,
         settings: &Settings,
-        profile: &crate::profile::Profile,
+        profile: &Profile,
     ) -> Decision {
-        let identity = &context.identity;
         let shadow = settings.policies.config.general.mode == Mode::Shadow;
-
-        if context.kind == StatementKind::FunctionCall {
-            return log_decision(
-                &identity.user,
-                "",
-                "fast-path function call",
-                Decision::Block("fast-path function calls are not allowed for masked users".into()),
-                shadow,
-            );
-        }
 
         let databases = self.databases.load();
         let refreshed;
-        let database: &Database = match databases.get(&*identity.database) {
+        let database: &Database = match databases.get(&*session.database) {
             Some(database) if database.settings_epoch == settings.epoch => database,
             Some(database) => {
-                refreshed = self.refresh_database(&identity.database, database, settings);
+                refreshed = self.refresh_database(&session.database, database, settings);
                 &refreshed
             }
             None => {
                 return Decision::Block(format!(
                     "masking schema for database \"{}\" is not loaded yet",
-                    &*identity.database
+                    &*session.database
                 ));
             }
         };
 
         // Resolution depends on the user only through `$user` in the search_path.
-        let user_dependent = if context.search_path.is_empty() {
+        let user_dependent = if session.search_path.is_empty() {
             database
                 .catalog
                 .search_path
                 .iter()
                 .any(|s| s.contains("$user"))
         } else {
-            context.search_path.contains("$user")
+            session.search_path.contains("$user")
         };
         let key = CacheKeyRef {
-            sql: &context.sql,
-            search_path: &context.search_path,
-            user: user_dependent.then_some(&*identity.user),
+            sql,
+            search_path: &session.search_path,
+            user: user_dependent.then_some(&*session.user),
             profile: profile.hash,
             settings_epoch: settings.epoch,
             schema_epoch: database.schema_epoch,
@@ -482,12 +479,12 @@ impl Engine {
             return decision;
         }
 
-        let search_path = if context.search_path.is_empty() {
+        let search_path = if session.search_path.is_empty() {
             database.catalog.search_path.join(",")
         } else {
-            context.search_path.to_string()
+            session.search_path.to_string()
         };
-        let search_path = parse_search_path(&search_path, &identity.user);
+        let search_path = parse_search_path(&search_path, &session.user);
 
         let ctx = Context {
             catalog: &database.catalog,
@@ -498,10 +495,10 @@ impl Engine {
         };
 
         // Statements with literals: analyze their shape once, then render.
-        // Prepared statements repeat their text on every Bind, so their rendered
-        // decision is cached by text too; simple queries rarely do, and caching
-        // them would only evict entries that are reused.
-        if let Some(literals) = shape::literals(&context.sql) {
+        // Rendered decisions aren't cached by text: statements with literals
+        // rarely repeat, and PgDog only asks again for a prepared statement
+        // when the generation changes.
+        if let Some(literals) = shape::literals(sql) {
             let shape_key = CacheKeyRef {
                 sql: &literals.shape,
                 ..key
@@ -512,7 +509,7 @@ impl Engine {
                 None => {
                     let outcome = analyze(&literals.shape, &ctx);
                     let shape = ShapeDecision::new(
-                        outcome_decision(outcome, &identity.user, &context.sql, shadow),
+                        outcome_decision(outcome, &session.user, sql, shadow),
                         literals.values.len(),
                     );
                     if let Some(shape) = &shape {
@@ -522,19 +519,11 @@ impl Engine {
                 }
             };
             if let Some(decision) = shape.and_then(|shape| shape.render(&literals.values)) {
-                if context.kind != StatementKind::Query {
-                    cache.put(key, decision.clone());
-                }
                 return decision;
             }
         }
 
-        let decision = outcome_decision(
-            analyze(&context.sql, &ctx),
-            &identity.user,
-            &context.sql,
-            shadow,
-        );
+        let decision = outcome_decision(analyze(sql, &ctx), &session.user, sql, shadow);
         cache.put(key, decision.clone());
         decision
     }
@@ -543,25 +532,17 @@ impl Engine {
 /// Decision for an analysis outcome, logged.
 fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) -> Decision {
     match outcome {
-        Outcome::Unchanged {
-            raw,
-            touches_masked,
-        } => {
+        Outcome::Unchanged { raw, .. } => {
             if !raw.is_empty() {
                 info!(
                     "[pgdog_mask] user \"{}\" searched raw values of {:?}",
                     user, raw
                 );
             }
-            Decision::Continue {
-                scrub: touches_masked,
-            }
+            Decision::Continue
         }
         Outcome::Rewritten {
-            sql,
-            masked,
-            raw,
-            touches_masked,
+            sql, masked, raw, ..
         } => {
             if !raw.is_empty() {
                 info!(
@@ -569,16 +550,11 @@ fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) 
                     user, raw
                 );
             }
-            let variant = variant(&sql);
             log_decision(
                 user,
                 original,
                 &format!("masked {masked:?}"),
-                Decision::Rewrite {
-                    sql,
-                    variant,
-                    scrub: touches_masked,
-                },
+                Decision::Rewrite(sql),
                 shadow,
             )
         }
@@ -588,16 +564,16 @@ fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) 
     }
 }
 
-impl Engine {
-    /// Remove `DETAIL` from errors and notices of statements that touch masked relations.
-    pub fn transform(&self, context: &TransformContext<'_>) -> TransformOutput {
-        if context.handle != SCRUB || !matches!(context.code, b'E' | b'N') {
-            return TransformOutput::forward();
-        }
-        match scrub_detail(context.payload.as_slice()) {
-            Some(body) => TransformOutput::replace(body),
-            None => TransformOutput::forward(),
-        }
+/// Deny a statement. Until a database's schema is loaded, masked users get a
+/// retryable error.
+fn denied(reason: String) -> Deny {
+    if reason.starts_with("masking schema") {
+        Deny::new(
+            SqlState::new(CANNOT_CONNECT_NOW).expect("valid SQLSTATE"),
+            reason,
+        )
+    } else {
+        Deny::insufficient_privilege(reason)
     }
 }
 
@@ -612,7 +588,7 @@ fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: b
         "[pgdog_mask]"
     };
     match &decision {
-        Decision::Rewrite { .. } => {
+        Decision::Rewrite(_) => {
             if shadow {
                 info!(
                     "{prefix} would rewrite statement for user \"{user}\", {what}: {}",
@@ -631,7 +607,7 @@ fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: b
                 normalized(sql)
             )
         }
-        Decision::Continue { .. } => (),
+        Decision::Continue => (),
     }
     decision
 }
@@ -649,23 +625,16 @@ fn normalized(sql: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use pgdog_plugin::Identity;
+    use pgdog_plugin::{ErrorField, redact::field};
 
     use super::*;
     use crate::analyzer::test::{CONFIG, catalog};
 
-    fn context<'a>(user: &'a str, sql: &'a str, kind: StatementKind) -> StatementContext<'a> {
-        StatementContext {
-            identity: Identity {
-                user: user.into(),
-                database: "db".into(),
-                ..Default::default()
-            },
-            kind,
-            sql: sql.into(),
-            statement_name: "".into(),
-            search_path: "".into(),
-            in_transaction: false,
+    fn session(user: &str) -> Session<'_> {
+        Session {
+            user: user.into(),
+            database: "db".into(),
+            ..Default::default()
         }
     }
 
@@ -687,56 +656,50 @@ mod test {
         engine
     }
 
-    fn decide(engine: &Engine, user: &str, sql: &str, kind: StatementKind) -> Decision {
+    fn decide(engine: &Engine, user: &str, sql: &str) -> Decision {
         let settings = engine.settings.load();
         let profile = settings.profile(user, "db");
-        engine.decide(&context(user, sql, kind), &settings, &profile)
+        engine.decide(&session(user), sql, &settings, &profile)
     }
 
     #[test]
     fn test_decisions() {
         let engine = engine(CONFIG);
         assert!(matches!(
-            decide(
-                &engine,
-                "anonymous",
-                "SELECT ssn FROM users",
-                StatementKind::Query
-            ),
-            Decision::Rewrite { .. }
+            decide(&engine, "anonymous", "SELECT ssn FROM users"),
+            Decision::Rewrite(_)
         ));
-        assert!(matches!(
-            decide(
-                &engine,
-                "anonymous",
-                "SELECT id FROM orders",
-                StatementKind::Parse
-            ),
-            Decision::Continue { .. }
-        ));
-        assert!(matches!(
-            decide(&engine, "anonymous", "", StatementKind::FunctionCall),
-            Decision::Block(_)
-        ));
+        assert_eq!(
+            decide(&engine, "anonymous", "SELECT id FROM orders"),
+            Decision::Continue
+        );
 
-        // Same rewrite, same variant.
-        let Decision::Rewrite { variant: a, .. } = decide(
-            &engine,
-            "anonymous",
-            "SELECT ssn FROM users",
-            StatementKind::Bind,
-        ) else {
-            panic!("rewrite")
-        };
-        let Decision::Rewrite { variant: b, .. } = decide(
-            &engine,
-            "anonymous",
-            "SELECT ssn FROM users",
-            StatementKind::Bind,
-        ) else {
-            panic!("rewrite")
-        };
-        assert_eq!(a, b);
+        // Deterministic: PgDog relies on it for prepared statements.
+        assert_eq!(
+            decide(&engine, "anonymous", "SELECT ssn FROM users"),
+            decide(&engine, "anonymous", "SELECT ssn FROM users"),
+        );
+    }
+
+    #[test]
+    fn test_function_calls() {
+        let engine = engine(CONFIG);
+        assert!(matches!(
+            engine.function_call(&session("anonymous"), 1234),
+            Access::Deny(_)
+        ));
+        assert_eq!(engine.function_call(&session("admin"), 1234), Access::Allow);
+    }
+
+    #[test]
+    fn test_generation() {
+        let engine = engine(CONFIG);
+        let first = engine.generation();
+        engine.apply(Config::from_toml(CONFIG).unwrap()).unwrap();
+        let second = engine.generation();
+        assert_ne!(first, second, "new settings");
+        engine.catalog("db", &pgdog_plugin::Catalog::default());
+        assert_ne!(second, engine.generation(), "new catalog");
     }
 
     #[test]
@@ -768,7 +731,7 @@ mod test {
             settings_epoch: 1,
             schema_epoch: 1,
         };
-        cache.put(key, Decision::Continue { scrub: false });
+        cache.put(key, Decision::Continue);
         assert!(cache.get(key).is_some());
 
         // Force a slot collision: same slot, different statement.
@@ -816,32 +779,17 @@ mod test {
             &engine,
             "anonymous",
             "SELECT ssn FROM users WHERE id = 1 AND name = 'a'",
-            StatementKind::Query,
         );
         let second = decide(
             &engine,
             "anonymous",
             "SELECT ssn FROM users WHERE id = 2 AND name = 'it''s'",
-            StatementKind::Query,
         );
-        let (
-            Decision::Rewrite {
-                sql: a,
-                variant: va,
-                ..
-            },
-            Decision::Rewrite {
-                sql: b,
-                variant: vb,
-                ..
-            },
-        ) = (first, second)
-        else {
+        let (Decision::Rewrite(a), Decision::Rewrite(b)) = (first, second) else {
             panic!("rewrites");
         };
         assert!(a.ends_with("WHERE id = 1 AND name = 'a'"), "{a}");
         assert!(b.ends_with("WHERE id = 2 AND name = 'it''s'"), "{b}");
-        assert_ne!(va, vb, "different statements, different variants");
 
         // One shape analyzed; rendered statements aren't cached by text.
         let shapes = engine.shapes.load();
@@ -849,15 +797,10 @@ mod test {
         assert_eq!(entries, 1);
         let cache = engine.cache.load();
         let entries: usize = cache.shards.iter().map(|s| s.read().len()).sum();
-        assert_eq!(entries, 0, "simple queries aren't cached by text");
+        assert_eq!(entries, 0, "statements with literals aren't cached by text");
 
-        // Prepared statements are.
-        decide(
-            &engine,
-            "anonymous",
-            "SELECT ssn FROM users LIMIT 10",
-            StatementKind::Bind,
-        );
+        // Statements without literals are.
+        decide(&engine, "anonymous", "SELECT ssn FROM users WHERE id = $1");
         let entries: usize = cache.shards.iter().map(|s| s.read().len()).sum();
         assert_eq!(entries, 1);
 
@@ -867,8 +810,7 @@ mod test {
                 decide(
                     &engine,
                     "anonymous",
-                    &format!("SELECT my_func({id}) FROM users"),
-                    StatementKind::Query
+                    &format!("SELECT my_func({id}) FROM users")
                 ),
                 Decision::Block(_)
             ));
@@ -878,88 +820,82 @@ mod test {
     #[test]
     fn test_missing_schema_blocks() {
         let engine = Engine::new(Config::from_toml(CONFIG).unwrap()).unwrap();
-        let Decision::Block(reason) =
-            decide(&engine, "anonymous", "SELECT 1", StatementKind::Query)
-        else {
+        let Decision::Block(reason) = decide(&engine, "anonymous", "SELECT 1") else {
             panic!("blocked");
         };
         assert!(reason.starts_with("masking schema"), "{reason}");
+        let Verdict::Deny(deny) = engine.statement(&session("anonymous"), "SELECT 1") else {
+            panic!("denied");
+        };
+        assert_eq!(deny.sqlstate.as_str(), CANNOT_CONNECT_NOW);
     }
 
     #[test]
     fn test_modes() {
         let shadow =
             engine(&format!("{CONFIG}\n").replacen("[general]", "[general]\nmode = \"shadow\"", 1));
-        let output = shadow.statement(&context(
-            "anonymous",
-            "SELECT ssn FROM users",
-            StatementKind::Query,
-        ));
-        assert!(format!("{output:?}").contains("action: 0"), "{output:?}");
+        assert_eq!(
+            shadow.statement(&session("anonymous"), "SELECT ssn FROM users"),
+            Verdict::Allow
+        );
 
         let enforce = engine(CONFIG);
-        let output = enforce.statement(&context(
-            "anonymous",
-            "SELECT ssn FROM users",
-            StatementKind::Query,
+        assert!(matches!(
+            enforce.statement(&session("anonymous"), "SELECT ssn FROM users"),
+            Verdict::Rewrite { .. }
         ));
-        assert!(format!("{output:?}").contains("action: 1"), "{output:?}");
 
         // Exempt users are never analyzed.
-        let output = enforce.statement(&context(
-            "admin",
-            "SELECT * FROM unknown_table",
-            StatementKind::Query,
-        ));
-        assert!(format!("{output:?}").contains("action: 0"), "{output:?}");
+        assert_eq!(
+            enforce.statement(&session("admin"), "SELECT * FROM unknown_table"),
+            Verdict::Allow
+        );
     }
 
     #[test]
-    fn test_scrub_transform() {
-        let enforce = engine(CONFIG);
-        let output = |user, sql| {
-            format!(
-                "{:?}",
-                enforce.statement(&context(user, sql, StatementKind::Query))
-            )
-        };
+    fn test_redact_error() {
+        let fields = [
+            ErrorField {
+                code: field::SQLSTATE,
+                value: "23514".into(),
+            },
+            ErrorField {
+                code: field::MESSAGE,
+                value: "check".into(),
+            },
+            ErrorField {
+                code: field::DETAIL,
+                value: "Failing row contains (1, secret).".into(),
+            },
+        ];
+        let error = ErrorFields::new(false, &fields);
 
-        // Statements touching masked relations get the transform, others don't.
-        assert!(
-            output("anonymous", "UPDATE users SET name = $1 WHERE id = $2")
-                .contains("transform: 1")
+        let enforce = engine(CONFIG);
+        assert_eq!(
+            enforce.redact_error(&session("anonymous"), &error),
+            Redaction::Replace(vec![
+                (field::SQLSTATE, "23514".into()),
+                (field::MESSAGE, "check".into())
+            ])
         );
-        assert!(output("anonymous", "SELECT ssn FROM users").contains("transform: 1"));
-        assert!(output("anonymous", "SELECT id FROM orders").contains("transform: 0"));
-        assert!(output("admin", "UPDATE users SET name = $1").contains("transform: 0"));
+        // Exempt users keep DETAIL.
+        assert_eq!(
+            enforce.redact_error(&session("admin"), &error),
+            Redaction::Keep
+        );
+        // Nothing to remove.
+        let error = ErrorFields::new(false, &fields[..2]);
+        assert_eq!(
+            enforce.redact_error(&session("anonymous"), &error),
+            Redaction::Keep
+        );
 
         let disabled =
             engine(&CONFIG.replacen("[general]", "[general]\nscrub_error_detail = false", 1));
-        let output = format!(
-            "{:?}",
-            disabled.statement(&context(
-                "anonymous",
-                "SELECT ssn FROM users",
-                StatementKind::Query
-            ))
+        let error = ErrorFields::new(false, &fields);
+        assert_eq!(
+            disabled.redact_error(&session("anonymous"), &error),
+            Redaction::Keep
         );
-        assert!(output.contains("transform: 0"), "{output}");
-
-        let body = b"SERROR\0C23514\0Mcheck\0DFailing row contains (1, secret).\0\0";
-        let replaced = enforce.transform(&TransformContext {
-            handle: SCRUB,
-            code: b'E',
-            payload: body.as_slice().into(),
-            result_formats: Default::default(),
-        });
-        let replaced = format!("{replaced:?}");
-        assert!(replaced.contains("action: 1"), "{replaced}");
-        let forwarded = enforce.transform(&TransformContext {
-            handle: SCRUB,
-            code: b'D',
-            payload: body.as_slice().into(),
-            result_formats: Default::default(),
-        });
-        assert!(format!("{forwarded:?}").contains("action: 0"));
     }
 }

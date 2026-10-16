@@ -1081,7 +1081,7 @@ dependencies = [
 [[package]]
 name = "pgdog-config"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=03e43475618b8aadffa4a1048c96176aad08fe4a#03e43475618b8aadffa4a1048c96176aad08fe4a"
+source = "git+https://github.com/ewhauser/pgdog?rev=6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1#6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1"
 dependencies = [
  "derive_more",
  "indexmap 2.14.2",
@@ -1123,8 +1123,8 @@ dependencies = [
 
 [[package]]
 name = "pgdog-plugin"
-version = "0.6.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=03e43475618b8aadffa4a1048c96176aad08fe4a#03e43475618b8aadffa4a1048c96176aad08fe4a"
+version = "0.7.0"
+source = "git+https://github.com/ewhauser/pgdog?rev=6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1#6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1"
 dependencies = [
  "bindgen 0.71.1",
  "libloading",
@@ -1137,7 +1137,7 @@ dependencies = [
 [[package]]
 name = "pgdog-postgres-types"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=03e43475618b8aadffa4a1048c96176aad08fe4a#03e43475618b8aadffa4a1048c96176aad08fe4a"
+source = "git+https://github.com/ewhauser/pgdog?rev=6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1#6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1"
 dependencies = [
  "bytes",
  "chrono",
@@ -1153,7 +1153,7 @@ dependencies = [
 [[package]]
 name = "pgdog-stats"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=03e43475618b8aadffa4a1048c96176aad08fe4a#03e43475618b8aadffa4a1048c96176aad08fe4a"
+source = "git+https://github.com/ewhauser/pgdog?rev=6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1#6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1168,7 +1168,7 @@ dependencies = [
 [[package]]
 name = "pgdog-vector"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=03e43475618b8aadffa4a1048c96176aad08fe4a#03e43475618b8aadffa4a1048c96176aad08fe4a"
+source = "git+https://github.com/ewhauser/pgdog?rev=6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1#6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1"
 dependencies = [
  "schemars 1.2.3",
  "serde",

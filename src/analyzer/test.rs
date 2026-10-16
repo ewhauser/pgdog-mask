@@ -791,7 +791,7 @@ fn test_functions() {
         ("SELECT volatile_ssn(1)", "VOLATILE"),
         ("SELECT plpgsql_fn()", "plpgsql"),
         ("SELECT recursive_fn(1)", "recursive"),
-        ("SELECT unknown_fn(1)", "isn't in the schema snapshot"),
+        ("SELECT unknown_fn(1)", "isn't in the catalog"),
         ("SELECT user_ssn(uid => 1)", "named arguments"),
         ("SELECT ssns()", "returns a set"),
         ("SELECT * FROM ssns() WITH ORDINALITY", "ORDINALITY"),

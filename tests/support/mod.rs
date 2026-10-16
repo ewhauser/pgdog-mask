@@ -1,9 +1,10 @@
-//! Load a database's catalog the way PgDog does for SCHEMA plugins: with PgDog's
-//! own catalog queries, serialized into the snapshot PgDog sends to plugins.
+//! Load a database's catalog the way PgDog does for CATALOG plugins: with PgDog's
+//! own catalog queries, converted into the `Catalog` PgDog sends to plugins.
 use std::collections::HashMap;
 
 use pgdog_mask::catalog::Catalog;
-use pgdog_stats::{Column, Function, Operator, Relation, Schema, SchemaInner, SecurityLabel};
+use pgdog_plugin::{CatalogParts, catalog as plugin};
+use pgdog_stats::{Column, Function, Operator, Relation, SecurityLabel};
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 // PgDog's schema loader queries (pgdog/src/backend/schema/*.sql), copied from the
@@ -141,30 +142,94 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
     .map(|row| text(row, 0))
     .collect();
 
-    let mut nested: HashMap<String, HashMap<String, Relation>> = HashMap::new();
-    for ((schema, name), relation) in relations {
-        nested.entry(schema).or_default().insert(name, relation);
-    }
-    let schema = Schema::new(SchemaInner {
+    // Converted like PgDog does (pgdog/src/plugin/catalog.rs).
+    let mut relations: Vec<_> = relations.into_values().map(relation).collect();
+    relations.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    let catalog = plugin::Catalog {
+        parts: CatalogParts::ALL,
         search_path: search_path.iter().map(|s| (*s).to_owned()).collect(),
-        relations: nested,
-        full_catalog: true,
-        functions,
-        operators,
+        relations,
+        functions: functions.into_iter().map(function).collect(),
         system_functions,
-        ..Default::default()
-    });
-    // Versioned the way PgDog sends it.
-    #[derive(serde::Serialize)]
-    struct Snapshot<'a> {
-        format_version: u32,
-        #[serde(flatten)]
-        schema: &'a Schema,
+        operators: operators.into_iter().map(operator).collect(),
+    };
+    Catalog::from_plugin(&catalog)
+}
+
+fn relation(relation: Relation) -> plugin::Relation {
+    let kind = match relation.type_.as_str() {
+        "table" => plugin::RelationKind::Table,
+        "partitioned table" => plugin::RelationKind::PartitionedTable,
+        "view" => plugin::RelationKind::View,
+        "materialized view" => plugin::RelationKind::MaterializedView,
+        "foreign table" => plugin::RelationKind::ForeignTable,
+        _ => plugin::RelationKind::Other,
+    };
+    plugin::Relation {
+        schema: relation.schema,
+        name: relation.name,
+        kind,
+        columns: relation
+            .columns
+            .into_values()
+            .map(|column| plugin::Column {
+                name: column.column_name,
+                data_type: column.data_type,
+                type_name: column.type_name,
+                is_primary_key: column.is_primary_key,
+                comment: column.comment,
+                security_labels: column
+                    .security_labels
+                    .into_iter()
+                    .map(|label| plugin::SecurityLabel {
+                        provider: label.provider,
+                        label: label.label,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        parent: relation.parent_table_schema.zip(relation.parent_table_name),
+        definition: relation.definition,
+        options: relation.options,
     }
-    let snapshot = serde_json::to_string(&Snapshot {
-        format_version: pgdog_plugin::SCHEMA_SNAPSHOT_VERSION,
-        schema: &schema,
-    })
-    .expect("serialize snapshot");
-    Catalog::from_json(&snapshot).expect("plugin parses the snapshot")
+}
+
+fn function(function: Function) -> plugin::Function {
+    plugin::Function {
+        oid: function.oid as u32,
+        schema: function.schema,
+        name: function.name,
+        kind: function.kind,
+        argument_types: function.argument_types,
+        argument_names: function.argument_names,
+        argument_defaults: function.argument_defaults.max(0) as u16,
+        variadic: function.variadic,
+        return_type: function.return_type,
+        result: function.result,
+        returns_set: function.returns_set,
+        output_names: function.output_names,
+        output_types: function.output_types,
+        language: function.language,
+        source: function.source,
+        sql_body: function.sql_body,
+        volatility: function.volatility,
+        security_definer: function.security_definer,
+        strict: function.strict,
+        config: function.config,
+        extension: function.extension,
+    }
+}
+
+fn operator(operator: Operator) -> plugin::Operator {
+    plugin::Operator {
+        oid: operator.oid as u32,
+        schema: operator.schema,
+        name: operator.name,
+        left_type: operator.left_type,
+        right_type: operator.right_type,
+        result_type: operator.result_type,
+        function_oid: operator.function_oid as u32,
+        function_schema: operator.function_schema,
+        function_name: operator.function_name,
+    }
 }

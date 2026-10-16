@@ -611,7 +611,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         } else {
             if self.ctx.policies.config.general.on_unresolved == OnUnresolved::Block {
                 self.block(format!(
-                    "relation \"{name}\" is not in the schema snapshot, so its columns can't be checked"
+                    "relation \"{name}\" is not in the catalog, so its columns can't be checked"
                 ));
             }
             Item {
@@ -1327,7 +1327,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             else {
                 if self.ctx.policies.config.general.on_unresolved == OnUnresolved::Block {
                     self.block(format!(
-                        "relation \"{name}\" is not in the schema snapshot, so its columns can't be checked"
+                        "relation \"{name}\" is not in the catalog, so its columns can't be checked"
                     ));
                 }
                 return;

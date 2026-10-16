@@ -12,7 +12,7 @@ Postgres then computes the masked values, so filters, sorting and aggregates can
 
 ## Requirements
 
-The plugin uses PgDog's plugin API 0.6 (statement, transform and schema hooks), which lives on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`) until it's upstream. `Cargo.toml` pins `pgdog-plugin` to a commit there.
+The plugin uses PgDog's plugin API 0.7 (statement, error and catalog hooks), which lives on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`) until it's upstream. `Cargo.toml` pins `pgdog-plugin` to a commit there.
 
 PgDog only loads plugins with the same plugin API version that were built by the same Rust compiler. Build PgDog from the pinned commit with the same toolchain as this plugin. `rust-toolchain.toml` matches PgDog's.
 
@@ -35,7 +35,7 @@ config = "masking.toml"
 required = true   # never serve traffic without masking
 ```
 
-The plugin needs PgDog's schema snapshot and loads it automatically. Masked users get an error (SQLSTATE `57P03`) until the snapshot has loaded.
+The plugin needs the database catalog, which PgDog loads and sends to it automatically. Masked users get an error (SQLSTATE `57P03`) until the catalog has loaded.
 
 ## Configuration
 
@@ -43,12 +43,12 @@ The plugin needs PgDog's schema snapshot and loads it automatically. Masked user
 # masking.toml
 [general]
 mode = "enforce"            # enforce | shadow (log decisions only) | off
-on_unresolved = "block"     # relations missing from the schema snapshot
+on_unresolved = "block"     # relations missing from the catalog
 udf_allowlist = []          # functions masked users may call without analysis, e.g. "public.normalize_phone"
 extension_allowlist = []    # extensions whose functions and operators are trusted, e.g. "citext"
 view_allowlist = []         # views masked users may query without analysis
 inline_views = true         # inline views over masked columns; false: treat views like tables
-scrub_error_detail = true   # remove DETAIL from errors/notices of statements touching masked tables
+scrub_error_detail = true   # remove DETAIL from the errors and notices masked users get
 tag_source = "config"       # config | comment | security_label
 security_label_provider = "pgdog"
 cache_size = 100000
@@ -134,13 +134,13 @@ Built-in masks are `none`, `null`, `constant` (`value`), `default`, `partial` (`
 
 All of these fail closed with SQLSTATE `42501`:
 - call functions in procedural languages or C, extension functions and operators, and SQL functions that read masked columns but can't be inlined, unless they're in `udf_allowlist` or `extension_allowlist`;
-- call functions that aren't in the schema snapshot;
+- call functions that aren't in the catalog;
 - call SQL-executing built-ins such as `query_to_xml`, `dblink*` and `lo_*`;
 - query `pg_stats`, `pg_statistic` or `pg_stat_statements`;
 - run `DO`, `MERGE`, `COPY … TO PROGRAM/file`, or DDL other than creating tables, `DROP`, sequences, and `ALTER TABLE`/`CREATE INDEX`/renames of relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, renames would unmask columns, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
 - write through views that read masked columns, or read columns of table-like views computed from masked columns;
-- query views missing from the schema snapshot's definitions;
-- query relations missing from the schema snapshot;
+- query views missing from the catalog's view definitions;
+- query relations missing from the catalog;
 - expand `*` across `JOIN … USING`/`NATURAL`, or alias a join, over masked columns;
 - create tables that shadow a masked table;
 - make fast-path function calls.

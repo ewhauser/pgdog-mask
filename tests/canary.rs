@@ -3,9 +3,8 @@
 //! Masked columns are seeded with unique canary values. Adversarial statements
 //! are analyzed as a masked user and whatever the analyzer lets through is run
 //! against Postgres. No canary may appear anywhere in what comes back: rows,
-//! errors, notices or COPY data. Errors and notices of statements that touch
-//! masked relations go through the plugin's `DETAIL` scrubbing first, as they
-//! would through PgDog.
+//! errors, notices or COPY data. Errors and notices lose their `DETAIL` first,
+//! as they do for masked users through PgDog.
 //!
 //! The schema is loaded with PgDog's own catalog queries.
 //!
@@ -19,7 +18,6 @@ use futures_util::{StreamExt as _, pin_mut, stream};
 use pgdog_mask::analyzer::{Context, Outcome, analyze, analyze_shape};
 use pgdog_mask::config::Config;
 use pgdog_mask::profile::{Assignments, Policies};
-use pgdog_mask::scrub::scrub_detail;
 use tokio_postgres::error::DbError;
 use tokio_postgres::{AsyncMessage, Client, NoTls, SimpleQueryMessage};
 
@@ -168,15 +166,15 @@ async fn setup(client: &Client) {
         .expect("setup");
 }
 
-/// Fields of an error or notice, encoded as an `ErrorResponse` body and
-/// scrubbed the way the plugin's transform does it, then rendered as text.
-fn render(error: &DbError, scrub: bool) -> String {
+/// Fields of an error or notice, rendered as text. `redact` drops `DETAIL`, as
+/// the plugin does for masked users.
+fn render(error: &DbError, redact: bool) -> String {
     let mut body = vec![];
     let fields = [
         (b'S', Some(error.severity())),
         (b'C', Some(error.code().code())),
         (b'M', Some(error.message())),
-        (b'D', error.detail()),
+        (b'D', error.detail().filter(|_| !redact)),
         (b'H', error.hint()),
         (b'W', error.where_()),
         (b's', error.schema()),
@@ -192,15 +190,11 @@ fn render(error: &DbError, scrub: bool) -> String {
             body.push(0);
         }
     }
-    body.push(0);
-    if scrub && let Some(scrubbed) = scrub_detail(&body) {
-        body = scrubbed;
-    }
     String::from_utf8_lossy(&body).replace('\0', " | ")
 }
 
 /// Everything a statement sends back, as text: rows, COPY data, the error and notices.
-async fn run(conn: &Connection, sql: &str, scrub: bool) -> Result<String, String> {
+async fn run(conn: &Connection, sql: &str, redact: bool) -> Result<String, String> {
     conn.notices.lock().unwrap().clear();
     let client = &conn.client;
     let result = if sql.trim_start().to_ascii_uppercase().starts_with("COPY") {
@@ -213,10 +207,10 @@ async fn run(conn: &Connection, sql: &str, scrub: bool) -> Result<String, String
         .lock()
         .unwrap()
         .iter()
-        .map(|notice| format!("NOTICE {}\n", render(notice, scrub)))
+        .map(|notice| format!("NOTICE {}\n", render(notice, redact)))
         .collect();
     let error = |err: tokio_postgres::Error| match err.as_db_error() {
-        Some(db) => render(db, scrub),
+        Some(db) => render(db, redact),
         None => format!("{err:?}"),
     };
     match result {
@@ -574,19 +568,15 @@ async fn test_no_canary_leaks() {
                 None => continue,
             },
         };
-        let (to_run, scrub) = match &outcome {
+        let to_run = match &outcome {
             Outcome::Blocked { reason } => {
                 if *expect == Expect::Runs {
                     failures.push(format!("[{path}] {sql}\n  unexpectedly blocked: {reason}"));
                 }
                 continue;
             }
-            Outcome::Rewritten {
-                sql,
-                touches_masked,
-                ..
-            } => (sql.clone(), *touches_masked),
-            Outcome::Unchanged { touches_masked, .. } => (sql.to_string(), *touches_masked),
+            Outcome::Rewritten { sql, .. } => sql.clone(),
+            Outcome::Unchanged { .. } => sql.to_string(),
         };
 
         if *expect == Expect::Blocked {
@@ -596,7 +586,8 @@ async fn test_no_canary_leaks() {
             continue;
         }
 
-        let result = run(&conn, &to_run, scrub).await;
+        // Masked users get every error redacted.
+        let result = run(&conn, &to_run, true).await;
         // Leave no transaction open after an error.
         let _ = client.batch_execute("ROLLBACK").await;
 

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use pgdog_plugin::{
-    Capabilities, Config as PluginConfig, PdStr, Plugin, StatementContext, StatementOutput,
-    TransformContext, TransformOutput,
+    Access, Capabilities, Catalog, CatalogParts, Config as PluginConfig, ErrorFields, PdStr,
+    Plugin, Redaction, Session, Verdict,
 };
 use tracing::error;
 
@@ -19,7 +19,6 @@ pub mod config;
 pub mod engine;
 pub mod mask;
 pub mod profile;
-pub mod scrub;
 pub mod tags;
 
 use engine::Engine;
@@ -35,12 +34,10 @@ impl Plugin for MaskingPlugin {
         env!("CARGO_PKG_VERSION").into()
     }
 
+    // Configure the plugin with `required = true` in `[[plugins]]`: PgDog must
+    // never serve traffic without masking once it's configured.
     fn capabilities() -> Capabilities {
-        // REQUIRED: PgDog must never serve traffic without masking once it's configured.
-        Capabilities::STATEMENT
-            | Capabilities::TRANSFORM
-            | Capabilities::SCHEMA
-            | Capabilities::REQUIRED
+        Capabilities::STATEMENT | Capabilities::ERRORS | Capabilities::CATALOG
     }
 
     extern "C-unwind" fn config(config: PluginConfig<'_>) -> bool {
@@ -58,16 +55,29 @@ impl Plugin for MaskingPlugin {
         }
     }
 
-    fn statement(context: StatementContext<'_>) -> StatementOutput {
-        ENGINE.statement(&context)
+    fn statement(session: &Session<'_>, sql: &str) -> Verdict {
+        ENGINE.statement(session, sql)
     }
 
-    fn transform(context: TransformContext<'_>) -> TransformOutput {
-        ENGINE.transform(&context)
+    fn function_call(session: &Session<'_>, function: u32) -> Access {
+        ENGINE.function_call(session, function)
     }
 
-    fn schema(database: &str, epoch: u64, snapshot: &str) {
-        ENGINE.schema(database, epoch, snapshot);
+    fn generation() -> u64 {
+        ENGINE.generation()
+    }
+
+    fn redact_error(session: &Session<'_>, error: &ErrorFields<'_>) -> Redaction {
+        ENGINE.redact_error(session, error)
+    }
+
+    fn catalog_parts() -> CatalogParts {
+        // Columns hidden from PgDog's role, views and functions are all analyzed.
+        CatalogParts::ALL
+    }
+
+    fn catalog(database: &str, catalog: &Catalog) {
+        ENGINE.catalog(database, catalog);
     }
 
     fn reload() -> bool {

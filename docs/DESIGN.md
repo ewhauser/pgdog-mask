@@ -1,6 +1,6 @@
 # Dynamic Data Masking for PgDog — Design
 
-> This project ([pgdog-mask](../README.md)) is the plugin. The PgDog changes it needs (plugin API 0.6, §8) are on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog), branch `masking/plugin-api`. Paths like `pgdog/src/...` refer to that repository.
+> This project ([pgdog-mask](../README.md)) is the plugin. The PgDog changes it needs (plugin API 0.7, §8) are on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog), branch `masking/plugin-api`. Paths like `pgdog/src/...` refer to that repository.
 
 Status: P1 and P2 implemented · Scope: `pgdog-plugin` API extensions + this plugin
 
@@ -10,9 +10,9 @@ We will build column-level dynamic data masking as a PgDog plugin. The model fol
 
 The plugin parses every statement with `pg_raw_parse`. It resolves each column reference to a base `schema.table.column` and checks it against the policies for the caller's identity. Every reference to a masked column is then replaced with the policy's masking expression. This applies wherever the reference appears: projections, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, `RETURNING`, subqueries, CTEs, `COPY` and `INSERT … SELECT`. PgDog sends the rewritten SQL, and Postgres computes the masked values.
 
-The rewrite is the main enforcement mechanism. A second mechanism, a **result-transform channel**, rewrites `RowDescription`/`DataRow`/`ErrorResponse` messages inside the proxy. It covers what SQL cannot express: keyed HMAC/tokenization with secrets that must not reach the database, format-preserving encryption, and scrubbing values out of error messages.
+The rewrite is the main enforcement mechanism. Two narrower hooks cover what SQL cannot express: **column masks**, computed by the plugin on batches of result rows (keyed HMAC/tokenization with secrets that must not reach the database, format-preserving encryption), and **error redaction**, which removes values from the errors and notices Postgres returns.
 
-Both mechanisms are **generic plugin APIs**: a statement-rewrite hook and a result-transform hook. Neither is masking-specific, so pgdog core gains only reusable extension points. Encryption, DLP and audit plugins could use the same hooks.
+All of them are **generic plugin APIs** (§8): a statement hook returning a verdict, a batched column-mask hook, and an error-redaction hook. None is masking-specific, so PgDog core gains only reusable extension points. Encryption, DLP and audit plugins could use the same hooks.
 
 ### Goals
 
@@ -31,7 +31,7 @@ Both mechanisms are **generic plugin APIs**: a statement-rewrite hook and a resu
 
 ---
 
-## 2. Key decision: rewrite first, transform second
+## 2. Key decision: rewrite first, proxy-side work second
 
 The initial idea was to mask in the result stream: let the query run, then mask `DataRow` values in the proxy. That needs the fewest core changes. On its own, though, it is **not secure**, and it cannot match Snowflake semantics:
 
@@ -49,11 +49,12 @@ The initial idea was to mask in the result stream: let the query run, then mask 
 
 A rewrite only has to resolve **leaf column references**. It does not have to track lineage through arbitrary expressions, because masking at the leaf carries through everything built on top of it. Postgres then produces the correct `RowDescription`, types and binary encodings. This is also how Snowflake works: it rewrites the column into the policy body everywhere it appears.
 
-The result-transform channel stays, for three narrower jobs:
+Proxy-side work stays for two narrower jobs, each with its own typed hook:
 
-1. **Proxy-only masks.** Keyed HMAC, tokenization against a vault and FPE need a secret that must not appear in SQL text, where `pg_stat_statements`, logs and `EXPLAIN` would expose it. These masks are only allowed when the masked column appears as a plain passthrough in the top-level projection. Any other reference to the same column still gets the policy's SQL fallback mask through the rewrite.
-2. **Error and notice scrubbing.** For example, a `CHECK` violation `DETAIL: Failing row contains (5, 123-45-6789, …)` exposes the stored values of other masked columns in the row.
-3. **Defense in depth.** The channel cross-checks `RowDescription.table_oid/column` (Postgres' own origin info for plain column outputs) against the plan, and fails the query on a mismatch.
+1. **Proxy-only masks** (column masks). Keyed HMAC, tokenization against a vault and FPE need a secret that must not appear in SQL text, where `pg_stat_statements`, logs and `EXPLAIN` would expose it. These masks are only allowed when the masked column appears as a plain passthrough in the top-level projection, cast to text. Any other reference to the same column still gets the policy's SQL fallback mask through the rewrite.
+2. **Error and notice redaction.** For example, a `CHECK` violation `DETAIL: Failing row contains (5, 123-45-6789, …)` exposes the stored values of other masked columns in the row. Redaction applies to every error and notice a masked user gets, not only those of statements touching masked relations: triggers and functions can raise errors about other tables.
+
+An earlier version of the API passed raw protocol messages to a generic transform hook. It was replaced (§8): plugins would have had to parse the wire protocol and manage handle lifetimes, and PgDog to expose them, for two jobs that need neither.
 
 ---
 
@@ -83,13 +84,11 @@ The deliberate difference is how the condition is evaluated. Snowflake evaluates
               │ cluster_check
               │ ┌──────────────────────────────────────────────────────────────┐
               │ │ NEW apply_statement_plugins                                  │
-              │ │   StatementContext{identity, kind, sql, stmt name,           │
-              │ │                    search_path, in_transaction}              │
-              │ │   └─► plugin.statement() ─► Continue | Rewrite{sql,tag}      │
-              │ │                              | Block{sqlstate,msg}           │
-              │ │                              (+ optional transform handle)   │
+              │ │   plugin.statement(&Session, sql) ─► Allow                   │
+              │ │       | Rewrite{sql, column masks} | Deny{sqlstate, msg}     │
               │ │   Rewrite → replace Query/Parse text before the prepared     │
-              │ │   statement cache sees it; Bind re-checks the variant tag    │
+              │ │   statement cache sees it; Bind re-checks only when the      │
+              │ │   plugin's generation or search_path changed                 │
               │ └──────────────────────────────────────────────────────────────┘
               │ parse_request           (PgDog AST cache + pgdog rewrites on *masked* SQL)
               │ rewrite_request / route_query / finalize_after_route (sharding as usual)
@@ -99,8 +98,8 @@ The deliberate difference is how the condition is evaluated. Snowflake evaluates
               ▼
             QueryEngine::process_server_message (query_engine/query.rs:189)
               │ ┌──────────────────────────────────────────────────────────────┐
-              │ │ NEW if pending_transform: plugin.transform(T/D/C/E/N/…)      │
-              │ │     Forward | Replace(payload) | Fail                        │
+              │ │ NEW E/N: plugin.redact_error(&Session, fields)               │
+              │ │ NEW D with column masks: plugin.mask_rows(batch of rows)     │
               │ └──────────────────────────────────────────────────────────────┘
               ▼ stream.send
             client
@@ -117,7 +116,7 @@ Why these two points:
 
   masking-core/     # pure library: policy model, identity → profile, analyzer, rewriter, proxy masks.
                     # No pgdog dependency beyond pg_raw_parse + pgdog-postgres-types. Fully unit testable.
-  masking-plugin/   # cdylib: implements pgdog_plugin::Plugin, caches, schema snapshots, config reload
+  masking-plugin/   # cdylib: implements pgdog_plugin::Plugin, caches, catalogs, config reload
   masking-cli/      # `pgdog-mask explain|validate|lint` using masking-core against a live DB schema
 ```
 
@@ -185,8 +184,8 @@ RangeItem =
 
 Resolution rules:
 
-- **Relations** resolve against the session `search_path` (from the `ParameterStore`), with `pg_temp` first. They are looked up in the host-provided schema snapshot (§8.4). An unknown relation fails closed for restricted profiles.
-- **Qualified columns** (`a.col`, `s.t.col`) resolve against the matching range item. **Unqualified columns** search items in the current scope, then outer scopes. This matches Postgres. Ambiguity is a Postgres error anyway; if the snapshot lacks a column that Postgres would resolve, the statement fails closed.
+- **Relations** resolve against the session `search_path` (from the `ParameterStore`), with `pg_temp` first. They are looked up in the catalog PgDog sends (§8.5). An unknown relation fails closed for restricted profiles.
+- **Qualified columns** (`a.col`, `s.t.col`) resolve against the matching range item. **Unqualified columns** search items in the current scope, then outer scopes. This matches Postgres. Ambiguity is a Postgres error anyway; if the catalog lacks a column that Postgres would resolve, the statement fails closed.
 - **Derived tables and CTEs** are analyzed recursively first. Their outputs only carry lineage. Masks are applied *inside* them at the base reference, so outer references need no further rewriting.
 - **Set operations** (`UNION`/`INTERSECT`/`EXCEPT`): each branch is resolved independently.
 - Identifier case folding follows Postgres: unquoted names are lowercased.
@@ -243,8 +242,8 @@ A block returns `ErrorResponse` with SQLSTATE `42501` (insufficient_privilege) a
 
 ### 6.6 Views, materialized views, partitions
 
-- **Partitions and inheritance children** inherit the parent's column policies. The snapshot carries `parent_table`. Querying `users_2024` directly is masked like `users`.
-- **Views.** The schema snapshot includes `pg_get_viewdef(oid)`. At snapshot load the plugin parses each view definition and computes its lineage. A view that references masked columns is a *masked view*. For restricted profiles, a `RangeVar` naming a masked view in a read context is replaced by `(<masked view definition>) AS <alias or view name>`, applied recursively for nested views. Writes through masked views are blocked. If the view is `security_barrier` or `security_invoker`, or inlining is disabled (`inline_views = false`), the view is treated like a table instead: passthrough output columns inherit the base policy, and derived ones must be explicitly assigned or the statement is blocked.
+- **Partitions and inheritance children** inherit the parent's column policies. The catalog carries each partition's parent. Querying `users_2024` directly is masked like `users`.
+- **Views.** The catalog includes `pg_get_viewdef(oid)`. When a catalog arrives, the plugin parses each view definition and computes its lineage. A view that references masked columns is a *masked view*. For restricted profiles, a `RangeVar` naming a masked view in a read context is replaced by `(<masked view definition>) AS <alias or view name>`, applied recursively for nested views. Writes through masked views are blocked. If the view is `security_barrier` or `security_invoker`, or inlining is disabled (`inline_views = false`), the view is treated like a table instead: passthrough output columns inherit the base policy, and derived ones must be explicitly assigned or the statement is blocked.
 - **Materialized views** hold materialized raw data. Passthrough columns inherit policies automatically. Derived columns of masked inputs without an explicit assignment raise a load-time warning, and statements touching them are blocked.
 
 As built in P2:
@@ -255,13 +254,13 @@ As built in P2:
   - a column that passes a masked column through gets its policy, with conditional-mask arguments renamed to the view's columns;
   - a column computed from masked columns, or whose inputs can't be determined, is blocked for users who would see any of those inputs masked. Assigning the view column a policy unblocks it.
 - **`view_allowlist`** remains as an attestation: listed views are used as they are, without analysis.
-- A view without a definition in the snapshot is blocked for masked users.
+- A view without a definition in the catalog is blocked for masked users.
 
 ---
 
 ### 6.7 Functions
 
-The schema snapshot (§8.4) includes `pg_proc` rows for functions outside `pg_catalog` and `information_schema`. Each row carries:
+The catalog (§8.5) includes `pg_proc` rows for functions outside `pg_catalog` and `information_schema`. Each row carries:
 - name, argument and return types, `proretset`;
 - language, `prosrc`, and `pg_get_function_sqlbody` for `BEGIN ATOMIC` bodies;
 - volatility, `prosecdef`, `proisstrict` and `proconfig`.
@@ -281,7 +280,7 @@ For a restricted profile, each call `f(args)` is handled as follows:
 4. **Procedural languages** (PL/pgSQL, PL/Python, …) are blocked unless listed in `udf_allowlist`. An allowlist entry is the administrator's attestation that the function doesn't return masked data.
 
 As built in P2:
-- **Built-ins** are the names in the snapshot's `system_functions` (`pg_catalog` functions, from `pg_proc`). A name that is neither a user-defined function in the snapshot nor a built-in is blocked, which covers functions created after the snapshot was taken.
+- **Built-ins** are the names in the catalog's `system_functions` (`pg_catalog` functions, from `pg_proc`). A name that is neither a user-defined function in the catalog nor a built-in is blocked, which covers functions created after the catalog was loaded.
 - **Candidates** are the user-defined functions with the call's name, in its schema or the `search_path`, whose arity fits (counting defaults and `VARIADIC`). Any blocked candidate blocks the call. A call is only inlined if it has a single candidate. A user-defined function that shadows a built-in name is analyzed instead of the built-in.
 - **Arguments are evaluated once.** A scalar call becomes `(SELECT (<value>)::<return type> FROM (SELECT <arg>::<type> AS <param>, …) AS __pgdog_args)`, where `<value>` is `(SELECT … FROM (<masked body>) AS __pgdog_body(__pgdog_out) LIMIT 1)`: the first row, like a SQL function. Parameters are columns of the arguments subquery, so columns of the body still take precedence over parameter names, as in SQL functions; `$n` and `function.param` references are rewritten to it. Because arguments aren't duplicated, the "no volatile arguments" condition isn't needed. `STRICT` adds the `CASE WHEN <arg> IS NULL …` wrapper.
 - **In FROM**, a set-returning call becomes a `LATERAL` subquery with the function's output columns (`OUT`/`TABLE` columns, or a table's columns for `SETOF table`) cast to their declared types. A scalar function in FROM becomes a one-row `LATERAL` subquery over the scalar form.
@@ -487,10 +486,10 @@ The analyzer only routes a reference to the proxy channel when it is a passthrou
 1. TOML schema validation and policy/type compatibility.
 2. Every SQL template is parsed. Templates may reference only `val` and declared `arguments`, and may call only allowlisted (immutable or stable, built-in) functions.
 3. **Live validation**: each template is prepared against the database as `SELECT (<template>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, to catch type errors before traffic does. `pgdog-mask validate` runs the same check in CI.
-4. Assignments are checked against the schema snapshot. A column that doesn't exist warns. Sharding keys and tenant columns are rejected.
+4. Assignments are checked against the catalog. A column that doesn't exist warns. Sharding keys and tenant columns are rejected.
 5. Rules with `search = "raw"` warn when they enable range or pattern operators, or when they target a low-entropy type (`date`, `boolean`, small enums).
 
-If validation fails at startup, `config()` returns `false`. PgDog skips the plugin and, because the plugin declares `REQUIRED`, **refuses to start** (§8.2). If validation fails on reload, the plugin keeps the last good policy set.
+If validation fails at startup, `config()` returns `false`. PgDog skips the plugin and, because the plugin is configured with `required = true`, **refuses to start** (§8.2). If validation fails on reload, the plugin keeps the last good policy set.
 
 ### 7.4 Where policies and tags live
 
@@ -521,162 +520,43 @@ As built in P2:
 
 ## 8. Plugin API extensions (core changes)
 
-The core patch is implemented on `masking/plugin-api` as `pgdog-plugin` **0.6.0**. The vtable gained fields, so this is a minor bump, as the vtable comment requires (`pgdog-plugin/src/plugin.rs`). Existing route-only plugins only need a rebuild. This section describes what was built.
+The core patch is on `masking/plugin-api` as `pgdog-plugin` **0.7.0**. PgDog's [`docs/PLUGIN_SYSTEM.md`](https://github.com/ewhauser/pgdog/blob/masking/plugin-api/docs/PLUGIN_SYSTEM.md) and the `Plugin` trait documentation are the reference; this section summarizes what the plugin relies on.
 
-### 8.1 Capabilities (`pgdog-plugin/src/capabilities.rs`)
+### 8.1 Capabilities
 
-```rust
-pub struct Capabilities(u64);
-impl Capabilities {
-    pub const ROUTE: Self;      // route() hook, unchanged
-    pub const STATEMENT: Self;  // statement() hook: rewrite / block
-    pub const TRANSFORM: Self;  // transform() hook
-    pub const SCHEMA: Self;     // schema() snapshots; forces schema loading
-    pub const REQUIRED: Self;   // PgDog refuses to start if the plugin fails to load or configure
-}
+| Capability | Hooks | Used by this plugin |
+|---|---|---|
+| `ROUTE` | `route` | no |
+| `STATEMENT` | `statement(&Session, sql) -> Verdict`, `function_call(&Session, oid) -> Access`, `generation()` | yes |
+| `MASK` | `mask_rows(&MaskBatch, &mut MaskOutput)` | P3 (proxy masks) |
+| `ERRORS` | `redact_error(&Session, &ErrorFields) -> Redaction` | yes |
+| `CATALOG` | `catalog_parts()`, `catalog(database, &Catalog)` | yes, all parts |
 
-pub trait Plugin {
-    fn capabilities() -> Capabilities { Capabilities::ROUTE }
-    // ...
-}
-```
+Only one loaded plugin can have `STATEMENT`. `required = true` in `[[plugins]]` makes PgDog refuse to start without the plugin.
 
-`capabilities()` defaults to `ROUTE`, so existing plugins keep their current behavior. PgDog only calls hooks a plugin declared.
+### 8.2 Sessions and verdicts
 
-The design originally had a `REQUIRES_PARSER` capability. It was dropped: the statement hook receives SQL text and runs before PgDog's parser, so it works with `query_parser = "off"`.
+Hooks get a `Session`: the authenticated user and database, the verified TLS identity, and `search_path`. `application_name` and the client address are in `Session::client`, marked untrusted; the plugin doesn't use them.
 
-### 8.2 Loader (`pgdog/src/plugin/mod.rs`)
+`statement` runs for every `Query` and `Parse`, before PgDog parses, rewrites or routes. It returns `Allow`, `Rewrite { sql, columns }` or `Deny`. Verdicts must be deterministic until `generation()` changes. PgDog relies on that for prepared statements: they're checked when prepared, and at `Bind` only if the generation or `search_path` changed, in which case PgDog re-prepares under the client's statement name if the SQL changed. The plugin bumps its generation when it loads new settings or receives a new catalog. A rewrite of a `Parse` must keep its highest `$n`.
 
-- Plugins are kept in a `Vec` in **config order**. They used to be in a `HashMap`, where "first plugin wins" routing depended on hash order.
-- **Required plugins.** Both `[[plugins]] required = true` and the `REQUIRED` capability make startup fail if the plugin can't load, fails version checks, or rejects its config. The config flag also covers a missing shared library, where PgDog never gets to read the plugin's capabilities. The masking plugin docs tell users to set it.
-- **Schema loading.** `Cluster::load_schema` returns true whenever a `SCHEMA` plugin is loaded, including when `load_schema = "off"`.
-- **Panics.** Every new hook has a raw wrapper compiled into the plugin that wraps the user function in `catch_unwind`. Unwinding never crosses into PgDog, and the panic payload is freed by the plugin's own allocator. A panic in `statement` is reported to PgDog and blocks the statement. A panic in `transform` fails it.
+Fast-path function calls carry no SQL, so `function_call` denies them for masked users.
 
-### 8.3 Statement hook (`pgdog-plugin/src/statement.rs`, `query_engine/statement_plugins.rs`)
+### 8.3 Column masks
 
-```rust
-#[repr(C)]
-pub struct Identity<'a> {
-    pub user: PdStr<'a>,             // authenticated PgDog user
-    pub database: PdStr<'a>,
-    pub application_name: PdStr<'a>, // untrusted
-    pub client_addr: PdStr<'a>,
-    pub tls_identity: PdStr<'a>,     // SAN DNS name or subject CN of the client cert, if any
-    pub session_id: u64,
-}
+A rewrite can name text output columns to mask in the proxy (`ColumnMask`: result set, column, `MaskId`, blocking). PgDog calls `mask_rows` with batches of the rows it already received (up to 256 rows or 1 MiB), column by column, and checks the column types on `RowDescription`. Masking failures close the session. P3 uses this for HMAC, FPE and vault tokenization; vault masks are declared blocking and run on PgDog's blocking pool.
 
-#[repr(u8)]
-pub enum StatementKind { Query, Parse, Bind, FunctionCall }
+### 8.4 Error redaction
 
-#[repr(C)]
-pub struct StatementContext<'a> {
-    pub identity: Identity<'a>,
-    pub kind: StatementKind,
-    pub sql: PdStr<'a>,              // for Bind: the statement's ORIGINAL SQL
-    pub statement_name: PdStr<'a>,   // client's name; empty for unnamed and simple queries
-    pub search_path: PdStr<'a>,
-    pub in_transaction: bool,
-}
+`redact_error` sees every `ErrorResponse` and `NoticeResponse` Postgres sends to the client, as fields. PgDog always keeps the severity and SQLSTATE. The plugin removes `DETAIL` for masked users when `scrub_error_detail` is on.
 
-pub trait Plugin {
-    fn statement(context: StatementContext<'_>) -> StatementOutput;
-}
+### 8.5 Catalog
 
-// Constructors on StatementOutput:
-StatementOutput::cont()
-StatementOutput::rewrite(sql, variant_tag)
-StatementOutput::block(sqlstate, message)
-    .with_transform(handle, MessageCodes::none().with('D').with('E'))
-```
-
-**Where it runs.** `QueryEngine::handle` calls `apply_statement_plugins` after logging and **before** `rewrite_extended`. At that point prepared statements still carry the client's names. It runs for every `Query`, `Parse`, `Bind` and fast-path `FunctionCall` message, including requests that later take early-return routing paths, such as multi-statement queries and `SET`. Plugins run in config order, each seeing the previous plugin's SQL. Any `Block`, or any hook error, stops the chain and returns an `ErrorResponse`. Identity comes from the client's `ParameterStore` and `Stream`.
-
-**Prepared statements.** This is simpler than the variant-name scheme the design first proposed (`GlobalCache::variant`), which was not built.
-
-- A named `Parse` is rewritten *before* it is registered in the global prepared-statement cache. That cache is keyed by SQL text, so each distinct rewrite automatically gets its own `__pgdog_N`, shared by every session with the same masking profile. The existing local name mapping, reference counting and eviction all apply unchanged.
-- The engine keeps a per-client map from client statement name to `(original Parse, variant)`.
-- On every `Bind`, the hook is called again with the original SQL. The plugin's cache makes this a hash and a lookup. The call:
-  - supplies the transform for this execution;
-  - catches policy or schema reloads: if the combined variant tag changed, the statement is registered again under the client's name with the new SQL (`PreparedStatements::insert`). The `Bind` is then renamed to the new global statement, and the backend re-prepares it transparently, hiding the `ParseComplete` from the client.
-- The unnamed statement is rewritten in place, and the rewritten `Parse` is stored in `ClientRequest::last_parse`, which PgDog re-sends for lib/pq-style Parse/Describe/Sync then Bind/Execute/Sync flows. If its variant changes between those two requests, the `Bind` is rejected with SQLSTATE `26000`. The same applies when `prepared_statements` is disabled, since PgDog can't re-prepare under the client's name then.
-
-The plugin crate's docs require a rewrite of a `Parse` or `Bind` to keep the number and types of bind parameters unchanged.
-
-### 8.4 Schema snapshots
-
-```rust
-pub trait Plugin {
-    fn schema(database: &str, epoch: u64, snapshot_json: &str) {}
-}
-```
-
-When a cluster's shard 0 schema finishes loading, through the existing `SchemaLoader` path, PgDog serializes it with `serde_json` and calls every `SCHEMA` plugin. That covers startup, `RELOAD`, and reloads triggered by `reload_schema_on_ddl`. `epoch` is a global counter that increases with every snapshot. The JSON carries `format_version` (`pgdog_plugin::SCHEMA_SNAPSHOT_VERSION`). The plugin rejects versions it doesn't know, which leaves masked users blocked until a supported snapshot arrives. If a load fails, PgDog retries and sends nothing, so the plugin keeps its previous snapshot. The snapshot is the existing `pgdog_stats::Schema` (relations, columns, data types, ordinal positions, primary and foreign keys, search_path). JSON keeps plugins from depending on that struct's memory layout.
-
-Until the plugin has a snapshot for a database, the masking plugin blocks statements from restricted profiles with SQLSTATE `57P03` (fail closed).
-
-**Full catalog.** When a `SCHEMA` plugin is loaded, PgDog loads more of the catalog (`backend/schema/catalog.rs`), and sets `full_catalog`:
-- **Columns from `pg_attribute`/`pg_class`** (`columns_catalog.sql`) instead of `information_schema.columns`, so privilege filtering can't hide columns from the loading role. `data_type` keeps `information_schema`'s values; each column also gets `type_name` (`format_type`), `comment` and `security_labels` (from `pg_seclabel`).
-- **View and materialized view definitions** (`pg_get_viewdef`) and `reloptions` on their relations (`definition`, `options`).
-- **`functions`**: `pg_proc` rows outside `pg_catalog` and `information_schema`, with argument names, types and defaults, `VARIADIC`, return type, `proretset`, `OUT`/`TABLE` columns, kind, language, `prosrc`, `pg_get_function_sqlbody` (Postgres 14+), volatility, `prosecdef`, `proisstrict`, `proconfig` and the owning extension.
-- **`operators`**: `pg_operator` rows outside `pg_catalog` and `information_schema`, with operand and result types and their function.
-- **`system_functions`**: names of the functions in `pg_catalog`.
-
-These queries run with an empty `search_path` (`SET LOCAL`, or inside a savepoint when the loading connection is in a transaction), so view definitions, `BEGIN ATOMIC` bodies and type names are schema-qualified regardless of the loading role's settings. Without a `SCHEMA` plugin, nothing changes. Nothing in the snapshot is masking-specific.
-
-### 8.5 Result-transform hook (`pgdog-plugin/src/transform.rs`)
-
-```rust
-#[repr(C)]
-pub struct TransformContext<'a> {
-    pub handle: u64,
-    pub code: u8,                          // b'T', b'D', b'C', b'E', ...
-    pub payload: PdSlice<'a, u8>,          // message body, without the code + length header
-    pub result_formats: PdSlice<'a, i16>,  // from the executing statement's Bind; empty for Query
-}
-
-pub trait Plugin {
-    fn transform(context: TransformContext<'_>) -> TransformOutput;  // forward | replace(body) | fail
-    fn release_transform(handle: u64);
-}
-```
-
-- **Where it runs.** `process_server_message` calls `transform_server_message` after PgDog's own per-message bookkeeping (explain capture, advisory locks, transaction state). That bookkeeping keeps seeing Postgres' original messages; the client sees the transformed ones. Multi-shard merge, sort and aggregate have already finished.
-- **Ownership.** A transform belongs to what the plugin attached it to, and server messages are attributed to their owner by tracking the client messages still waiting for responses:
-  - a simple `Query` (or fast-path call) owns its transforms until its client-visible `ReadyForQuery`, including COPY data exchanged in between;
-  - a prepared statement (`Parse`) owns them until it's closed or replaced, so `Describe` responses go through them;
-  - a portal (`Bind`) owns them until it's closed or replaced, or the transaction ends, so resumed `Execute`s go through them.
-- **Release.** Each handle is released exactly once, when its owner ends or the client disconnects.
-- **Result formats** are captured from the `Bind` in the statement-plugin layer. No backend changes were needed.
-- **Failure.** On `fail`, or a hook error, PgDog:
-  1. cancels the query;
-  2. force-closes the server connection;
-  3. sends the client a `FATAL` `XX000`;
-  4. ends the session, since earlier rows may already have been delivered.
+`catalog` receives a typed `Catalog` (defined in `pgdog-plugin`, passed by reference) for each database, when it changes: relations and columns, plus the parts the plugin asks for (`COLUMNS` from `pg_attribute` with type names, comments and security labels; `VIEWS`; `FUNCTIONS` with system function names; `OPERATORS`). Names are schema-qualified. Until a database's catalog arrives, masked users get `57P03` (fail closed).
 
 ### 8.6 Reload
 
-`fn reload() -> bool` is called on every PgDog configuration reload, from `databases::reload`. If it returns `false`, PgDog logs a warning and the plugin is expected to keep its previous config.
-
-### 8.7 The core patch
-
-`masking/plugin-api` contains only these generic extension points, in four commits. There is no masking code, no masking config, and no unrelated fixes. The `search_path` bug above and the stale `PLUGIN_SYSTEM.md` go in separate PRs.
-
-| Commit | Contents |
-|---|---|
-| plugin API 0.6.0 with capabilities, hook types and ordered loading | `pgdog-plugin` types (`Capabilities`, `PdBuf`, `PdSlice`, statement and transform types, vtable entries, `catch_unwind` wrappers, vtable round-trip tests); config-order loader, `required`, schema forcing and snapshot push, reload; regenerated JSON schema |
-| statement hook to rewrite or block statements | `query_engine/statement_plugins.rs`, wiring in `handle()`, in-process test plugin (`plugin/test.rs`), engine tests |
-| result transform hook | transform dispatch in `process_server_message`, `Error::PluginTransform`, engine tests |
-| full catalog in schema snapshots for SCHEMA plugins | `pgdog_stats` `Function`, `Operator`, `SecurityLabel` and new snapshot fields; `backend/schema/catalog.rs` and its queries; schema loader tests (§8.4) |
-
-**Ownership rule.** Plugin-allocated output (`PdBuf`) has no `Drop`. PgDog copies it, then calls the plugin's `free_*` vtable entry, so memory is always returned to the allocator that created it. PgDog uses jemalloc; plugins use their own allocator.
-
-**Tests.** The patch is tested with an in-process test plugin, not the masking plugin. It covers:
-- vtable round trips for continue, rewrite, block, transform and panic;
-- engine tests against Postgres: simple and extended rewrite; block; named statements re-prepared after the plugin changes its rewrite; unnamed statements across requests; transforms on simple and extended queries; handle release; and a failing transform closing the session.
-
-Nothing in core knows what masking is.
-
----
+`reload()` runs when PgDog reloads its configuration. The plugin re-reads its TOML, keeps the old settings if the new ones are invalid, and bumps its generation otherwise.
 
 ## 9. Caching and performance
 
@@ -691,7 +571,7 @@ Nothing in core knows what masking is.
 
 Caches:
 
-- **Plugin rewrite LRU**: key `(sql_hash, profile_tag, policy_epoch, schema_epoch)`, value `Continue | Rewrite{sql, tag, transform_plan} | Block`. Concurrency via sharded `moka`/`DashMap`; route hooks run on async worker threads, so lookups must never block.
+- **Plugin decision cache**: key `(sql, search_path, profile, settings_epoch, schema_epoch)`, value `Continue | Rewrite(sql) | Block`. Concurrency via sharded `moka`/`DashMap`; route hooks run on async worker threads, so lookups must never block.
 - **Profiles**: keyed by identity hash and `policy_epoch`.
 - **Prepared statements**: one server-side statement per (statement × distinct rewrite), shared across all sessions with that profile through PgDog's global cache and prepared lazily per server connection.
 
@@ -706,7 +586,7 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 | Sharding | Masking runs before routing, so shard keys are extracted from the masked SQL. Masking a sharding key is rejected at load, because the key would be unextractable and broadcast. Cross-shard sort, aggregate and `DISTINCT` operate on masked values, which is consistent with single-node semantics. |
 | Multi-tenant mode | The tenant column can't be masked (load error). |
 | Rewrite engine (auto id, `unique_id()`, ND functions, subqueries, sharding-key updates) | Runs on the masked SQL. Masked expressions are ordinary SQL, so no interaction. |
-| Prepared statements (`prepared_statements = extended/full`) | One server-side statement per distinct rewrite (§8.3), re-checked on every `Bind`. Statement names stay stable for the client. With `prepared_statements = disabled`, a statement whose rewrite changes must be prepared again by the client. |
+| Prepared statements (`prepared_statements = extended/full`) | One server-side statement per distinct rewrite (§8.2), re-checked at `Bind` only after the plugin's settings or catalog changed. Statement names stay stable for the client. With `prepared_statements = disabled`, a statement whose rewrite changes must be prepared again by the client. |
 | Read/write splitting, load balancing | Unaffected. |
 | Mirroring | The mirror receives the masked request, since masking runs before `backend.mirror`. Responses are discarded. |
 | Dry run / query log | Logs show the original SQL. Shadow mode adds the masked SQL and the decision. |
@@ -752,7 +632,7 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 4. **Protocol matrix**: simple, extended named and unnamed, pipelined, `Execute` without `Describe`, binary result formats (pgx, JDBC, asyncpg), SQL `PREPARE`/`EXECUTE`, cursors, multi-statement, COPY text/CSV/binary. Run in `integration/` with Python, Ruby, Go and Java drivers, following the existing `integration/plugins/` harness.
 5. **Sharded runs**: the same suites against the 2-shard integration setup, including cross-shard aggregates and `ORDER BY` on masked columns.
 6. **Grammar fuzzing**: generate random queries over a schema with masked columns (sqlsmith-style, on top of `pg_raw_parse`), run them through the analyzer, and assert two things: the rewritten SQL never leaks a canary when executed, and every outcome is `Continue`/`Rewrite`/`Block`, never a panic.
-7. **Core API tests**: capability gating, plugin ordering, `catch_unwind` fail-closed behavior, `REQUIRED` startup failure, re-preparing on a changed rewrite, and transform `Fail` closing the connection. These are done on `masking/plugin-api` (§8.7).
+7. **Core API tests**: capability gating, `catch_unwind` fail-closed behavior, `required` startup failure, re-preparing on a new generation, parameter checks, batched masks, mask failures closing the connection, and error redaction. These are done on `masking/plugin-api`, in-process and through a compiled plugin.
 
 ---
 
@@ -762,36 +642,36 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 
 ```
 ewhauser/pgdog
- └─ masking/plugin-api   # narrow core patch: pgdog-plugin 0.6.0 + host hooks (§8)
+ └─ masking/plugin-api   # narrow core patch: pgdog-plugin 0.7.0 + host hooks (§8)
 ewhauser/pgdog-mask      # this plugin, depending on pgdog-plugin at a pinned masking/plugin-api commit
 ```
 
-- `masking/plugin-api` is the patch to upstream into PgDog. It is a few logical commits (§8.7), each building and passing tests. It contains no masking code. If the plugin needs something from core, the change goes there, and `Cargo.toml` here moves to the new commit.
+- `masking/plugin-api` is the patch to upstream into PgDog. It is a few logical commits, each building and passing tests. It contains no masking code. If the plugin needs something from core, the change goes there, and `Cargo.toml` here moves to the new commit.
 - The plugin is its own project. It was developed on a `masking/plugin` branch in PgDog and extracted with its history.
 
 ### 14.2 Phases
 
 **P1 status.** P1 is implemented in this repository, with these differences from the plan:
 - **One crate, not three.** Modules `analyzer`, `config`, `profile`, `catalog`, `mask` and `engine` replace `masking-core`/`masking-plugin`. There is no `masking-cli` yet.
-- **Built-in functions** were identified from an embedded list of PostgreSQL 16 `pg_catalog` function names, since the schema snapshot had no `pg_proc`. P2 replaced it.
+- **Built-in functions** were identified from an embedded list of PostgreSQL 16 `pg_catalog` function names, since the catalog had no `pg_proc` then. P2 replaced it.
 - **Views failed closed** unless they were in `view_allowlist` or had masked columns of their own. P2 added view inlining.
 - **`MERGE`, aliased joins, and `*` across `USING`/`NATURAL` joins** over masked columns are blocked, not rewritten.
 - **Output names** of rewritten column references are pinned with `AS`, and leading comments (routing hints) are kept on rewritten statements.
-- **Prepared statement re-checks** use a variant tag that is the hash of the rewritten SQL.
+- **Prepared statement re-checks** used a variant tag, the hash of the rewritten SQL. API 0.7 replaced it with the plugin's generation.
 - **Tests:** an analyzer unit corpus, canary leak tests against Postgres (`tests/canary.rs`), and end-to-end tests through PgDog (`integration/run.sh`).
 
-**P2 status.** Implemented on top of the full-catalog snapshot (§8.4):
+**P2 status.** Implemented on top of the full catalog (§8.5):
 - **Views** are inlined with masks applied, or queried like tables with lineage-based masks (§6.6). `view_allowlist` is no longer the only way to read a view.
 - **SQL functions** are analyzed, allowed, inlined or blocked (§6.7), and operators are treated as calls. Built-ins come from `pg_proc` through `system_functions`; the embedded PostgreSQL 16 list is only a unit-test fixture now. New setting: `extension_allowlist`.
 - **Tags from the database** with `tag_source = "comment" | "security_label"` and `security_label_provider`, additive only, with removals logged at `warn` on schema reload; **`[[classifiers]]`** tag columns by name (§7.4).
-- **Error and notice scrubbing** (§2): for statements that read or write relations with masked columns, including through views and functions, the plugin attaches a transform that removes `DETAIL` from `ErrorResponse` and `NoticeResponse`. `scrub_error_detail = false` turns it off. Exempt users keep `DETAIL`.
+- **Error and notice scrubbing** (§2, §8.4): the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` masked users get. `scrub_error_detail = false` turns it off. Exempt users keep `DETAIL`.
 - **Tests:** unit tests for lineage, tags, classifiers, view and function rewrites; the canary corpus covers views, functions, operators and `DETAIL` leaks (a `CHECK` violation's failing row, a trigger's notice) and loads its schema with PgDog's own catalog queries; e2e tests cover inlined views and functions, comment tags, classifiers and scrubbed errors through PgDog.
 - **Not done yet:** `lint`, live template validation (§7.3), and the `explain`/`validate` CLI.
 
 
 | Phase | Branch | Scope |
 |---|---|---|
-| **P0: API** ✅ | `masking/plugin-api` | 0.6.0 vtable: capabilities, `statement`, `transform`, `schema`, `reload`; config-order plugin list, schema forcing, `catch_unwind`, `required`, Bind re-checking, test plugin; full catalog in snapshots (views, functions, operators, comments, labels, `pg_attribute`) |
+| **P0: API** ✅ | `masking/plugin-api` | 0.7.0: capabilities, `statement` verdicts with generations, `function_call`, batched `mask_rows`, `redact_error`, typed `catalog` with selectable parts, `reload`; `catch_unwind`, `required`, test plugins |
 | **P1: MVP** ✅ | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, `explain` CLI, canary suite |
 | **P2: hardening** (mostly ✅) | `masking/plugin` | SQL-function analysis and inlining ✅, view inlining ✅, partitions ✅ (P1), conditional masking ✅ (P1), tags and classifiers (`config`/`comment`/`security_label`) ✅, error/notice scrubbing ✅, `lint`, live template validation |
 | **P3: proxy masks** | `masking/plugin` | HMAC, FPE, vault tokenization |

@@ -10,11 +10,11 @@ name = "pgdog_mask"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-# Plugin API 0.6 (statement, transform and schema hooks) lives on the fork until
+# Plugin API 0.7 (statement, mask, error and catalog hooks) lives on the fork until
 # it's upstream. PgDog must be built from the same commit: plugins are only loaded
 # when the plugin API version and the Rust compiler version match. The
 # integration scripts read this revision to build PgDog.
-pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "03e43475618b8aadffa4a1048c96176aad08fe4a" }
+pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1" }
 # Must match the pg_raw_parse PgDog uses at that revision.
 pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
 arc-swap = "1"
@@ -30,8 +30,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 futures-util = "0.3"
-# Schema snapshot types, to build snapshots exactly as PgDog does.
-pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "03e43475618b8aadffa4a1048c96176aad08fe4a" }
+# PgDog's catalog row types, to load catalogs in tests the way PgDog does.
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1" }
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
 

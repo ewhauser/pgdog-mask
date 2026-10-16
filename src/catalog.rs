@@ -1,8 +1,7 @@
-//! Database schema, from the snapshots PgDog sends to the plugin.
+//! Database schema, from the catalog PgDog sends to the plugin.
 use std::collections::{HashMap, HashSet};
 
-use indexmap::IndexMap;
-use serde::Deserialize;
+use pgdog_plugin::{CatalogParts, catalog as plugin};
 
 /// Kind of relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +82,7 @@ impl Relation {
 }
 
 /// A function from `pg_proc`, outside `pg_catalog`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Function {
     pub oid: i64,
     pub schema: String,
@@ -133,8 +131,7 @@ impl Function {
 }
 
 /// An operator from `pg_operator`, outside `pg_catalog`.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default)]
 pub struct Operator {
     pub schema: String,
     pub name: String,
@@ -157,122 +154,96 @@ pub struct Catalog {
     operators: HashMap<String, Vec<Operator>>,
     /// Names of the functions in `pg_catalog`.
     system_functions: HashSet<String>,
-    /// The snapshot has view definitions and functions. Without them, views and
-    /// functions can't be analyzed.
+    /// The catalog has hidden columns, view definitions and functions. Without
+    /// them, views and functions can't be analyzed.
     pub full: bool,
 }
 
-#[derive(Deserialize)]
-struct Snapshot {
-    format_version: u32,
-    inner: SnapshotInner,
-}
-
-#[derive(Deserialize)]
-struct SnapshotInner {
-    #[serde(default)]
-    search_path: Vec<String>,
-    #[serde(default)]
-    relations: HashMap<String, HashMap<String, SnapshotRelation>>,
-    #[serde(default)]
-    full_catalog: bool,
-    #[serde(default)]
-    functions: Vec<Function>,
-    #[serde(default)]
-    operators: Vec<Operator>,
-    #[serde(default)]
-    system_functions: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct SnapshotRelation {
-    schema: String,
-    name: String,
-    type_: String,
-    parent_table_schema: Option<String>,
-    parent_table_name: Option<String>,
-    #[serde(default)]
-    columns: IndexMap<String, SnapshotColumn>,
-    #[serde(default)]
-    definition: Option<String>,
-    #[serde(default)]
-    options: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct SnapshotColumn {
-    column_name: String,
-    data_type: String,
-    ordinal_position: i32,
-    #[serde(default)]
-    type_name: String,
-    #[serde(default)]
-    comment: Option<String>,
-    #[serde(default)]
-    security_labels: Vec<SnapshotLabel>,
-}
-
-#[derive(Deserialize)]
-struct SnapshotLabel {
-    provider: String,
-    label: String,
-}
-
 impl Catalog {
-    /// Parse a schema snapshot sent by PgDog.
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        let snapshot: Snapshot = serde_json::from_str(json)?;
-        // A format this plugin doesn't know could be misread; treat it as no
-        // snapshot, which blocks masked users.
-        if snapshot.format_version != pgdog_plugin::SCHEMA_SNAPSHOT_VERSION {
-            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
-                "unsupported schema snapshot format {} (supported: {})",
-                snapshot.format_version,
-                pgdog_plugin::SCHEMA_SNAPSHOT_VERSION
-            )));
-        }
-        let inner = snapshot.inner;
-        let relations = inner
+    /// Copy the catalog PgDog sent.
+    pub fn from_plugin(catalog: &plugin::Catalog) -> Self {
+        let relations = catalog
             .relations
-            .into_values()
-            .flat_map(|tables| tables.into_values())
+            .iter()
             .map(|relation| {
-                let mut columns: Vec<_> = relation.columns.into_values().collect();
-                columns.sort_by_key(|column| column.ordinal_position);
-                let kind = match relation.type_.as_str() {
-                    "table" | "partitioned table" | "foreign table" => RelationKind::Table,
-                    "view" => RelationKind::View,
-                    "materialized view" => RelationKind::MaterializedView,
-                    _ => RelationKind::Other,
+                let kind = match relation.kind {
+                    plugin::RelationKind::Table
+                    | plugin::RelationKind::PartitionedTable
+                    | plugin::RelationKind::ForeignTable => RelationKind::Table,
+                    plugin::RelationKind::View => RelationKind::View,
+                    plugin::RelationKind::MaterializedView => RelationKind::MaterializedView,
+                    plugin::RelationKind::Other => RelationKind::Other,
                 };
-                let columns = columns
-                    .into_iter()
+                let columns = relation
+                    .columns
+                    .iter()
                     .map(|column| Column {
-                        name: column.column_name,
-                        data_type: column.data_type,
-                        type_name: column.type_name,
-                        comment: column.comment,
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        type_name: column.type_name.clone(),
+                        comment: column.comment.clone(),
                         security_labels: column
                             .security_labels
-                            .into_iter()
-                            .map(|label| (label.provider, label.label))
+                            .iter()
+                            .map(|label| (label.provider.clone(), label.label.clone()))
                             .collect(),
                     })
                     .collect();
                 let mut built = Relation::new(&relation.schema, &relation.name, kind, columns);
-                built.parent = relation.parent_table_schema.zip(relation.parent_table_name);
-                built.definition = relation.definition;
-                built.options = relation.options;
+                built.parent = relation.parent.clone();
+                built.definition = relation.definition.clone();
+                built.options = relation.options.clone();
                 built
             })
             .collect();
 
-        let mut catalog = Self::new(inner.search_path, relations);
-        catalog.full = inner.full_catalog;
-        catalog.add_functions(inner.functions);
-        catalog.add_operators(inner.operators);
-        catalog.system_functions = inner.system_functions.into_iter().collect();
-        Ok(catalog)
+        let mut built = Self::new(catalog.search_path.clone(), relations);
+        built.full = catalog.parts.contains(CatalogParts::ALL);
+        built.add_functions(
+            catalog
+                .functions
+                .iter()
+                .map(|function| Function {
+                    oid: function.oid.into(),
+                    schema: function.schema.clone(),
+                    name: function.name.clone(),
+                    kind: function.kind.clone(),
+                    argument_types: function.argument_types.clone(),
+                    argument_names: function.argument_names.clone(),
+                    argument_defaults: function.argument_defaults.into(),
+                    variadic: function.variadic,
+                    return_type: function.return_type.clone(),
+                    returns_set: function.returns_set,
+                    output_names: function.output_names.clone(),
+                    output_types: function.output_types.clone(),
+                    language: function.language.clone(),
+                    source: function.source.clone(),
+                    sql_body: function.sql_body.clone(),
+                    volatility: function.volatility.clone(),
+                    security_definer: function.security_definer,
+                    strict: function.strict,
+                    config: function.config.clone(),
+                    extension: function.extension.clone(),
+                })
+                .collect(),
+        );
+        built.add_operators(
+            catalog
+                .operators
+                .iter()
+                .map(|operator| Operator {
+                    schema: operator.schema.clone(),
+                    name: operator.name.clone(),
+                    left_type: operator.left_type.clone(),
+                    right_type: operator.right_type.clone(),
+                    function_oid: operator.function_oid.into(),
+                    function_schema: operator.function_schema.clone(),
+                    function_name: operator.function_name.clone(),
+                })
+                .collect(),
+        );
+        built.system_functions = catalog.system_functions.iter().cloned().collect();
+        built
     }
 
     /// Build a catalog from relations.
@@ -412,25 +383,65 @@ mod test {
     }
 
     #[test]
-    fn test_from_json() {
-        let json = r#"{"format_version":1,"inner":{"search_path":["$user","public"],"relations":{"public":{"users":{
-            "schema":"public","name":"users","type_":"table","owner":"pgdog","persistence":"permanent",
-            "access_method":"heap","description":"","oid":1,"parent_table_schema":null,"parent_table_name":null,
-            "columns":{
-              "ssn":{"table_catalog":"pgdog","table_schema":"public","table_name":"users","column_name":"ssn","column_default":"","is_nullable":true,"data_type":"text","ordinal_position":2,"is_primary_key":false,"foreign_keys":[],
-                     "type_name":"text","comment":"pgdog:tag=pii.ssn","security_labels":[{"provider":"pgdog","label":"pii.ssn"}]},
-              "id":{"table_catalog":"pgdog","table_schema":"public","table_name":"users","column_name":"id","column_default":"","is_nullable":false,"data_type":"bigint","ordinal_position":1,"is_primary_key":true,"foreign_keys":[]}
-            }},
-            "user_ssns":{"schema":"public","name":"user_ssns","type_":"view","owner":"pgdog","persistence":"permanent",
-            "access_method":"","description":"","oid":2,"parent_table_schema":null,"parent_table_name":null,"columns":{},
-            "definition":" SELECT users.ssn FROM public.users;","options":["security_barrier=true"]}}},
-            "aggregate_functions":[],"full_catalog":true,
-            "functions":[{"oid":10,"schema":"public","name":"last4","kind":"function","argument_types":["text"],
-              "argument_names":["value"],"argument_defaults":0,"variadic":false,"return_type":"text","result":"text",
-              "returns_set":false,"output_names":[],"output_types":[],"language":"sql","source":"SELECT right(value, 4)",
-              "sql_body":null,"volatility":"immutable","security_definer":false,"strict":true,"config":[],"extension":null}],
-            "operators":[],"system_functions":["lower","right"]}}"#;
-        let catalog = Catalog::from_json(json).unwrap();
+    fn test_from_plugin() {
+        let catalog = plugin::Catalog {
+            parts: CatalogParts::ALL,
+            search_path: vec!["$user".into(), "public".into()],
+            relations: vec![
+                plugin::Relation {
+                    schema: "public".into(),
+                    name: "users".into(),
+                    kind: plugin::RelationKind::Table,
+                    columns: vec![
+                        plugin::Column {
+                            name: "id".into(),
+                            data_type: "bigint".into(),
+                            ..Default::default()
+                        },
+                        plugin::Column {
+                            name: "ssn".into(),
+                            data_type: "text".into(),
+                            type_name: "text".into(),
+                            comment: Some("pgdog:tag=pii.ssn".into()),
+                            security_labels: vec![plugin::SecurityLabel {
+                                provider: "pgdog".into(),
+                                label: "pii.ssn".into(),
+                            }],
+                            ..Default::default()
+                        },
+                    ],
+                    parent: None,
+                    definition: None,
+                    options: vec![],
+                },
+                plugin::Relation {
+                    schema: "public".into(),
+                    name: "user_ssns".into(),
+                    kind: plugin::RelationKind::View,
+                    columns: vec![],
+                    parent: None,
+                    definition: Some(" SELECT users.ssn FROM public.users;".into()),
+                    options: vec!["security_barrier=true".into()],
+                },
+            ],
+            functions: vec![plugin::Function {
+                oid: 10,
+                schema: "public".into(),
+                name: "last4".into(),
+                kind: "function".into(),
+                argument_types: vec!["text".into()],
+                argument_names: vec!["value".into()],
+                return_type: "text".into(),
+                language: "sql".into(),
+                source: "SELECT right(value, 4)".into(),
+                volatility: "immutable".into(),
+                strict: true,
+                ..Default::default()
+            }],
+            system_functions: vec!["lower".into(), "right".into()],
+            operators: vec![],
+        };
+        let catalog = Catalog::from_plugin(&catalog);
         assert!(catalog.full);
         let users = catalog.resolve(None, "users", &["public".into()]).unwrap();
         assert_eq!(users.kind, RelationKind::Table);
@@ -457,16 +468,12 @@ mod test {
     }
 
     #[test]
-    fn test_unknown_snapshot_format() {
-        let err = Catalog::from_json(r#"{"format_version":999,"inner":{}}"#).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported schema snapshot format"),
-            "{err}"
-        );
-        assert!(
-            Catalog::from_json(r#"{"inner":{}}"#).is_err(),
-            "unversioned"
-        );
+    fn test_partial_catalog() {
+        // Without every part, views and functions can't be analyzed.
+        let catalog = Catalog::from_plugin(&plugin::Catalog {
+            parts: CatalogParts::COLUMNS,
+            ..Default::default()
+        });
+        assert!(!catalog.full);
     }
 }

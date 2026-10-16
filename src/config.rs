@@ -61,7 +61,7 @@ pub enum OnUnresolved {
 pub struct General {
     #[serde(default)]
     pub mode: Mode,
-    /// Statements referencing relations missing from the schema snapshot.
+    /// Statements referencing relations missing from the catalog.
     #[serde(default)]
     pub on_unresolved: OnUnresolved,
     /// Functions masked users may call without analysis, e.g. `public.normalize_phone`.
@@ -80,9 +80,8 @@ pub struct General {
     /// are masked, other columns derived from masked columns are blocked.
     #[serde(default = "General::enabled")]
     pub inline_views: bool,
-    /// Remove `DETAIL` from errors and notices of statements that read or write
-    /// relations with masked columns. They can contain row values, e.g. a
-    /// `CHECK` violation's `Failing row contains (...)`.
+    /// Remove `DETAIL` from the errors and notices masked users get. It can
+    /// contain row values, e.g. a `CHECK` violation's `Failing row contains (...)`.
     #[serde(default = "General::enabled")]
     pub scrub_error_detail: bool,
     #[serde(default)]

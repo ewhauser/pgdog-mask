@@ -1,7 +1,7 @@
 //! Column tags read from the database: column comments or security labels.
 //!
 //! Database tags only add masking. They never replace or remove a binding
-//! from the config file, and tags that disappear between schema snapshots are
+//! from the config file, and tags that disappear between catalogs are
 //! logged, since removing one unmasks a column.
 use std::collections::{BTreeMap, BTreeSet};
 

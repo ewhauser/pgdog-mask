@@ -136,11 +136,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         };
         if !catalog.full {
             return Target::Unknown(format!(
-                "the schema snapshot has no functions, so {qualified}() can't be checked"
+                "the catalog has no functions, so {qualified}() can't be checked"
             ));
         }
         Target::Unknown(format!(
-            "function {qualified}() is not a built-in function and isn't in the schema snapshot or udf_allowlist"
+            "function {qualified}() is not a built-in function and isn't in the catalog or udf_allowlist"
         ))
     }
 
@@ -322,7 +322,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 Some(_) => (),
                 None => {
                     self.block(format!(
-                        "operator {}.{} uses function {}.{}(), which isn't in the schema snapshot",
+                        "operator {}.{} uses function {}.{}(), which isn't in the catalog",
                         operator.schema,
                         operator.name,
                         operator.function_schema,

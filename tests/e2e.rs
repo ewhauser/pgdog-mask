@@ -200,7 +200,8 @@ async fn test_error_detail_scrubbed() {
     assert_eq!(db.detail(), None, "{err:?}");
     assert!(!format!("{err:?}").contains("CANARY"), "{err:?}");
 
-    // Extended protocol: the transform is attached on Bind.
+    // Extended protocol, executed twice: Bind isn't checked again, errors are
+    // redacted for the whole session.
     let statement = client
         .prepare("UPDATE masking_e2e.users SET name = $1 WHERE id = $2")
         .await
