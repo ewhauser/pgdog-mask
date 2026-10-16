@@ -16,7 +16,7 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt as _, pin_mut, stream};
-use pgdog_masking::analyzer::{Context, Outcome, analyze};
+use pgdog_masking::analyzer::{Context, Outcome, analyze, analyze_shape};
 use pgdog_masking::config::Config;
 use pgdog_masking::profile::{Assignments, Policies};
 use pgdog_masking::scrub::scrub_detail;
@@ -561,12 +561,23 @@ async fn test_no_canary_leaks() {
     };
 
     let mut failures = vec![];
-    for (sql, expect) in CORPUS {
-        let outcome = analyze(sql, &ctx);
+    // Every statement goes through full analysis, and statements with literals
+    // also through the shape path that simple-protocol traffic takes.
+    for ((sql, expect), path) in CORPUS
+        .iter()
+        .flat_map(|entry| [(entry, "full"), (entry, "shape")])
+    {
+        let outcome = match path {
+            "full" => analyze(sql, &ctx),
+            _ => match analyze_shape(sql, &ctx) {
+                Some(outcome) => outcome,
+                None => continue,
+            },
+        };
         let (to_run, scrub) = match &outcome {
             Outcome::Blocked { reason } => {
                 if *expect == Expect::Runs {
-                    failures.push(format!("{sql}\n  unexpectedly blocked: {reason}"));
+                    failures.push(format!("[{path}] {sql}\n  unexpectedly blocked: {reason}"));
                 }
                 continue;
             }
@@ -579,7 +590,9 @@ async fn test_no_canary_leaks() {
         };
 
         if *expect == Expect::Blocked {
-            failures.push(format!("{sql}\n  expected a block, got {outcome:?}"));
+            failures.push(format!(
+                "[{path}] {sql}\n  expected a block, got {outcome:?}"
+            ));
             continue;
         }
 
@@ -592,13 +605,15 @@ async fn test_no_canary_leaks() {
         };
         if let Some(canary) = leaked(text) {
             failures.push(format!(
-                "{sql}\n  LEAKED {canary}\n  ran: {to_run}\n  got: {text}"
+                "[{path}] {sql}\n  LEAKED {canary}\n  ran: {to_run}\n  got: {text}"
             ));
         }
         if *expect == Expect::Runs
             && let Err(err) = &result
         {
-            failures.push(format!("{sql}\n  failed to run: {err}\n  ran: {to_run}"));
+            failures.push(format!(
+                "[{path}] {sql}\n  failed to run: {err}\n  ran: {to_run}"
+            ));
         }
     }
 

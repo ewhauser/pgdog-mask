@@ -1,0 +1,13 @@
+[[users]]
+name = "bench_masked"
+database = "masking_bench"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
+
+[[users]]
+name = "bench_admin"
+database = "masking_bench"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"

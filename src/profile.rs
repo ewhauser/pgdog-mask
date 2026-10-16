@@ -2,7 +2,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use parking_lot::RwLock;
+use pg_raw_parse::{Owned, StmtList};
 use regex::Regex;
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::analyzer::lineage::{Lineage, view_lineage, view_relations};
@@ -24,7 +27,22 @@ pub struct CompiledPolicy {
 pub struct Policies {
     pub config: Config,
     pub policies: Vec<CompiledPolicy>,
+    templates: Templates,
 }
+
+/// Mask expressions parsed once and copied into each statement that uses them.
+#[derive(Default)]
+struct Templates(RwLock<HashMap<String, Arc<Owned<StmtList>>>>);
+
+impl std::fmt::Debug for Templates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Templates({})", self.0.read().len())
+    }
+}
+
+/// Entries kept before the template cache is cleared. Templates are one per
+/// (mask, column type), so this only matters for pathological configs.
+const MAX_TEMPLATES: usize = 4096;
 
 impl Policies {
     pub fn new(config: Config) -> Result<Self, Error> {
@@ -49,7 +67,26 @@ impl Policies {
             })
             .collect::<Result<_, Error>>()?;
 
-        Ok(Self { config, policies })
+        Ok(Self {
+            config,
+            policies,
+            templates: Templates::default(),
+        })
+    }
+
+    /// `SELECT <expr>`, parsed. Mask expressions are the same for every statement,
+    /// so they're parsed once and copied into statements.
+    pub fn template(&self, expr: &str) -> Result<Arc<Owned<StmtList>>, pg_raw_parse::Error> {
+        if let Some(parsed) = self.templates.0.read().get(expr) {
+            return Ok(parsed.clone());
+        }
+        let parsed = Arc::new(pg_raw_parse::parse(&format!("SELECT {expr}"))?.into_inner());
+        let mut templates = self.templates.0.write();
+        if templates.len() >= MAX_TEMPLATES {
+            templates.clear();
+        }
+        templates.insert(expr.to_owned(), parsed.clone());
+        Ok(parsed)
     }
 
     /// Masking roles of a PgDog user.

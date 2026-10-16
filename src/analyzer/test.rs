@@ -816,3 +816,154 @@ fn test_scrub_flag() {
     assert!(touches_masked("anonymous", "SELECT count_users()"));
     assert!(!touches_masked("anonymous", "SELECT id FROM orders"));
 }
+
+#[test]
+fn test_conditional_masks_bind_their_own_arguments() {
+    // Two conditional policies with different argument names: each column must
+    // bind its own policy's arguments.
+    let config = r#"
+[[policies]]
+name = "by_flag"
+data_type = "text"
+arguments = ["flag"]
+mask = "sql"
+expression = "CASE WHEN flag THEN val ELSE NULL END"
+
+[[policies]]
+name = "by_amount"
+data_type = "text"
+arguments = ["amount"]
+mask = "sql"
+expression = "CASE WHEN amount > 0 THEN val ELSE NULL END"
+
+[[masked_columns]]
+name = "users"
+column = "email"
+policy = "by_flag"
+arguments = ["opted_in"]
+
+[[masked_columns]]
+name = "users"
+column = "ssn"
+policy = "by_amount"
+arguments = ["salary"]
+"#;
+    let Outcome::Rewritten { sql, .. } =
+        analyze_with(config, "anonymous", "SELECT email, ssn FROM users")
+    else {
+        panic!("expected a rewrite");
+    };
+    assert!(sql.contains("CASE WHEN users.opted_in THEN email"), "{sql}");
+    assert!(sql.contains("CASE WHEN users.salary > 0 THEN ssn"), "{sql}");
+}
+
+/// Statements with literals, covering every analyzer feature. The shape path
+/// (analyze once with placeholders, render with literals) must agree with
+/// analyzing each statement.
+const SHAPE_CORPUS: &[&str] = &[
+    "SELECT 5",
+    "SELECT 'a' AS x, true, NULL, -1, 1.5, -2.5e3",
+    "SELECT ssn, 'lit' FROM users WHERE id = 3",
+    "SELECT ssn FROM users WHERE ssn = '123-45-6789'",
+    "SELECT id FROM users WHERE ssn IN ('a', 'b', 'c') AND id > -5",
+    "SELECT id FROM users WHERE lower(ssn) = lower('ABC')",
+    "SELECT id FROM users WHERE ssn LIKE 'A%' AND name ILIKE '%x%'",
+    "SELECT id FROM users WHERE ssn IS NULL OR salary > 100000",
+    "SELECT id FROM users WHERE ssn::int = 5",
+    "SELECT date_trunc('day', now()), ssn::text, '2020-01-01'::date FROM users",
+    "SELECT interval '1 day', ssn FROM users LIMIT 10 OFFSET 5",
+    "SELECT ssn FROM users ORDER BY 1 DESC LIMIT 1",
+    "SELECT ssn, count(*) FROM users GROUP BY 1 HAVING count(*) > 2",
+    "SELECT CASE WHEN salary > 1000 THEN 'high' ELSE ssn END FROM users",
+    "SELECT * FROM users WHERE id = 1",
+    "SELECT u.*, 'x' FROM users u WHERE u.salary BETWEEN 1 AND 2",
+    "SELECT row_to_json(u), 1 FROM users u WHERE id = 7",
+    "SELECT x.ssn FROM (SELECT ssn, 1 AS one FROM users WHERE id = 2) x WHERE x.one = 1",
+    "WITH s AS (SELECT ssn FROM users WHERE id = 1) SELECT ssn, 'k' FROM s",
+    "SELECT ssn FROM users WHERE id = 1 UNION SELECT 'constant' ORDER BY 1",
+    "SELECT (SELECT ssn FROM users WHERE id = 1 LIMIT 1), 2",
+    "SELECT o.id FROM orders o JOIN users u ON u.ssn = 'abc' AND o.total > 10",
+    "SELECT id FROM users WHERE ssn = ANY(ARRAY['a', 'b'])",
+    "SELECT ssn FROM user_ssns WHERE id = 1",
+    "SELECT ssn FROM nested_v LIMIT 3",
+    "SELECT id, ssn FROM ssn_barrier WHERE id = 5",
+    "SELECT n FROM ssn_counts WHERE n > 1",
+    "SELECT name FROM user_names_v WHERE id = 1",
+    "SELECT last4('123456789')",
+    "SELECT user_ssn(5)",
+    "SELECT atomic_ssn(1), 'x'",
+    "SELECT * FROM ssns() AS s(id bigint, ssn text) WHERE id = 1",
+    "SELECT public.same('a', 'b')",
+    "SELECT 'a' === 'b'",
+    "INSERT INTO users (id, ssn, name) VALUES (1, '123', 'n')",
+    "INSERT INTO orders (user_id, total) SELECT id, salary * 2 FROM users WHERE ssn = 'x'",
+    "INSERT INTO users (id, ssn) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET name = users.ssn || '!' RETURNING ssn, 1",
+    "UPDATE users SET name = 'x', salary = salary + 1 WHERE ssn = 'abc' RETURNING ssn",
+    "UPDATE users SET name = ssn WHERE id = 1",
+    "DELETE FROM users WHERE id = 1 RETURNING *",
+    "SELECT 1; SELECT ssn FROM users WHERE id = 2",
+    "/* pgdog_shard: 1 */ SELECT ssn FROM users WHERE id = 1",
+    "SELECT my_func(1) FROM users",
+    "SELECT query_to_xml('SELECT ssn FROM users', true, true, '')",
+    "SELECT * FROM pg_stats WHERE tablename = 'users'",
+    "SELECT name FROM user_names WHERE name = 'x'",
+    "SELECT 1 FROM unknown_table WHERE x = 1",
+    "SELECT plpgsql_fn() + 1",
+    "SELECT volatile_ssn(1)",
+    "SELECT user_ssn_definer(1)",
+];
+
+#[test]
+fn test_shape_path_matches_full_analysis() {
+    fn canonical(sql: &str) -> String {
+        let parsed = pg_raw_parse::parse(sql)
+            .unwrap_or_else(|err| panic!("rewrite doesn't parse: {err}\n{sql}"))
+            .into_inner();
+        pg_raw_parse::deparse_stmts(parsed.iter()).unwrap()
+    }
+
+    let mut checked = 0;
+    for user in ["anonymous", "support", "admin"] {
+        for sql in SHAPE_CORPUS {
+            let full = analyze_as(user, sql);
+            let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+            let catalog = catalog();
+            let assignments = Assignments::new(&policies, "db", &catalog);
+            let profile = policies.profile(user, "db");
+            let ctx = Context {
+                catalog: &catalog,
+                assignments: &assignments,
+                policies: &policies,
+                profile: &profile,
+                search_path: vec!["public".into()],
+            };
+            let Some(shaped) = analyze_shape(sql, &ctx) else {
+                continue;
+            };
+            checked += 1;
+
+            match (&full, &shaped) {
+                (
+                    Outcome::Rewritten {
+                        sql: a,
+                        masked: ma,
+                        raw: ra,
+                        touches_masked: ta,
+                    },
+                    Outcome::Rewritten {
+                        sql: b,
+                        masked: mb,
+                        raw: rb,
+                        touches_masked: tb,
+                    },
+                ) => {
+                    assert_eq!(canonical(a), canonical(b), "{user}: {sql}");
+                    assert_eq!((ma, ra, ta), (mb, rb, tb), "{user}: {sql}");
+                }
+                (Outcome::Blocked { .. }, Outcome::Blocked { .. }) => (),
+                (a, b) => assert_eq!(a, b, "{user}: {sql}"),
+            }
+        }
+    }
+    assert!(checked > 100, "most of the corpus has a shape: {checked}");
+}

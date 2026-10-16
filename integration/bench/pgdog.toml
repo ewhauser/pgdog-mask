@@ -1,0 +1,11 @@
+[general]
+workers = 4
+
+[[plugins]]
+name = "pgdog_masking"
+config = "integration/masking/bench/masking.toml"
+required = true
+
+[[databases]]
+name = "masking_bench"
+host = "127.0.0.1"

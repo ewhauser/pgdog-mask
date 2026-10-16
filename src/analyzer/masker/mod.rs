@@ -28,12 +28,14 @@ pub(super) fn ident(name: &str) -> String {
 }
 
 /// Mask to apply to one column reference.
-struct MaskTarget {
-    template: String,
-    raw_search: HashSet<SearchOp>,
-    cast: String,
+struct MaskTarget<'c> {
+    /// Index of the policy in the config.
+    policy: usize,
+    template: &'c str,
+    raw_search: &'c HashSet<SearchOp>,
+    cast: &'c str,
     qualifier: String,
-    arguments: Vec<String>,
+    arguments: &'c [String],
     label: String,
 }
 
@@ -308,19 +310,24 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// The mask for a relation column, if it's masked for this user.
-    fn mask_target(&self, relation: &Relation, column: &str, refname: &str) -> Option<MaskTarget> {
-        let assignment = self
-            .ctx
+    fn mask_target(
+        &self,
+        relation: &'c Relation,
+        column: &str,
+        refname: &str,
+    ) -> Option<MaskTarget<'c>> {
+        let ctx: &'c Context<'c> = self.ctx;
+        let assignment = ctx
             .assignments
             .column(&relation.schema, &relation.name, column)?;
         let Mask::Masked {
             template,
             raw_search,
-        } = &self.ctx.profile.masks[assignment.policy]
+        } = &ctx.profile.masks[assignment.policy]
         else {
             return None;
         };
-        let policy = &self.ctx.policies.policies[assignment.policy].policy;
+        let policy = &ctx.policies.policies[assignment.policy].policy;
         let data_type = relation
             .column(column)
             .map(|c| c.data_type.as_str())
@@ -328,11 +335,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .unwrap_or(&policy.data_type);
 
         Some(MaskTarget {
-            template: template.clone(),
-            raw_search: raw_search.clone(),
-            cast: data_type.to_owned(),
+            policy: assignment.policy,
+            template,
+            raw_search,
+            cast: data_type,
             qualifier: refname.to_owned(),
-            arguments: assignment.arguments.clone(),
+            arguments: &assignment.arguments,
             label: format!("{}.{}.{}", relation.schema, relation.name, column),
         })
     }
@@ -345,7 +353,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// The mask for a column reference, if it points to a masked column.
-    fn column_target(&self, fields: &[&str]) -> Option<MaskTarget> {
+    fn column_target(&self, fields: &[&str]) -> Option<MaskTarget<'c>> {
         let resolved = resolve_column(&self.frames, fields)?;
         self.mask_target(resolved.relation, resolved.column, resolved.refname)
     }
@@ -371,11 +379,27 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     fn masked_expr(
         &mut self,
         original: &nodes::ColumnRef,
-        target: &MaskTarget,
+        target: &MaskTarget<'c>,
     ) -> Option<Unique<'mem, Node<'mem>>> {
-        let mut expr = self.parse_expr(&format!("({})::{}", target.template, target.cast))?;
+        let template = match self
+            .ctx
+            .policies
+            .template(&format!("({})::{}", target.template, target.cast))
+        {
+            Ok(template) => template,
+            Err(err) => {
+                self.block(format!("failed to build mask expression: {err}"));
+                return None;
+            }
+        };
+        let val = template.iter().next().and_then(|stmt| match stmt.stmt() {
+            Node::SelectStmt(select) => select.target_list().iter().next().map(|t| t.val()),
+            _ => None,
+        })?;
+        let mut expr = self.mem.make_unique(val);
         let mem = self.mem;
-        let policy_arguments = &self.argument_names(target);
+        let policy_arguments: &[String] =
+            &self.ctx.policies.policies[target.policy].policy.arguments;
 
         transform::transform(&mut expr, |node| {
             let replacement = match &*node {
@@ -410,21 +434,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         });
 
         Some(expr)
-    }
-
-    /// The policy's declared argument names for a mask.
-    fn argument_names(&self, target: &MaskTarget) -> Vec<String> {
-        self.ctx
-            .policies
-            .policies
-            .iter()
-            .find(|p| {
-                self.ctx.profile.masks.iter().any(
-                    |m| matches!(m, Mask::Masked { template, .. } if *template == target.template),
-                ) && !p.policy.arguments.is_empty()
-            })
-            .map(|p| p.policy.arguments.clone())
-            .unwrap_or_default()
     }
 
     /// Masked columns used directly as a condition can't be replaced in place.
@@ -550,23 +559,38 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// SQL listing an item's columns, replacing `*` for it.
-    fn expand_item(&mut self, item_index: usize) -> Option<String> {
+    /// `qualifier.column`, or `qualifier.*`, as a target list entry.
+    fn star_target(
+        &self,
+        qualifier: &str,
+        column: Option<&str>,
+    ) -> Unique<'mem, &'mem nodes::ResTarget> {
+        let mem = self.mem;
+        let last = match column {
+            Some(column) => mem.make_string(Some(column)).uncast(),
+            None => mem.make_node::<nodes::A_Star>().uncast(),
+        };
+        let fields = [mem.make_string(Some(qualifier)).uncast(), last];
+        let column = mem.make_column_ref(mem.make_list(&fields));
+        mem.make_res_target(None, mem.empty(), column.uncast())
+    }
+
+    /// An item's columns, replacing `*` for it.
+    fn expand_item(
+        &mut self,
+        item_index: usize,
+    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
         let frame = self.frames.last()?;
         let item = &frame.items[item_index];
         let masked = self.item_is_masked(item);
         match &item.kind {
-            ItemKind::Relation { names, .. } if masked => {
-                let qualifier = ident(&item.refname);
-                Some(
-                    names
-                        .iter()
-                        .map(|name| format!("{qualifier}.{}", ident(name)))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )
-            }
-            _ if !item.refname.is_empty() => Some(format!("{}.*", ident(&item.refname))),
+            ItemKind::Relation { names, .. } if masked => Some(
+                names
+                    .iter()
+                    .map(|name| self.star_target(&item.refname, Some(name)))
+                    .collect(),
+            ),
+            _ if !item.refname.is_empty() => Some(vec![self.star_target(&item.refname, None)]),
             _ => {
                 self.block("can't expand * over a subquery without an alias");
                 None
@@ -597,7 +621,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .collect();
         let merging = frame.merging_join;
 
-        let mut plans: Vec<Option<String>> = vec![];
+        let mut plans: Vec<Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>>> = vec![];
         let mut needed = false;
 
         for target in targets {
@@ -609,9 +633,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                                 self.block("can't expand * across a JOIN with USING or NATURAL over masked columns; list the columns");
                                 return None;
                             }
-                            let parts: Option<Vec<String>> =
+                            let parts: Option<Vec<_>> =
                                 (0..masked.len()).map(|i| self.expand_item(i)).collect();
-                            parts.map(|p| p.join(", "))
+                            parts.map(|p| p.into_iter().flatten().collect())
                         } else {
                             None
                         }
@@ -639,22 +663,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         for (target, plan) in targets.iter().zip(plans) {
             match plan {
                 None => expanded.push(self.mem.make_unique(*target)),
-                Some(columns) => {
-                    let parsed = match self.mem.parse(&format!("SELECT {columns}")) {
-                        Ok(parsed) => parsed,
-                        Err(err) => {
-                            self.block(format!("failed to expand *: {err}"));
-                            return None;
-                        }
-                    };
-                    if let Some(Node::SelectStmt(select)) =
-                        parsed.as_ref().iter().next().map(|stmt| stmt.stmt())
-                    {
-                        for column in select.target_list().iter() {
-                            expanded.push(self.mem.make_unique(column));
-                        }
-                    }
-                }
+                Some(columns) => expanded.extend(columns),
             }
         }
 
@@ -1080,11 +1089,13 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         // This is the name Postgres would give them anyway.
         // Function calls can be inlined, which would change their output name too.
         if node.name().is_none()
-            && let Some(name) = column_ref_name(node.val()).or_else(|| match node.val() {
-                Node::FuncCall(_) => Some(figure_name(node.val())),
-                Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
-                _ => None,
-            })
+            && let Some(name) = column_ref_name(node.val())
+                .filter(|name| !super::shape::is_placeholder(name))
+                .or_else(|| match node.val() {
+                    Node::FuncCall(_) => Some(figure_name(node.val())),
+                    Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
+                    _ => None,
+                })
         {
             node.set_name(Some(self.mem.copy_string(&name)));
         }

@@ -1,0 +1,47 @@
+[[users]]
+name = "bench_admin"
+roles = ["pii_admin"]
+
+[[policies]]
+name = "balance"
+data_type = "integer"
+mask = "round"
+digits = -2
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[masked_columns]]
+name = "pgbench_accounts"
+column = "abalance"
+policy = "balance"
+
+[[policies]]
+name = "email"
+data_type = "text"
+mask = "email"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "partial"
+keep_suffix = 4
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[masked_columns]]
+name = "customers"
+column = "email"
+policy = "email"
+
+[[masked_columns]]
+name = "customers"
+column = "ssn"
+policy = "ssn"

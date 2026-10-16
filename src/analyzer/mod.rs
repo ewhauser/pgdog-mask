@@ -4,6 +4,7 @@ pub mod lineage;
 mod masker;
 mod rules;
 mod scope;
+pub mod shape;
 
 use std::collections::BTreeSet;
 
@@ -105,9 +106,31 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     }
 }
 
+/// Analyze a statement through its shape: analyze the statement with literals
+/// replaced by placeholders, then put this statement's literals back.
+/// `None` if the statement has no shape (see [`shape::literals`]).
+pub fn analyze_shape(sql: &str, ctx: &Context<'_>) -> Option<Outcome> {
+    let literals = shape::literals(sql)?;
+    Some(match analyze(&literals.shape, ctx) {
+        Outcome::Rewritten {
+            sql: shape_sql,
+            masked,
+            raw,
+            touches_masked,
+        } => Outcome::Rewritten {
+            sql: shape::Template::new(&shape_sql, literals.values.len())?
+                .render(&literals.values)?,
+            masked,
+            raw,
+            touches_masked,
+        },
+        other => other,
+    })
+}
+
 /// Comments at the start of the statement, which carry PgDog routing hints
 /// and are lost when the statement is rebuilt.
-fn leading_comments(sql: &str) -> String {
+pub(crate) fn leading_comments(sql: &str) -> String {
     let mut rest = sql;
     let mut comments = String::new();
     loop {
