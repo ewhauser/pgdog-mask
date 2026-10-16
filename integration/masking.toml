@@ -1,0 +1,43 @@
+[[users]]
+name = "admin"
+roles = ["pii_admin"]
+
+[[users]]
+name = "support"
+roles = ["support"]
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "sql"
+expression = "'XXX-XX-' || right(val, 4)"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies.rules]]
+roles = ["support"]
+mask = "default"
+search = "raw"
+
+[[policies]]
+name = "email"
+data_type = "text"
+mask = "email"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[masked_columns]]
+schema = "masking_e2e"
+name = "users"
+column = "ssn"
+policy = "ssn"
+
+[[masked_columns]]
+schema = "masking_e2e"
+name = "users"
+column = "email"
+policy = "email"

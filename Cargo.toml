@@ -1,0 +1,26 @@
+[package]
+name = "pgdog-masking"
+version = "0.1.0"
+edition.workspace = true
+description = "Dynamic data masking plugin for PgDog"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+pgdog-plugin.workspace = true
+pg_raw_parse.workspace = true
+arc-swap = "1"
+lru = "0.16"
+parking_lot.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+thiserror = "2"
+toml = "0.8"
+tracing = "0.1"
+indexmap.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+futures-util.workspace = true

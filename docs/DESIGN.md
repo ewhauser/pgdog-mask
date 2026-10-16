@@ -732,10 +732,20 @@ main
 
 ### 14.2 Phases
 
+**P1 status.** P1 is implemented in `plugins/pgdog-masking`, with these differences from the plan:
+- **One crate, not three.** Modules `analyzer`, `config`, `profile`, `catalog`, `mask` and `engine` replace `masking-core`/`masking-plugin`. There is no `masking-cli` yet.
+- **Built-in functions** are identified from an embedded list of PostgreSQL 16 `pg_catalog` function names, since the schema snapshot has no `pg_proc` until P2. Unqualified names not on the list are treated as user-defined functions.
+- **Views fail closed** unless they're in `view_allowlist` or have masked columns of their own. View inlining waits for view definitions in the snapshot (P2).
+- **`MERGE`, aliased joins, and `*` across `USING`/`NATURAL` joins** over masked columns are blocked, not rewritten.
+- **Output names** of rewritten column references are pinned with `AS`, and leading comments (routing hints) are kept on rewritten statements.
+- **Prepared statement re-checks** use a variant tag that is the hash of the rewritten SQL.
+- **Tests:** an analyzer unit corpus, canary leak tests against Postgres (`tests/canary.rs`), and end-to-end tests through PgDog (`integration/masking/run.sh`).
+
+
 | Phase | Branch | Scope |
 |---|---|---|
 | **P0: API** ✅ | `masking/plugin-api` | 0.6.0 vtable: capabilities, `statement`, `transform`, `schema`, `reload`; config-order plugin list, schema forcing, `catch_unwind`, `required`, Bind re-checking, test plugin. Catalog additions (views, functions, comments, labels, `pg_attribute`) follow when P2 needs them |
-| **P1: MVP** | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, `explain` CLI, canary suite |
+| **P1: MVP** ✅ | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, `explain` CLI, canary suite |
 | **P2: hardening** | `masking/plugin` | SQL-function analysis and inlining, view inlining, partitions, conditional masking, tags and classifiers (`config`/`comment`/`security_label`), error/notice scrubbing, `lint`, live template validation |
 | **P3: proxy masks** | `masking/plugin` | HMAC, FPE, vault tokenization |
 | **Later** | | row access policies (inject `WHERE` predicates through the same statement hook), JSON-path masking (`jsonb_set`-based templates) |
