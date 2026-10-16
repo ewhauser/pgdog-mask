@@ -1,12 +1,5 @@
 //! Fail-closed rules for masked users.
-use std::collections::HashSet;
-use std::sync::LazyLock;
-
 use pg_raw_parse::Node;
-
-/// Functions in `pg_catalog` (PostgreSQL 16).
-static BUILTIN_FUNCTIONS: LazyLock<HashSet<&'static str>> =
-    LazyLock::new(|| include_str!("builtin_functions.txt").lines().collect());
 
 /// Built-in functions that run SQL or read data out of band.
 const DENIED_FUNCTIONS: &[&str] = &[
@@ -47,36 +40,19 @@ const DENIED_RELATIONS: &[&str] = &[
 
 const CATALOG_SCHEMAS: &[&str] = &["pg_catalog", "information_schema", "pg_toast"];
 
-/// Is this function call allowed for masked users?
-pub(super) fn check_function(
-    schema: Option<&str>,
-    name: &str,
-    allowlist: &[String],
-) -> Result<(), String> {
-    let builtin = matches!(schema, None | Some("pg_catalog")) && BUILTIN_FUNCTIONS.contains(name);
+/// Functions that run SQL or read data out of band. They're blocked even if
+/// allowlisted.
+pub(super) fn denied_function(name: &str) -> Option<String> {
+    (DENIED_FUNCTIONS.contains(&name) || name.starts_with("dblink"))
+        .then(|| format!("function {name}() is not allowed for masked users"))
+}
 
-    if builtin {
-        if DENIED_FUNCTIONS.contains(&name) || name.starts_with("dblink") {
-            return Err(format!("function {name}() is not allowed for masked users"));
-        }
-        return Ok(());
-    }
-
-    let qualified = match schema {
-        Some(schema) => format!("{schema}.{name}"),
-        None => name.to_owned(),
-    };
-    let allowed = allowlist.iter().any(|entry| {
-        *entry == qualified || (schema.is_none() && entry.rsplit('.').next() == Some(name))
-    });
-
-    if allowed {
-        Ok(())
-    } else {
-        Err(format!(
-            "function {qualified}() is not a built-in function and isn't in udf_allowlist"
-        ))
-    }
+/// Is a function in `udf_allowlist`? Unqualified calls match entries by name.
+pub(super) fn allowlisted(schema: Option<&str>, name: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|entry| match schema {
+        Some(schema) => entry.split_once('.') == Some((schema, name)),
+        None => entry.rsplit('.').next() == Some(name),
+    })
 }
 
 /// Is this a reference to a system catalog relation, and is it allowed?
@@ -146,15 +122,15 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_check_function() {
-        assert!(check_function(None, "lower", &[]).is_ok());
-        assert!(check_function(Some("pg_catalog"), "count", &[]).is_ok());
-        assert!(check_function(None, "query_to_xml", &[]).is_err());
-        assert!(check_function(None, "dblink_exec", &[]).is_err());
-        assert!(check_function(None, "my_func", &[]).is_err());
-        assert!(check_function(None, "my_func", &["public.my_func".into()]).is_ok());
-        assert!(check_function(Some("public"), "my_func", &["public.my_func".into()]).is_ok());
-        assert!(check_function(Some("public"), "lower", &[]).is_err());
+    fn test_functions() {
+        assert!(denied_function("lower").is_none());
+        assert!(denied_function("query_to_xml").is_some());
+        assert!(denied_function("dblink_exec").is_some());
+        let allowlist = ["public.my_func".to_owned()];
+        assert!(allowlisted(None, "my_func", &allowlist));
+        assert!(allowlisted(Some("public"), "my_func", &allowlist));
+        assert!(!allowlisted(Some("other"), "my_func", &allowlist));
+        assert!(!allowlisted(None, "lower", &allowlist));
     }
 
     #[test]

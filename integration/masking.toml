@@ -1,3 +1,6 @@
+[general]
+tag_source = "comment"
+
 [[users]]
 name = "admin"
 roles = ["pii_admin"]
@@ -41,3 +44,36 @@ schema = "masking_e2e"
 name = "users"
 column = "email"
 policy = "email"
+
+# Tagged with a column comment.
+[[policies]]
+name = "phone"
+data_type = "text"
+mask = "partial"
+keep_suffix = 2
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "secret"
+data_type = "text"
+mask = "null"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[tags]]
+name = "pii.phone"
+policy = "phone"
+
+[[tags]]
+name = "secret"
+policy = "secret"
+
+[[classifiers]]
+schema = "masking_e2e"
+column_regex = "secret_.*"
+tag = "secret"

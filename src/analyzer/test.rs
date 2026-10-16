@@ -1,5 +1,5 @@
 use super::*;
-use crate::catalog::{Column, Relation, RelationKind};
+use crate::catalog::{Column, Function, Operator, Relation, RelationKind};
 use crate::config::Config;
 
 pub(crate) const CONFIG: &str = r#"
@@ -67,20 +67,138 @@ policy = "salary"
 "#;
 
 fn column(name: &str, data_type: &str) -> Column {
-    Column {
-        name: name.into(),
-        data_type: data_type.into(),
-    }
+    Column::new(name, data_type)
 }
 
 fn relation(name: &str, kind: RelationKind, columns: Vec<Column>) -> Relation {
-    Relation {
+    Relation::new("public", name, kind, columns)
+}
+
+fn view(name: &str, columns: &[&str], definition: &str) -> Relation {
+    let mut view = relation(
+        name,
+        RelationKind::View,
+        columns.iter().map(|c| column(c, "text")).collect(),
+    );
+    view.definition = Some(definition.into());
+    view
+}
+
+/// A SQL function.
+fn sql_function(
+    oid: i64,
+    name: &str,
+    args: &[(&str, &str)],
+    returns: &str,
+    body: &str,
+) -> Function {
+    Function {
+        oid,
         schema: "public".into(),
         name: name.into(),
-        kind,
-        columns,
-        parent: None,
+        kind: "function".into(),
+        argument_types: args.iter().map(|(_, t)| (*t).to_owned()).collect(),
+        argument_names: args.iter().map(|(n, _)| (*n).to_owned()).collect(),
+        return_type: returns.into(),
+        language: "sql".into(),
+        source: body.into(),
+        volatility: "stable".into(),
+        ..Default::default()
     }
+}
+
+pub(crate) fn functions() -> Vec<Function> {
+    let mut last4 = sql_function(
+        1,
+        "last4",
+        &[("value", "text")],
+        "text",
+        "SELECT right(value, 4)",
+    );
+    last4.volatility = "immutable".into();
+    last4.strict = true;
+
+    let mut definer = sql_function(
+        4,
+        "user_ssn_definer",
+        &[("uid", "bigint")],
+        "text",
+        "SELECT ssn FROM public.users WHERE id = uid",
+    );
+    definer.security_definer = true;
+
+    let mut plpgsql = sql_function(5, "plpgsql_fn", &[], "integer", "BEGIN RETURN 1; END");
+    plpgsql.language = "plpgsql".into();
+
+    let mut ssns = sql_function(6, "ssns", &[], "record", "SELECT id, ssn FROM public.users");
+    ssns.returns_set = true;
+    ssns.output_names = vec!["id".into(), "ssn".into()];
+    ssns.output_types = vec!["bigint".into(), "text".into()];
+
+    let mut atomic = sql_function(8, "atomic_ssn", &[("uid", "bigint")], "text", "");
+    atomic.sql_body = Some(
+        "BEGIN ATOMIC\n SELECT users.ssn\n    FROM public.users\n   WHERE (users.id = atomic_ssn.uid);\nEND".into(),
+    );
+
+    let mut volatile = sql_function(
+        10,
+        "volatile_ssn",
+        &[("uid", "bigint")],
+        "text",
+        "SELECT ssn FROM public.users WHERE id = uid",
+    );
+    volatile.volatility = "volatile".into();
+
+    vec![
+        last4,
+        sql_function(
+            2,
+            "user_ssn",
+            &[("uid", "bigint")],
+            "text",
+            "SELECT ssn FROM public.users WHERE id = uid",
+        ),
+        sql_function(
+            3,
+            "user_ssn_p",
+            &[("", "bigint")],
+            "text",
+            "SELECT ssn FROM public.users WHERE id = $1",
+        ),
+        definer,
+        plpgsql,
+        ssns,
+        sql_function(
+            7,
+            "count_users",
+            &[],
+            "bigint",
+            "SELECT count(*) FROM public.users",
+        ),
+        atomic,
+        sql_function(
+            9,
+            "recursive_fn",
+            &[("x", "integer")],
+            "integer",
+            "SELECT public.recursive_fn(x)",
+        ),
+        volatile,
+        sql_function(
+            11,
+            "same",
+            &[("a", "text"), ("b", "text")],
+            "boolean",
+            "SELECT a = b",
+        ),
+        sql_function(
+            12,
+            "ssn_eq",
+            &[("a", "bigint"), ("b", "bigint")],
+            "boolean",
+            "SELECT (SELECT ssn FROM public.users WHERE id = a) = (SELECT ssn FROM public.users WHERE id = b)",
+        ),
+    ]
 }
 
 pub(crate) fn catalog() -> Catalog {
@@ -95,7 +213,20 @@ pub(crate) fn catalog() -> Catalog {
     let mut partition = relation("users_2024", RelationKind::Table, users.clone());
     partition.parent = Some(("public".into(), "users".into()));
 
-    Catalog::new(
+    let mut barrier = view(
+        "ssn_barrier",
+        &["id", "ssn", "loud"],
+        " SELECT users.id, users.ssn, upper((users.ssn)::text) AS loud FROM public.users;",
+    );
+    barrier.options = vec!["security_barrier=true".into()];
+    let mut counts = view(
+        "ssn_counts",
+        &["ssn", "n"],
+        " SELECT users.ssn, count(*) AS n FROM public.users GROUP BY users.ssn;",
+    );
+    counts.kind = RelationKind::MaterializedView;
+
+    let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
         vec![
             relation("users", RelationKind::Table, users),
@@ -109,17 +240,63 @@ pub(crate) fn catalog() -> Catalog {
                     column("total", "numeric"),
                 ],
             ),
+            // No definition: can't be analyzed.
             relation(
                 "user_names",
                 RelationKind::View,
                 vec![column("name", "text")],
             ),
+            view(
+                "user_ssns",
+                &["id", "ssn"],
+                " SELECT users.id, users.ssn FROM public.users;",
+            ),
+            view(
+                "user_names_v",
+                &["id", "name"],
+                " SELECT users.id, users.name FROM public.users;",
+            ),
+            view(
+                "nested_v",
+                &["ssn"],
+                " SELECT user_ssns.ssn FROM public.user_ssns;",
+            ),
+            barrier,
+            counts,
         ],
-    )
+    );
+    catalog.full = true;
+    catalog.set_system_functions(include_str!("test_builtin_functions.txt").lines());
+    catalog.add_functions(functions());
+    catalog.add_operators(vec![
+        Operator {
+            schema: "public".into(),
+            name: "===".into(),
+            left_type: Some("text".into()),
+            right_type: Some("text".into()),
+            function_oid: 11,
+            function_schema: "public".into(),
+            function_name: "same".into(),
+        },
+        Operator {
+            schema: "public".into(),
+            name: "@@@".into(),
+            left_type: Some("bigint".into()),
+            right_type: Some("bigint".into()),
+            function_oid: 12,
+            function_schema: "public".into(),
+            function_name: "ssn_eq".into(),
+        },
+    ]);
+    catalog
 }
 
 pub(crate) fn analyze_as(user: &str, sql: &str) -> Outcome {
-    let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+    analyze_with(CONFIG, user, sql)
+}
+
+fn analyze_with(config: &str, user: &str, sql: &str) -> Outcome {
+    let policies = Policies::new(Config::from_toml(config).unwrap()).unwrap();
     let catalog = catalog();
     let assignments = Assignments::new(&policies, "db", &catalog);
     let profile = policies.profile(user, "db");
@@ -158,7 +335,7 @@ const SSN: &str = r#"('XXX-XX-' || "right"(ssn, 4))::varchar"#;
 
 fn raw_columns(user: &str, sql: &str) -> std::collections::BTreeSet<String> {
     match analyze_as(user, sql) {
-        Outcome::Unchanged { raw } | Outcome::Rewritten { raw, .. } => raw,
+        Outcome::Unchanged { raw, .. } | Outcome::Rewritten { raw, .. } => raw,
         Outcome::Blocked { reason } => panic!("{sql:?} blocked: {reason}"),
     }
 }
@@ -248,7 +425,11 @@ fn test_column_aliases() {
 fn test_whole_row() {
     let sql = rewritten("anonymous", "SELECT row_to_json(u) FROM users u");
     assert!(sql.contains("ROW(u.id, u.name, ('XXX-XX-'"), "{sql}");
-    assert!(sql.ends_with("::public.users) FROM users u"), "{sql}");
+    // Output names of function calls are pinned, since calls can be inlined.
+    assert!(
+        sql.ends_with("::public.users) AS row_to_json FROM users u"),
+        "{sql}"
+    );
 
     let sql = rewritten("anonymous", "SELECT to_jsonb(u.*) FROM users u");
     assert!(sql.contains("ROW(u.id"), "{sql}");
@@ -454,4 +635,184 @@ fn test_multiple_statements() {
 fn test_leading_comments_kept() {
     let sql = rewritten("anonymous", "/* pgdog_shard: 1 */ SELECT ssn FROM users");
     assert!(sql.starts_with("/* pgdog_shard: 1 */ SELECT"), "{sql}");
+}
+
+fn touches_masked(user: &str, sql: &str) -> bool {
+    match analyze_as(user, sql) {
+        Outcome::Unchanged { touches_masked, .. } | Outcome::Rewritten { touches_masked, .. } => {
+            touches_masked
+        }
+        Outcome::Blocked { reason } => panic!("{sql:?} blocked: {reason}"),
+    }
+}
+
+#[test]
+fn test_views_inlined() {
+    let sql = rewritten("anonymous", "SELECT ssn FROM user_ssns");
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT ssn AS ssn FROM (SELECT users.id AS id, {} AS ssn FROM public.users) user_ssns(id, ssn)",
+            SSN.replace("(ssn", "(users.ssn")
+        )
+    );
+
+    // Aliases and column aliases are kept.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT v.s FROM user_ssns AS v(i, s) WHERE v.i = 1",
+    );
+    assert!(sql.contains(") v(i, s) WHERE v.i = 1"), "{sql}");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+
+    // Nested views and `*`.
+    assert!(rewritten("anonymous", "SELECT ssn FROM nested_v").contains("'XXX-XX-'"));
+    assert!(rewritten("anonymous", "SELECT * FROM user_ssns").contains("'XXX-XX-'"));
+    assert!(rewritten("anonymous", "TABLE user_ssns").contains("'XXX-XX-'"));
+    let sql = rewritten(
+        "anonymous",
+        "SELECT o.id FROM orders o JOIN user_ssns u ON u.id = o.user_id WHERE u.ssn = $1",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+
+    // Views over unmasked columns are left alone.
+    unchanged("anonymous", "SELECT name FROM user_names_v");
+    unchanged(
+        "anonymous",
+        "UPDATE user_names_v SET name = $1 WHERE id = $2",
+    );
+    unchanged("admin", "SELECT ssn FROM user_ssns");
+
+    // Writes through views over masked columns, and other non-FROM uses, are blocked.
+    for sql in [
+        "UPDATE user_ssns SET ssn = $1 WHERE id = $2",
+        "DELETE FROM user_ssns WHERE id = 1",
+        "INSERT INTO user_ssns (id) VALUES (1)",
+        "LOCK TABLE user_ssns",
+    ] {
+        blocked("anonymous", sql);
+    }
+}
+
+#[test]
+fn test_views_as_tables() {
+    // security_barrier views aren't inlined: passed-through columns are masked,
+    // derived ones blocked.
+    let sql = rewritten("anonymous", "SELECT ssn FROM ssn_barrier");
+    assert!(sql.ends_with("FROM ssn_barrier"), "{sql}");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    unchanged("anonymous", "SELECT id FROM ssn_barrier");
+    assert!(blocked("anonymous", "SELECT loud FROM ssn_barrier").contains("computed from masked"));
+    blocked("anonymous", "SELECT * FROM ssn_barrier");
+    unchanged("admin", "SELECT loud FROM ssn_barrier");
+
+    // Materialized views hold their own data.
+    let sql = rewritten("anonymous", "SELECT ssn, n FROM ssn_counts");
+    assert!(
+        sql.contains("'XXX-XX-'") && sql.ends_with("FROM ssn_counts"),
+        "{sql}"
+    );
+
+    // With inline_views off, every view is a table.
+    let config = CONFIG.replacen("[general]", "[general]\ninline_views = false", 1);
+    let Outcome::Rewritten { sql, .. } =
+        analyze_with(&config, "anonymous", "SELECT ssn FROM user_ssns")
+    else {
+        panic!("rewrite");
+    };
+    assert!(sql.ends_with("FROM user_ssns"), "{sql}");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_functions() {
+    // Functions that don't read masked columns are left alone.
+    unchanged("anonymous", "SELECT last4(name) FROM users");
+    unchanged("anonymous", "SELECT count_users()");
+    unchanged("anonymous", "SELECT public.same('a', 'b')");
+
+    // Functions that do are inlined, with masks applied.
+    let sql = rewritten("anonymous", "SELECT user_ssn(o.user_id) FROM orders o");
+    assert!(
+        sql.starts_with(
+            "SELECT (SELECT (SELECT __pgdog_body.__pgdog_out AS __pgdog_out FROM (SELECT"
+        ),
+        "{sql}"
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    assert!(
+        sql.contains("FROM (SELECT o.user_id::bigint AS uid) __pgdog_args)"),
+        "{sql}"
+    );
+    assert!(sql.ends_with("AS user_ssn FROM orders o"), "{sql}");
+
+    for sql in [
+        "SELECT user_ssn_p($1)",
+        "SELECT atomic_ssn(1)",
+        "SELECT id FROM orders WHERE user_ssn(user_id) = $1",
+        "SELECT public.user_ssn(1)",
+    ] {
+        let rewritten = rewritten("anonymous", sql);
+        assert!(rewritten.contains("'XXX-XX-'"), "{sql} => {rewritten}");
+        assert!(rewritten.contains("__pgdog_args"), "{sql} => {rewritten}");
+        assert!(
+            !rewritten.contains("$1)") || sql.contains("$1"),
+            "{rewritten}"
+        );
+    }
+
+    // Set-returning functions in FROM.
+    let sql = rewritten("anonymous", "SELECT s.ssn FROM ssns() s WHERE s.id = 1");
+    assert!(
+        sql.contains("FROM LATERAL (SELECT __pgdog_body.__pgdog_c1::bigint AS id"),
+        "{sql}"
+    );
+    assert!(sql.contains(") s(id, ssn) WHERE s.id = 1"), "{sql}");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+
+    // Scalar functions in FROM are one row.
+    let sql = rewritten("anonymous", "SELECT * FROM user_ssn(1) AS s(x)");
+    assert!(
+        sql.starts_with("SELECT * FROM LATERAL (SELECT (SELECT (SELECT"),
+        "{sql}"
+    );
+    assert!(sql.ends_with(") s(x)"), "{sql}");
+
+    // Operators are calls to their functions.
+    unchanged("anonymous", "SELECT 'a' === 'b'");
+    let sql = rewritten("anonymous", "SELECT id FROM orders WHERE id @@@ user_id");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+
+    // Nothing changes for exempt users.
+    unchanged("admin", "SELECT user_ssn(1)");
+
+    for (sql, reason) in [
+        ("SELECT user_ssn_definer(1)", "SECURITY DEFINER"),
+        ("SELECT volatile_ssn(1)", "VOLATILE"),
+        ("SELECT plpgsql_fn()", "plpgsql"),
+        ("SELECT recursive_fn(1)", "recursive"),
+        ("SELECT unknown_fn(1)", "isn't in the schema snapshot"),
+        ("SELECT user_ssn(uid => 1)", "named arguments"),
+        ("SELECT ssns()", "returns a set"),
+        ("SELECT * FROM ssns() WITH ORDINALITY", "ORDINALITY"),
+    ] {
+        let blocked = blocked("anonymous", sql);
+        assert!(blocked.contains(reason), "{sql}: {blocked}");
+    }
+}
+
+#[test]
+fn test_scrub_flag() {
+    assert!(touches_masked(
+        "anonymous",
+        "UPDATE users SET name = $1 WHERE id = $2"
+    ));
+    assert!(touches_masked(
+        "anonymous",
+        "INSERT INTO users (id, name) VALUES ($1, $2)"
+    ));
+    assert!(touches_masked("anonymous", "SELECT ssn FROM users"));
+    assert!(touches_masked("anonymous", "SELECT ssn FROM user_ssns"));
+    assert!(touches_masked("anonymous", "SELECT count_users()"));
+    assert!(!touches_masked("anonymous", "SELECT id FROM orders"));
 }

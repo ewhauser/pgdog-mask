@@ -5,6 +5,7 @@
 //! `[[sharded_tables]]`.
 use std::{collections::HashSet, fs, path::Path};
 
+use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -33,6 +34,19 @@ pub enum Mode {
     Off,
 }
 
+/// Where column tags come from, besides `[[masked_columns]]` and `[[classifiers]]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagSource {
+    /// Only the config file.
+    #[default]
+    Config,
+    /// Also column comments containing `pgdog:tag=<name>`.
+    Comment,
+    /// Also `SECURITY LABEL FOR <security_label_provider> ON COLUMN ... IS '<name>'`.
+    SecurityLabel,
+}
+
 /// What to do with statements the analyzer can't prove safe.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,12 +64,32 @@ pub struct General {
     /// Statements referencing relations missing from the schema snapshot.
     #[serde(default)]
     pub on_unresolved: OnUnresolved,
-    /// User-defined functions masked users may call, e.g. `public.normalize_phone`.
+    /// Functions masked users may call without analysis, e.g. `public.normalize_phone`.
+    /// Listing one attests that it doesn't return masked data.
     #[serde(default)]
     pub udf_allowlist: Vec<String>,
-    /// Views masked users may query even though their definitions aren't analyzed.
+    /// Extensions whose functions and operators masked users may call, e.g. `citext`.
+    #[serde(default)]
+    pub extension_allowlist: Vec<String>,
+    /// Views masked users may query without analysis. Listing one attests that it
+    /// doesn't return masked data.
     #[serde(default)]
     pub view_allowlist: Vec<String>,
+    /// Replace views over masked columns with their masked definitions. If off,
+    /// views are treated like tables: columns passed through from masked columns
+    /// are masked, other columns derived from masked columns are blocked.
+    #[serde(default = "General::enabled")]
+    pub inline_views: bool,
+    /// Remove `DETAIL` from errors and notices of statements that read or write
+    /// relations with masked columns. They can contain row values, e.g. a
+    /// `CHECK` violation's `Failing row contains (...)`.
+    #[serde(default = "General::enabled")]
+    pub scrub_error_detail: bool,
+    #[serde(default)]
+    pub tag_source: TagSource,
+    /// Security label provider read with `tag_source = "security_label"`.
+    #[serde(default = "General::security_label_provider")]
+    pub security_label_provider: String,
     /// Number of analyzed statements to cache.
     #[serde(default = "General::cache_size")]
     pub cache_size: usize,
@@ -65,6 +99,14 @@ impl General {
     fn cache_size() -> usize {
         100_000
     }
+
+    fn enabled() -> bool {
+        true
+    }
+
+    fn security_label_provider() -> String {
+        "pgdog".into()
+    }
 }
 
 impl Default for General {
@@ -73,7 +115,12 @@ impl Default for General {
             mode: Mode::default(),
             on_unresolved: OnUnresolved::default(),
             udf_allowlist: vec![],
+            extension_allowlist: vec![],
             view_allowlist: vec![],
+            inline_views: Self::enabled(),
+            scrub_error_detail: Self::enabled(),
+            tag_source: TagSource::default(),
+            security_label_provider: Self::security_label_provider(),
             cache_size: Self::cache_size(),
         }
     }
@@ -213,6 +260,19 @@ pub struct MaskedColumn {
     pub arguments: Vec<String>,
 }
 
+/// Tag columns by name.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Classifier {
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    /// Table name. If omitted, every table is checked.
+    pub name: Option<String>,
+    /// Regular expression matched against the whole column name.
+    pub column_regex: String,
+    pub tag: String,
+}
+
 /// Tag to policy mapping.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,6 +294,8 @@ pub struct Config {
     pub masked_columns: Vec<MaskedColumn>,
     #[serde(default)]
     pub tags: Vec<Tag>,
+    #[serde(default)]
+    pub classifiers: Vec<Classifier>,
 }
 
 impl Config {
@@ -273,6 +335,21 @@ impl Config {
             }
         }
 
+        for classifier in &self.classifiers {
+            if !tags.contains(classifier.tag.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "classifier \"{}\" references unknown tag \"{}\"",
+                    classifier.column_regex, classifier.tag
+                )));
+            }
+            if let Err(err) = Regex::new(&classifier.column_regex) {
+                return Err(Error::Invalid(format!(
+                    "classifier \"{}\" is not a valid regular expression: {err}",
+                    classifier.column_regex
+                )));
+            }
+        }
+
         for column in &self.masked_columns {
             let target = format!(
                 "{}.{}",
@@ -304,15 +381,16 @@ impl Config {
 
     /// Policy assigned to a masked column, directly or through its tag.
     pub fn column_policy(&self, column: &MaskedColumn) -> Option<&Policy> {
-        let name = match (&column.policy, &column.tag) {
-            (Some(policy), _) => policy.as_str(),
-            (None, Some(tag)) => self
-                .tags
-                .iter()
-                .find(|t| &t.name == tag)
-                .map(|t| t.policy.as_str())?,
-            (None, None) => return None,
-        };
+        match (&column.policy, &column.tag) {
+            (Some(policy), _) => self.policies.iter().find(|p| &p.name == policy),
+            (None, Some(tag)) => self.tag_policy(tag),
+            (None, None) => None,
+        }
+    }
+
+    /// Policy of a tag.
+    pub fn tag_policy(&self, tag: &str) -> Option<&Policy> {
+        let name = self.tags.iter().find(|t| t.name == tag)?.policy.as_str();
         self.policies.iter().find(|policy| policy.name == name)
     }
 }
@@ -378,6 +456,56 @@ policy = "nope"
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown policy"), "{err}");
+    }
+
+    #[test]
+    fn test_classifiers() {
+        let config = Config::from_toml(
+            r#"
+[general]
+tag_source = "security_label"
+
+[[policies]]
+name = "email"
+data_type = "text"
+mask = "email"
+
+[[tags]]
+name = "pii.email"
+policy = "email"
+
+[[classifiers]]
+column_regex = "^e_?mail$"
+tag = "pii.email"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.general.tag_source, TagSource::SecurityLabel);
+        assert_eq!(config.general.security_label_provider, "pgdog");
+        assert_eq!(config.tag_policy("pii.email").unwrap().name, "email");
+
+        let err = Config::from_toml("[[classifiers]]\ncolumn_regex = \"x\"\ntag = \"nope\"\n")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown tag"), "{err}");
+
+        let err = Config::from_toml(
+            r#"
+[[policies]]
+name = "email"
+data_type = "text"
+mask = "email"
+
+[[tags]]
+name = "pii.email"
+policy = "email"
+
+[[classifiers]]
+column_regex = "("
+tag = "pii.email"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("regular expression"), "{err}");
     }
 
     #[test]

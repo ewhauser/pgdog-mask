@@ -1,5 +1,6 @@
 //! Statement analysis: resolve column references against masking policies
 //! and rewrite the statement to read masks instead of masked columns.
+pub mod lineage;
 mod masker;
 mod rules;
 mod scope;
@@ -29,6 +30,9 @@ pub enum Outcome {
     Unchanged {
         /// Masked columns searched by raw value.
         raw: BTreeSet<String>,
+        /// Reads or writes relations with masked columns, so errors can carry
+        /// masked values.
+        touches_masked: bool,
     },
     /// Send this SQL instead.
     Rewritten {
@@ -36,6 +40,7 @@ pub enum Outcome {
         /// Masked columns, as `schema.table.column`.
         masked: BTreeSet<String>,
         raw: BTreeSet<String>,
+        touches_masked: bool,
     },
     /// The statement can't be run safely.
     Blocked { reason: String },
@@ -51,7 +56,13 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         for stmt in stmts.as_mut() {
             masker.statement(stmt);
         }
-        result = Some((masker.blocked, masker.changed, masker.masked, masker.raw));
+        result = Some((
+            masker.blocked,
+            masker.changed,
+            masker.masked,
+            masker.raw,
+            masker.touched,
+        ));
         Ok::<_, pg_raw_parse::Error>(stmts)
     });
 
@@ -64,7 +75,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         }
     };
 
-    let Some((blocked, changed, masked, raw)) = result else {
+    let Some((blocked, changed, masked, raw, touches_masked)) = result else {
         return Outcome::Blocked {
             reason: "statement could not be analyzed".into(),
         };
@@ -75,7 +86,10 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     }
 
     if !changed {
-        return Outcome::Unchanged { raw };
+        return Outcome::Unchanged {
+            raw,
+            touches_masked,
+        };
     }
 
     match pg_raw_parse::deparse_stmts(parsed.iter()) {
@@ -83,6 +97,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             sql: format!("{}{rewritten}", leading_comments(sql)),
             masked,
             raw,
+            touches_masked,
         },
         Err(err) => Outcome::Blocked {
             reason: format!("failed to build the masked statement: {err}"),

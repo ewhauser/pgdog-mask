@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 
 use pgdog_plugin::{
     Capabilities, Config as PluginConfig, PdStr, Plugin, StatementContext, StatementOutput,
+    TransformContext, TransformOutput,
 };
 use tracing::error;
 
@@ -18,6 +19,8 @@ pub mod config;
 pub mod engine;
 pub mod mask;
 pub mod profile;
+pub mod scrub;
+pub mod tags;
 
 use engine::Engine;
 
@@ -34,7 +37,10 @@ impl Plugin for MaskingPlugin {
 
     fn capabilities() -> Capabilities {
         // REQUIRED: PgDog must never serve traffic without masking once it's configured.
-        Capabilities::STATEMENT | Capabilities::SCHEMA | Capabilities::REQUIRED
+        Capabilities::STATEMENT
+            | Capabilities::TRANSFORM
+            | Capabilities::SCHEMA
+            | Capabilities::REQUIRED
     }
 
     extern "C-unwind" fn config(config: PluginConfig<'_>) -> bool {
@@ -54,6 +60,10 @@ impl Plugin for MaskingPlugin {
 
     fn statement(context: StatementContext<'_>) -> StatementOutput {
         ENGINE.statement(&context)
+    }
+
+    fn transform(context: TransformContext<'_>) -> TransformOutput {
+        ENGINE.transform(&context)
     }
 
     fn schema(database: &str, epoch: u64, snapshot: &str) {

@@ -124,8 +124,102 @@ async fn test_exempt_user() {
         return;
     }
     let client = connect("admin").await;
-    let rows = simple(&client, "SELECT ssn FROM masking_e2e.users WHERE id = 1").await;
-    assert_eq!(rows, vec![vec![Some("CANARYSSN-1111".into())]]);
+    let rows = simple(
+        &client,
+        "SELECT ssn, phone, secret_note FROM masking_e2e.users WHERE id = 1",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("CANARYSSN-1111".into()),
+            Some("CANARYPHONE-11".into()),
+            Some("CANARYNOTE-1".into())
+        ]]
+    );
+
+    // Errors keep their DETAIL for exempt users.
+    let err = client
+        .simple_query("UPDATE masking_e2e.users SET name = 'forbidden' WHERE id = 1")
+        .await
+        .unwrap_err();
+    let detail = err.as_db_error().and_then(|e| e.detail()).unwrap_or("");
+    assert!(detail.contains("CANARYSSN-1111"), "{err:?}");
+}
+
+#[tokio::test]
+async fn test_views_functions_and_tags() {
+    if !enabled() {
+        return;
+    }
+    let client = connect("masked").await;
+
+    // Views over masked columns are inlined with masks applied.
+    let rows = simple(&client, "SELECT ssn FROM masking_e2e.user_ssns ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("XXX-XX-1111".into())],
+            vec![Some("XXX-XX-2222".into())]
+        ]
+    );
+
+    // SQL functions that read masked columns are inlined.
+    let rows = simple(&client, "SELECT masking_e2e.get_ssn(2)").await;
+    assert_eq!(rows, vec![vec![Some("XXX-XX-2222".into())]]);
+    let row = client
+        .query_one("SELECT masking_e2e.get_ssn($1) AS ssn", &[&1_i64])
+        .await
+        .unwrap();
+    let ssn: String = row.get("ssn");
+    assert_eq!(ssn, "XXX-XX-1111");
+
+    // A tag from a column comment, and a classifier match.
+    let rows = simple(
+        &client,
+        "SELECT phone, secret_note FROM masking_e2e.users WHERE id = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("************11".into()), None]]);
+}
+
+#[tokio::test]
+async fn test_error_detail_scrubbed() {
+    if !enabled() {
+        return;
+    }
+    let client = connect("masked").await;
+
+    // A CHECK violation's DETAIL lists the whole row, including masked columns.
+    let err = client
+        .simple_query("UPDATE masking_e2e.users SET name = 'forbidden' WHERE id = 1")
+        .await
+        .unwrap_err();
+    let db = err.as_db_error().expect("database error");
+    assert_eq!(db.code(), &SqlState::CHECK_VIOLATION, "{err:?}");
+    assert_eq!(db.detail(), None, "{err:?}");
+    assert!(!format!("{err:?}").contains("CANARY"), "{err:?}");
+
+    // Extended protocol: the transform is attached on Bind.
+    let statement = client
+        .prepare("UPDATE masking_e2e.users SET name = $1 WHERE id = $2")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let err = client
+            .execute(&statement, &[&"forbidden", &2_i64])
+            .await
+            .unwrap_err();
+        let db = err.as_db_error().expect("database error");
+        assert_eq!(db.detail(), None, "{err:?}");
+        assert!(!format!("{err:?}").contains("CANARY"), "{err:?}");
+    }
+
+    // The session is still usable.
+    assert_eq!(
+        simple(&client, "SELECT 1").await,
+        vec![vec![Some("1".into())]]
+    );
 }
 
 #[tokio::test]

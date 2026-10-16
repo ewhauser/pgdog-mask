@@ -8,16 +8,25 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use pgdog_plugin::{StatementContext, StatementKind, StatementOutput};
+use pgdog_plugin::{
+    MessageCodes, StatementContext, StatementKind, StatementOutput, TransformContext,
+    TransformOutput,
+};
 use tracing::{error, info, warn};
 
 use crate::analyzer::{Context, Outcome, analyze};
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies};
+use crate::scrub::scrub_detail;
+use crate::tags;
 
 const PERMISSION_DENIED: &str = "42501";
 const CANNOT_CONNECT_NOW: &str = "57P03";
+
+/// Transform handle for removing `DETAIL` from errors and notices. Scrubbing
+/// keeps no state, so every statement shares it.
+const SCRUB: u64 = 1;
 
 /// Loaded configuration.
 struct Settings {
@@ -36,8 +45,15 @@ struct Database {
 /// What to do with a statement, cached by statement and profile.
 #[derive(Debug, Clone)]
 enum Decision {
-    Continue,
-    Rewrite { sql: String, variant: u64 },
+    /// `scrub`: remove `DETAIL` from errors and notices.
+    Continue {
+        scrub: bool,
+    },
+    Rewrite {
+        sql: String,
+        variant: u64,
+        scrub: bool,
+    },
     Block(String),
 }
 
@@ -119,6 +135,16 @@ impl Engine {
         };
         let settings = self.settings.load();
         let assignments = Assignments::new(&settings.policies, database, &catalog);
+        if let Some(previous) = self.databases.read().get(database) {
+            for ((schema, table, column), tag) in tags::removed(
+                &previous.assignments.database_tags,
+                &assignments.database_tags,
+            ) {
+                warn!(
+                    "[pgdog_masking] tag \"{tag}\" was removed from column {schema}.{table}.{column} in database \"{database}\"; it's no longer masked by that tag"
+                );
+            }
+        }
         self.databases.write().insert(
             database.to_owned(),
             Arc::new(Database {
@@ -167,12 +193,27 @@ impl Engine {
         }
 
         let decision = self.decide(context, &settings, &profile);
+        let scrub = |output: StatementOutput, scrub: bool| {
+            if scrub && settings.policies.config.general.scrub_error_detail {
+                output.with_transform(SCRUB, MessageCodes::none().with('E').with('N'))
+            } else {
+                output
+            }
+        };
 
         match (decision, mode) {
-            (Decision::Continue, _) => StatementOutput::cont(),
-            (Decision::Rewrite { sql, variant }, Mode::Enforce) => {
-                StatementOutput::rewrite(sql, variant)
+            (Decision::Continue { scrub: touched }, Mode::Enforce) => {
+                scrub(StatementOutput::cont(), touched)
             }
+            (Decision::Continue { .. }, _) => StatementOutput::cont(),
+            (
+                Decision::Rewrite {
+                    sql,
+                    variant,
+                    scrub: touched,
+                },
+                Mode::Enforce,
+            ) => scrub(StatementOutput::rewrite(sql, variant), touched),
             (Decision::Block(reason), Mode::Enforce) => {
                 let code = if reason.starts_with("masking schema") {
                     CANNOT_CONNECT_NOW
@@ -244,16 +285,26 @@ impl Engine {
         };
 
         let decision = match analyze(&context.sql, &ctx) {
-            Outcome::Unchanged { raw } => {
+            Outcome::Unchanged {
+                raw,
+                touches_masked,
+            } => {
                 if !raw.is_empty() {
                     info!(
                         "[pgdog_masking] user \"{}\" searched raw values of {:?}",
                         &*identity.user, raw
                     );
                 }
-                Decision::Continue
+                Decision::Continue {
+                    scrub: touches_masked,
+                }
             }
-            Outcome::Rewritten { sql, masked, raw } => {
+            Outcome::Rewritten {
+                sql,
+                masked,
+                raw,
+                touches_masked,
+            } => {
                 if !raw.is_empty() {
                     info!(
                         "[pgdog_masking] user \"{}\" searched raw values of {:?}",
@@ -268,7 +319,11 @@ impl Engine {
                 log_decision(
                     &identity.user,
                     &format!("masked {masked:?}"),
-                    Decision::Rewrite { sql, variant },
+                    Decision::Rewrite {
+                        sql,
+                        variant,
+                        scrub: touches_masked,
+                    },
                     shadow,
                 )
             }
@@ -285,6 +340,19 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Remove `DETAIL` from errors and notices of statements that touch masked relations.
+    pub fn transform(&self, context: &TransformContext<'_>) -> TransformOutput {
+        if context.handle != SCRUB || !matches!(context.code, b'E' | b'N') {
+            return TransformOutput::forward();
+        }
+        match scrub_detail(context.payload.as_slice()) {
+            Some(body) => TransformOutput::replace(body),
+            None => TransformOutput::forward(),
+        }
+    }
+}
+
 fn log_decision(user: &str, what: &str, decision: Decision, shadow: bool) -> Decision {
     let prefix = if shadow {
         "[pgdog_masking] (shadow)"
@@ -298,7 +366,7 @@ fn log_decision(user: &str, what: &str, decision: Decision, shadow: bool) -> Dec
         Decision::Block(reason) => {
             warn!("{prefix} blocked statement for user \"{user}\": {reason} [{what}]")
         }
-        Decision::Continue => (),
+        Decision::Continue { .. } => (),
     }
     decision
 }
@@ -366,7 +434,7 @@ mod test {
                 "SELECT id FROM orders",
                 StatementKind::Parse
             ),
-            Decision::Continue
+            Decision::Continue { .. }
         ));
         assert!(matches!(
             decide(&engine, "anonymous", "", StatementKind::FunctionCall),
@@ -430,5 +498,54 @@ mod test {
             StatementKind::Query,
         ));
         assert!(format!("{output:?}").contains("action: 0"), "{output:?}");
+    }
+
+    #[test]
+    fn test_scrub_transform() {
+        let enforce = engine(CONFIG);
+        let output = |user, sql| {
+            format!(
+                "{:?}",
+                enforce.statement(&context(user, sql, StatementKind::Query))
+            )
+        };
+
+        // Statements touching masked relations get the transform, others don't.
+        assert!(
+            output("anonymous", "UPDATE users SET name = $1 WHERE id = $2")
+                .contains("transform: 1")
+        );
+        assert!(output("anonymous", "SELECT ssn FROM users").contains("transform: 1"));
+        assert!(output("anonymous", "SELECT id FROM orders").contains("transform: 0"));
+        assert!(output("admin", "UPDATE users SET name = $1").contains("transform: 0"));
+
+        let disabled =
+            engine(&CONFIG.replacen("[general]", "[general]\nscrub_error_detail = false", 1));
+        let output = format!(
+            "{:?}",
+            disabled.statement(&context(
+                "anonymous",
+                "SELECT ssn FROM users",
+                StatementKind::Query
+            ))
+        );
+        assert!(output.contains("transform: 0"), "{output}");
+
+        let body = b"SERROR\0C23514\0Mcheck\0DFailing row contains (1, secret).\0\0";
+        let replaced = enforce.transform(&TransformContext {
+            handle: SCRUB,
+            code: b'E',
+            payload: body.as_slice().into(),
+            result_formats: Default::default(),
+        });
+        let replaced = format!("{replaced:?}");
+        assert!(replaced.contains("action: 1"), "{replaced}");
+        let forwarded = enforce.transform(&TransformContext {
+            handle: SCRUB,
+            code: b'D',
+            payload: body.as_slice().into(),
+            result_formats: Default::default(),
+        });
+        assert!(format!("{forwarded:?}").contains("action: 0"));
     }
 }

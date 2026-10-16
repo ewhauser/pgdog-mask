@@ -1,5 +1,10 @@
 //! Rewrites a statement so every reference to a masked column reads the mask instead.
-use std::collections::{BTreeSet, HashSet};
+mod functions;
+mod views;
+
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use pg_raw_parse::{
     Node, NodeMut,
@@ -12,9 +17,10 @@ use pg_raw_parse::{
 use super::Context;
 use super::rules;
 use super::scope::{Cte, Frame, Item, ItemKind, find_cte, find_item, resolve_column};
-use crate::catalog::{Relation, RelationKind};
+use crate::catalog::Relation;
 use crate::config::OnUnresolved;
 use crate::mask::{Mask, SearchOp, VALUE, castable};
+use functions::CallUse;
 
 /// Quote an identifier.
 pub(super) fn ident(name: &str) -> String {
@@ -34,6 +40,45 @@ struct MaskTarget {
 /// Functions that only normalize a value, allowed around a column in raw searches.
 const NORMALIZERS: &[&str] = &["lower", "upper", "btrim", "ltrim", "rtrim"];
 
+/// Views and functions nested deeper than this are blocked.
+const MAX_DEPTH: usize = 16;
+
+/// Transform a clause stored in a field of a known type, whose root can't be
+/// replaced in place: a call or operator at the root that must be inlined is
+/// set through the field's setter instead.
+macro_rules! clause {
+    ($masker:expr, $node:expr, $get:ident, $get_mut:ident, $set:ident) => {{
+        match $masker.root_replacement($node.$get()) {
+            Some(mut replacement) => {
+                $masker.mask_replacement(&mut replacement);
+                $node.$set(replacement);
+            }
+            None => transform::transform_node($node.$get_mut(), $masker),
+        }
+    }};
+}
+
+/// What a view or function does for this user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    /// Reads no masked columns; use it as is.
+    Safe,
+    /// Reads masked columns; inline its definition with masks applied.
+    Inline,
+    Blocked(String),
+}
+
+/// Verdicts shared by the masker of a statement and the maskers it starts for
+/// view and function bodies.
+#[derive(Debug, Default)]
+struct Memo {
+    /// Verdict and whether it reads relations with masked columns.
+    views: HashMap<(String, String), (Verdict, bool)>,
+    functions: HashMap<i64, (Verdict, bool)>,
+    /// Views and functions being analyzed, to stop recursion.
+    active: Vec<String>,
+}
+
 pub(super) struct Masker<'c, 'mem> {
     mem: MemoryToken<'mem>,
     ctx: &'c Context<'c>,
@@ -42,10 +87,19 @@ pub(super) struct Masker<'c, 'mem> {
     predicate: bool,
     /// Column references used in an allowed raw search shape.
     raw_refs: HashSet<usize>,
+    /// Function calls already checked, e.g. in a FROM list.
+    checked_calls: HashSet<usize>,
+    /// Inside a FROM list, where views can be inlined.
+    from: bool,
+    /// Nesting of view and function bodies.
+    depth: usize,
+    memo: Rc<RefCell<Memo>>,
     pub(super) blocked: Option<String>,
     pub(super) changed: bool,
     pub(super) masked: BTreeSet<String>,
     pub(super) raw: BTreeSet<String>,
+    /// Reads or writes a relation with masked columns.
+    pub(super) touched: bool,
 }
 
 fn names(list: &pg_raw_parse::list::NodeList) -> Vec<String> {
@@ -69,6 +123,10 @@ fn fields(column: &nodes::ColumnRef) -> (Vec<&str>, bool) {
 
 fn address(column: &nodes::ColumnRef) -> usize {
     std::ptr::from_ref(column) as usize
+}
+
+fn call_address(call: &nodes::FuncCall) -> usize {
+    std::ptr::from_ref(call) as usize
 }
 
 /// Output column name Postgres gives an expression, if it's a (cast) column reference.
@@ -140,11 +198,71 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             frames: vec![],
             predicate: false,
             raw_refs: HashSet::new(),
+            checked_calls: HashSet::new(),
+            from: false,
+            depth: 0,
+            memo: Rc::default(),
             blocked: None,
             changed: false,
             masked: BTreeSet::new(),
             raw: BTreeSet::new(),
+            touched: false,
         }
+    }
+
+    /// A masker for the body of a view or function, sharing this one's verdicts.
+    fn nested<'n>(&self, ctx: &'n Context<'n>) -> Masker<'n, 'mem> {
+        let mut nested = Masker::new(self.mem, ctx);
+        nested.depth = self.depth + 1;
+        nested.memo = self.memo.clone();
+        nested
+    }
+
+    /// Analyze the statements of a view or function body for this user.
+    /// Returns the verdict and whether the body reads relations with masked columns.
+    fn analyze_body(
+        &self,
+        body: &str,
+        search_path: Vec<String>,
+        inlinable: impl FnOnce(&nodes::RawStmt) -> Result<(), String>,
+    ) -> (Verdict, bool) {
+        if self.depth >= MAX_DEPTH {
+            return (
+                Verdict::Blocked("views or functions are nested too deeply".into()),
+                false,
+            );
+        }
+        let mut stmts = match self.mem.parse(body) {
+            Ok(stmts) => stmts,
+            Err(err) => return (Verdict::Blocked(format!("failed to parse: {err}")), false),
+        };
+        let ctx = Context {
+            catalog: self.ctx.catalog,
+            assignments: self.ctx.assignments,
+            policies: self.ctx.policies,
+            profile: self.ctx.profile,
+            search_path,
+        };
+        let mut nested = self.nested(&ctx);
+        let shape = match stmts.as_ref().iter().collect::<Vec<_>>().as_slice() {
+            [stmt] => inlinable(stmt),
+            _ => Err("it has more than one statement".into()),
+        };
+        for stmt in stmts.as_mut() {
+            nested.statement(stmt);
+        }
+
+        let verdict = match nested.blocked {
+            Some(reason) => Verdict::Blocked(reason),
+            None if !nested.changed => Verdict::Safe,
+            None => match shape {
+                Ok(()) => Verdict::Inline,
+                Err(why) => {
+                    Verdict::Blocked(format!("reads masked columns and can't be inlined: {why}"))
+                }
+            },
+        };
+        (verdict, nested.touched)
     }
 
     fn block(&mut self, reason: impl Into<String>) {
@@ -222,12 +340,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     fn is_masked_relation(&self, relation: &Relation) -> bool {
         self.ctx
             .assignments
-            .relation(&relation.schema, &relation.name)
-            .is_some_and(|columns| {
-                columns
-                    .values()
-                    .any(|a| self.ctx.profile.masks[a.policy].is_masked())
-            })
+            .relation_policies(&relation.schema, &relation.name)
+            .any(|policy| self.ctx.profile.masks[policy].is_masked())
     }
 
     /// The mask for a column reference, if it points to a masked column.
@@ -398,15 +512,17 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .catalog
             .resolve(schema, name, &self.ctx.search_path)
         {
-            if matches!(
-                relation.kind,
-                RelationKind::View | RelationKind::MaterializedView
-            ) && !self.view_allowed(relation)
-            {
-                self.block(format!(
-                    "view {}.{} can't be analyzed for masked columns; add it to view_allowlist or mask its columns",
-                    relation.schema, relation.name
-                ));
+            match self.view_verdict(relation) {
+                Verdict::Safe => (),
+                // Views are inlined in FROM lists; anywhere else they can't be.
+                Verdict::Inline => self.block(format!(
+                    "view {} reads masked columns and can only be read in a FROM list",
+                    relation.qualified_name()
+                )),
+                Verdict::Blocked(reason) => self.block(reason),
+            }
+            if self.is_masked_relation(relation) {
+                self.touched = true;
             }
             Item::relation(refname, relation, &aliases)
         } else if let Some(result) = rules::check_catalog_relation(schema, name) {
@@ -432,22 +548,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if let Some(frame) = self.frames.last_mut() {
             frame.items.push(item);
         }
-    }
-
-    fn view_allowed(&self, relation: &Relation) -> bool {
-        let qualified = format!("{}.{}", relation.schema, relation.name);
-        self.ctx
-            .policies
-            .config
-            .general
-            .view_allowlist
-            .iter()
-            .any(|v| *v == qualified || *v == relation.name)
-            || self
-                .ctx
-                .assignments
-                .relation(&relation.schema, &relation.name)
-                .is_some()
     }
 
     /// SQL listing an item's columns, replacing `*` for it.
@@ -617,6 +717,24 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             };
         }
 
+        if let Some(resolved) = resolve_column(&self.frames, &names)
+            && let Some(policies) = self.ctx.assignments.derived(
+                &resolved.relation.schema,
+                &resolved.relation.name,
+                resolved.column,
+            )
+            && policies
+                .iter()
+                .any(|policy| self.ctx.profile.masks[*policy].is_masked())
+        {
+            self.block(format!(
+                "column {}.{} is computed from masked columns and can't be masked; assign it a policy",
+                resolved.relation.qualified_name(),
+                resolved.column
+            ));
+            return None;
+        }
+
         if let Some(target) = self.column_target(&names) {
             if self.raw_refs.contains(&address(column)) {
                 self.raw.insert(target.label);
@@ -637,28 +755,24 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         None
     }
 
-    fn check_function(&mut self, call: &nodes::FuncCall) {
-        let names: Vec<_> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
-        let (schema, name) = match names.as_slice() {
-            [name] => (None, *name),
-            [.., schema, name] => (Some(*schema), *name),
-            [] => return,
-        };
-        if let Err(reason) = rules::check_function(
-            schema,
-            name,
-            &self.ctx.policies.config.general.udf_allowlist,
-        ) {
-            self.block(reason);
-        }
-    }
-
     fn with_frame(&mut self, f: impl FnOnce(&mut Self)) {
         self.frames.push(Frame::default());
         let predicate = std::mem::replace(&mut self.predicate, false);
+        let from = std::mem::replace(&mut self.from, false);
         f(self);
         self.predicate = predicate;
+        self.from = from;
         self.frames.pop();
+    }
+
+    /// Transform a FROM list, where views are inlined.
+    fn transform_from_list<'mutref>(
+        &mut self,
+        list: pg_raw_parse::list_mut::NodeListMut<'mem, 'mutref, pg_raw_parse::list::NodeList>,
+    ) {
+        let from = std::mem::replace(&mut self.from, true);
+        self.transform_list(list);
+        self.from = from;
     }
 
     fn with_predicate(&mut self, predicate: bool, f: impl FnOnce(&mut Self)) {
@@ -667,10 +781,37 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.predicate = saved;
     }
 
+    /// A call or operator that must be inlined, at the root of a clause.
+    fn root_replacement(&mut self, node: Node<'_>) -> Option<Unique<'mem, Node<'mem>>> {
+        let use_ = match node {
+            Node::FuncCall(call) => self.call(call),
+            Node::A_Expr(expr) => self.operator(expr),
+            _ => return None,
+        };
+        match use_ {
+            CallUse::Inline(inlined) => Some(inlined),
+            CallUse::Allow | CallUse::Block => None,
+        }
+    }
+
+    /// Mask an inlined view or function before it replaces the original node.
+    fn mask_replacement(&mut self, replacement: &mut Unique<'mem, Node<'mem>>) {
+        if self.depth > MAX_DEPTH * 4 {
+            self.block("views or functions are nested too deeply");
+            return;
+        }
+        self.depth += 1;
+        self.transform_node(Assignable::new(replacement));
+        self.depth -= 1;
+        self.changed = true;
+        self.touched = true;
+    }
+
     /// Add a DML target relation to the current frame.
     fn add_target(&mut self, relation: Option<&nodes::RangeVar>) {
-        if let Some(relation) = relation {
-            self.add_range_var(relation);
+        if let Some(range_var) = relation {
+            self.check_view_write(range_var);
+            self.add_range_var(range_var);
         }
     }
 }
@@ -748,10 +889,12 @@ fn cte_info(cte: &nodes::CommonTableExpr) -> Cte {
 }
 
 /// What to do with a generic node, decided while it's borrowed.
-enum Action {
+enum Action<'mem> {
     Recurse,
     Done,
     ColumnRef,
+    /// Replace the node with this one, then mask it.
+    Replace(Unique<'mem, Node<'mem>>),
     Subselect {
         refname: String,
         columns: Option<Vec<String>>,
@@ -770,10 +913,23 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     fn transform_node<'mutref>(&mut self, node: Assignable<'mem, 'mutref>) {
         let action = match &*node {
             NodeMut::ColumnRef(_) => Action::ColumnRef,
-            NodeMut::RangeVar(range_var) => {
-                self.add_range_var(range_var);
-                Action::Done
-            }
+            NodeMut::RangeVar(range_var) => match self.inline_view(range_var) {
+                Some(inlined) => Action::Replace(inlined),
+                None => {
+                    self.add_range_var(range_var);
+                    Action::Done
+                }
+            },
+            NodeMut::FuncCall(call) => match self.call(call) {
+                CallUse::Allow => Action::Recurse,
+                CallUse::Inline(inlined) => Action::Replace(inlined),
+                CallUse::Block => Action::Done,
+            },
+            NodeMut::A_Expr(expr) => match self.operator(expr) {
+                CallUse::Allow => Action::Recurse,
+                CallUse::Inline(inlined) => Action::Replace(inlined),
+                CallUse::Block => Action::Done,
+            },
             NodeMut::RangeSubselect(subselect) => {
                 let alias = subselect.alias();
                 let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
@@ -784,6 +940,12 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                     } else {
                         Some(aliases)
                     },
+                }
+            }
+            NodeMut::RangeFunction(function) if let Some(use_) = self.range_function(function) => {
+                match use_ {
+                    CallUse::Inline(inlined) => Action::Replace(inlined),
+                    CallUse::Allow | CallUse::Block => Action::Done,
                 }
             }
             NodeMut::RangeFunction(function) => {
@@ -819,6 +981,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         match action {
             Action::Done => (),
             Action::Recurse => transform::transform_node(node.into_inner(), self),
+            Action::Replace(mut replacement) => {
+                self.mask_replacement(&mut replacement);
+                node.replace(replacement);
+            }
             Action::ColumnRef => {
                 let replacement = match &*node {
                     NodeMut::ColumnRef(column) => self.column_ref(column),
@@ -875,7 +1041,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     }
 
     fn transform_func_call<'mutref>(&mut self, node: nodes::FuncCallMut<'mem, 'mutref>) {
-        self.check_function(&node);
+        // Calls in generic positions were checked by `transform_node`.
+        if !self.checked_calls.contains(&call_address(&node)) {
+            self.check_call(&node);
+        }
         transform::transform_func_call(node, self);
     }
 
@@ -909,8 +1078,13 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     fn transform_res_target<'mutref>(&mut self, mut node: nodes::ResTargetMut<'mem, 'mutref>) {
         // Pin the output name of column references, which masking would change.
         // This is the name Postgres would give them anyway.
+        // Function calls can be inlined, which would change their output name too.
         if node.name().is_none()
-            && let Some(name) = column_ref_name(node.val())
+            && let Some(name) = column_ref_name(node.val()).or_else(|| match node.val() {
+                Node::FuncCall(_) => Some(figure_name(node.val())),
+                Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
+                _ => None,
+            })
         {
             node.set_name(Some(self.mem.copy_string(&name)));
         }
@@ -932,13 +1106,19 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 }
                 // ORDER BY / LIMIT of a set operation refer to its (masked) output.
                 masker.transform_sort_by_list(node.sort_clause_mut());
-                transform::transform_node(node.limit_offset_mut(), masker);
-                transform::transform_node(node.limit_count_mut(), masker);
+                clause!(
+                    masker,
+                    node,
+                    limit_offset,
+                    limit_offset_mut,
+                    set_limit_offset
+                );
+                clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
                 return;
             }
 
             masker.transform_list(node.values_lists_mut());
-            masker.transform_list(node.from_clause_mut());
+            masker.transform_from_list(node.from_clause_mut());
             let targets: Vec<_> = node.target_list().iter().collect();
             if let Some(targets) = masker.expand_stars(&targets) {
                 node.set_target_list(masker.mem.make_list(&targets));
@@ -948,18 +1128,36 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
             masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
-                transform::transform_node(node.where_clause_mut(), masker);
+                clause!(
+                    masker,
+                    node,
+                    where_clause,
+                    where_clause_mut,
+                    set_where_clause
+                );
             });
 
             masker.transform_list(node.group_clause_mut());
             masker.guard_bare(node.having_clause());
-            transform::transform_node(node.having_clause_mut(), masker);
+            clause!(
+                masker,
+                node,
+                having_clause,
+                having_clause_mut,
+                set_having_clause
+            );
             masker.transform_list(node.window_clause_mut());
             masker.transform_sort_by_list(node.sort_clause_mut());
             masker.guard_bare(node.limit_offset());
             masker.guard_bare(node.limit_count());
-            transform::transform_node(node.limit_offset_mut(), masker);
-            transform::transform_node(node.limit_count_mut(), masker);
+            clause!(
+                masker,
+                node,
+                limit_offset,
+                limit_offset_mut,
+                set_limit_offset
+            );
+            clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
         });
     }
 
@@ -995,11 +1193,17 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 masker.transform_with_clause(with);
             }
             masker.add_target(node.relation());
-            masker.transform_list(node.from_clause_mut());
+            masker.transform_from_list(node.from_clause_mut());
             masker.transform_res_target_list(node.target_list_mut());
             masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
-                transform::transform_node(node.where_clause_mut(), masker);
+                clause!(
+                    masker,
+                    node,
+                    where_clause,
+                    where_clause_mut,
+                    set_where_clause
+                );
             });
             masker.returning(node.returning_clause_mut());
         });
@@ -1011,10 +1215,16 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 masker.transform_with_clause(with);
             }
             masker.add_target(node.relation());
-            masker.transform_list(node.using_clause_mut());
+            masker.transform_from_list(node.using_clause_mut());
             masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
-                transform::transform_node(node.where_clause_mut(), masker);
+                clause!(
+                    masker,
+                    node,
+                    where_clause,
+                    where_clause_mut,
+                    set_where_clause
+                );
             });
             masker.returning(node.returning_clause_mut());
         });
