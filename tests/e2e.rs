@@ -240,3 +240,96 @@ async fn test_raw_search() {
     let ssn: String = row.get(1);
     assert_eq!((id, ssn.as_str()), (2, "****"));
 }
+
+#[tokio::test]
+async fn test_proxy_masks() {
+    if !enabled() {
+        return;
+    }
+    let client = connect("masked").await;
+
+    // Simple protocol: text results.
+    let rows = simple(
+        &client,
+        "SELECT tax_id, card, balance FROM masking_e2e.users ORDER BY id",
+    )
+    .await;
+    assert_eq!(rows.len(), 2);
+    let tax_ids: Vec<_> = rows.iter().map(|row| row[0].clone().unwrap()).collect();
+    for (row, raw_card) in rows
+        .iter()
+        .zip(["4111-1111-1111-1111", "5500-0000-0000-0004"])
+    {
+        let tax_id = row[0].as_deref().unwrap();
+        assert_eq!(tax_id.len(), 16, "{row:?}");
+        assert!(tax_id.chars().all(|c| c.is_ascii_hexdigit()), "{row:?}");
+        let card = row[1].as_deref().unwrap();
+        assert_ne!(card, raw_card);
+        assert_eq!(card.len(), 19);
+        assert!(
+            card.split('-')
+                .all(|group| group.len() == 4 && group.chars().all(|c| c.is_ascii_digit())),
+            "{card}"
+        );
+    }
+    assert_ne!(tax_ids[0], tax_ids[1]);
+    assert_eq!(rows[0][2].as_deref(), Some("1001"));
+    assert_eq!(rows[1][2].as_deref(), Some("2001"));
+
+    // Extended protocol: binary results, same masked values.
+    let statement = client
+        .prepare("SELECT tax_id, card, balance FROM masking_e2e.users WHERE id = $1")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let row = client.query_one(&statement, &[&1_i64]).await.unwrap();
+        let tax_id: String = row.get(0);
+        let balance: i64 = row.get(2);
+        assert_eq!(tax_id, tax_ids[0], "deterministic in both formats");
+        assert_eq!(row.get::<_, String>(1), rows[0][1].clone().unwrap());
+        assert_eq!(balance, 1001);
+    }
+
+    // Stars are covered too.
+    let row = client
+        .query_one("SELECT * FROM masking_e2e.users WHERE id = 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>("balance"), 2001);
+    assert_eq!(row.get::<_, String>("tax_id"), tax_ids[1]);
+
+    // Other references use the SQL fallback: filters don't match raw values,
+    // and ordering isn't by raw values.
+    assert!(
+        simple(
+            &client,
+            "SELECT id FROM masking_e2e.users WHERE tax_id = 'TAX-1111'"
+        )
+        .await
+        .is_empty()
+    );
+    let rows = simple(&client, "SELECT card FROM masking_e2e.users ORDER BY card").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("***************0004".into())],
+            vec![Some("***************1111".into())],
+        ]
+    );
+
+    // Exempt users see raw values.
+    let admin = connect("admin").await;
+    let rows = simple(
+        &admin,
+        "SELECT tax_id, card, balance FROM masking_e2e.users WHERE id = 1",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some("TAX-1111".into()),
+            Some("4111-1111-1111-1111".into()),
+            Some("1000".into())
+        ]]
+    );
+}

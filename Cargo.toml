@@ -9,21 +9,34 @@ publish = false
 name = "pgdog_mask"
 crate-type = ["rlib", "cdylib"]
 
+[features]
+default = ["plugin"]
+# Build the plugin itself. Crates that build their own plugin with custom proxy
+# masks (`masking_plugin!`) depend on pgdog-mask with default features off.
+plugin = []
+# Masks for integration tests only.
+test-masks = []
+
 [dependencies]
 # Plugin API 0.7 (statement, mask, error and catalog hooks) lives on the fork until
 # it's upstream. PgDog must be built from the same commit: plugins are only loaded
 # when the plugin API version and the Rust compiler version match. The
 # integration scripts read this revision to build PgDog.
-pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1" }
+pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "40a3d1b516d6072406f0286bab7d722bdb80f82a" }
 # Must match the pg_raw_parse PgDog uses at that revision.
 pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
+aes = "0.8"
 arc-swap = "1"
+fpe = "0.6"
+hex = "0.4"
+hmac = "0.12"
 indexmap = { version = "2.14", features = ["serde"] }
 lru = "0.16"
 parking_lot = "0.12"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
@@ -31,7 +44,7 @@ tracing = "0.1"
 [dev-dependencies]
 futures-util = "0.3"
 # PgDog's catalog row types, to load catalogs in tests the way PgDog does.
-pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "6cc2d30c3a2689193bf09c58663a9bf48ce4e8c1" }
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "40a3d1b516d6072406f0286bab7d722bdb80f82a" }
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
 

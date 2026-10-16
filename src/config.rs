@@ -152,6 +152,8 @@ pub enum MaskKind {
     Round,
     Truncate,
     Sql,
+    /// Computed in code by a registered proxy mask (see [`crate::proxy`]).
+    Proxy,
 }
 
 /// Whether masked users can search on the raw value of the column.
@@ -164,7 +166,7 @@ pub enum Search {
 }
 
 /// Mask settings, shared by policy defaults and rules.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MaskSpec {
     pub kind: Option<MaskKind>,
     pub value: Option<String>,
@@ -176,6 +178,12 @@ pub struct MaskSpec {
     pub expression: Option<String>,
     pub search: Search,
     pub search_operators: Option<Vec<String>>,
+    /// Name of the proxy mask, with `mask = "proxy"`.
+    pub proxy: Option<String>,
+    /// Options passed to the proxy mask.
+    pub options: Option<toml::Table>,
+    /// SQL mask for references a proxy mask can't cover. Defaults to `null`.
+    pub fallback: Option<MaskKind>,
 }
 
 /// Declares the flat mask keys on a config struct, so policies and rules
@@ -196,6 +204,9 @@ macro_rules! mask_fields {
             #[serde(default)]
             pub search: Search,
             pub search_operators: Option<Vec<String>>,
+            pub proxy: Option<String>,
+            pub options: Option<toml::Table>,
+            pub fallback: Option<MaskKind>,
         }
 
         impl $name {
@@ -211,6 +222,9 @@ macro_rules! mask_fields {
                     expression: self.expression.clone(),
                     search: self.search,
                     search_operators: self.search_operators.clone(),
+                    proxy: self.proxy.clone(),
+                    options: self.options.clone(),
+                    fallback: self.fallback,
                 }
             }
         }

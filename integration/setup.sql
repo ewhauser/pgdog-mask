@@ -7,13 +7,19 @@ CREATE TABLE masking_e2e.users (
     ssn TEXT,
     email TEXT,
     phone TEXT,
-    secret_note TEXT
+    secret_note TEXT,
+    -- Masked by proxy masks.
+    tax_id TEXT,
+    card VARCHAR(19),
+    balance BIGINT
 );
 -- Tagged in the database (tag_source = "comment").
 COMMENT ON COLUMN masking_e2e.users.phone IS 'Phone number. pgdog:tag=pii.phone';
 INSERT INTO masking_e2e.users VALUES
-    (1, 'alice', 'CANARYSSN-1111', 'canaryemail-alice@example.com', 'CANARYPHONE-11', 'CANARYNOTE-1'),
-    (2, 'bob', 'CANARYSSN-2222', 'canaryemail-bob@example.com', 'CANARYPHONE-22', 'CANARYNOTE-2');
+    (1, 'alice', 'CANARYSSN-1111', 'canaryemail-alice@example.com', 'CANARYPHONE-11', 'CANARYNOTE-1',
+     'TAX-1111', '4111-1111-1111-1111', 1000),
+    (2, 'bob', 'CANARYSSN-2222', 'canaryemail-bob@example.com', 'CANARYPHONE-22', 'CANARYNOTE-2',
+     'TAX-2222', '5500-0000-0000-0004', 2000);
 
 -- Inlined with masks applied.
 CREATE VIEW masking_e2e.user_ssns AS SELECT id, ssn FROM masking_e2e.users;

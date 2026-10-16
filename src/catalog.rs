@@ -19,6 +19,8 @@ pub struct Column {
     pub data_type: String,
     /// From `format_type`, e.g. `public.mood` or `text[]`. Empty if unknown.
     pub type_name: String,
+    /// Type OID as `RowDescription` reports it; 0 if unknown.
+    pub type_oid: u32,
     pub comment: Option<String>,
     /// `(provider, label)` pairs.
     pub security_labels: Vec<(String, String)>,
@@ -181,6 +183,7 @@ impl Catalog {
                         name: column.name.clone(),
                         data_type: column.data_type.clone(),
                         type_name: column.type_name.clone(),
+                        type_oid: column.type_oid,
                         comment: column.comment.clone(),
                         security_labels: column
                             .security_labels

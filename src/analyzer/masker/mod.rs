@@ -37,6 +37,10 @@ struct MaskTarget<'c> {
     qualifier: String,
     arguments: &'c [String],
     label: String,
+    /// Index of the proxy mask, if the policy has one for this user.
+    proxy: Option<usize>,
+    /// Type OID of the column; 0 if unknown.
+    type_oid: u32,
 }
 
 /// Functions that only normalize a value, allowed around a column in raw searches.
@@ -102,6 +106,13 @@ pub(super) struct Masker<'c, 'mem> {
     pub(super) raw: BTreeSet<String>,
     /// Reads or writes a relation with masked columns.
     pub(super) touched: bool,
+    /// The next SELECT is the statement's top level, whose plain output
+    /// columns can be masked by proxy masks.
+    proxies_allowed: bool,
+    /// Column references left raw for a proxy mask.
+    proxy_refs: HashSet<usize>,
+    /// Output columns masked by proxy masks.
+    pub(super) proxies: Vec<super::ProxyColumn>,
 }
 
 fn names(list: &pg_raw_parse::list::NodeList) -> Vec<String> {
@@ -209,6 +220,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             masked: BTreeSet::new(),
             raw: BTreeSet::new(),
             touched: false,
+            proxies_allowed: false,
+            proxy_refs: HashSet::new(),
+            proxies: vec![],
         }
     }
 
@@ -389,13 +403,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let Mask::Masked {
             template,
             raw_search,
+            proxy,
         } = &ctx.profile.masks[assignment.policy]
         else {
             return None;
         };
         let policy = &ctx.policies.policies[assignment.policy].policy;
-        let data_type = relation
-            .column(column)
+        let catalog_column = relation.column(column);
+        let data_type = catalog_column
             .map(|c| c.data_type.as_str())
             .filter(|t| castable(t))
             .unwrap_or(&policy.data_type);
@@ -408,6 +423,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             qualifier: refname.to_owned(),
             arguments: &assignment.arguments,
             label: format!("{}.{}.{}", relation.schema, relation.name, column),
+            proxy: *proxy,
+            type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
         })
     }
 
@@ -811,6 +828,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
 
         if let Some(target) = self.column_target(&names) {
+            if self.proxy_refs.contains(&address(column)) {
+                // Masked in the results by the proxy mask.
+                self.masked.insert(target.label);
+                return None;
+            }
             if self.raw_refs.contains(&address(column)) {
                 self.raw.insert(target.label);
                 return None;
@@ -883,6 +905,63 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Add a DML target relation to the current frame.
+    /// Allow proxy masks on the next SELECT, the statement's top level.
+    pub(super) fn allow_proxies(&mut self) {
+        self.proxies_allowed = true;
+    }
+
+    /// Leave plain output columns of the top-level SELECT whose policy has a
+    /// proxy mask unmasked in the statement, for the plugin to mask in the
+    /// results. Other references to the same columns still get the fallback.
+    fn route_proxies(&mut self, select: &nodes::SelectStmt) {
+        // Raw values would be written, deduplicated, grouped or aggregated.
+        if select.into_clause().is_some()
+            || !select.distinct_clause().is_empty()
+            || !select.group_clause().is_empty()
+            || !matches!(select.having_clause(), Node::None)
+        {
+            return;
+        }
+
+        for (position, target) in select.target_list().iter().enumerate() {
+            let Node::ColumnRef(column) = target.val() else {
+                continue;
+            };
+            let (names, star) = fields(column);
+            // Positions after a star depend on what it expands to.
+            if star {
+                return;
+            }
+            let Some(mask) = self.column_target(&names) else {
+                continue;
+            };
+            let (Some(proxy), type_oid @ 1..) = (mask.proxy, mask.type_oid) else {
+                continue;
+            };
+            let output = target
+                .name()
+                .or_else(|| names.last().copied())
+                .unwrap_or_default();
+            // ORDER BY the output column would sort by raw values.
+            if select
+                .sort_clause()
+                .iter()
+                .any(|sort| refers_to_output(sort.node(), position, output))
+            {
+                continue;
+            }
+            let Ok(column_index) = u16::try_from(position) else {
+                return;
+            };
+            self.proxy_refs.insert(address(column));
+            self.proxies.push(super::ProxyColumn {
+                column: column_index,
+                proxy,
+                type_oid,
+            });
+        }
+    }
+
     fn add_target(&mut self, relation: Option<&nodes::RangeVar>) {
         if let Some(range_var) = relation {
             self.check_view_write(range_var);
@@ -892,6 +971,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 }
 
 /// The column in a raw-search comparison side, possibly wrapped in a normalizer.
+/// Does an `ORDER BY` item refer to the output column at `position` named `name`,
+/// by ordinal or by name?
+fn refers_to_output(node: Node<'_>, position: usize, name: &str) -> bool {
+    match node {
+        Node::A_Const(constant) => matches!(
+            constant.val(),
+            Some(pg_raw_parse::ConstValue::Integer(ordinal)) if ordinal as usize == position + 1
+        ),
+        Node::ColumnRef(column) => matches!(fields(column).0.as_slice(), [field] if *field == name),
+        _ => false,
+    }
+}
+
 fn raw_column(node: Node<'_>) -> Option<&nodes::ColumnRef> {
     match node {
         Node::ColumnRef(column) => Some(column),
@@ -1169,6 +1261,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     }
 
     fn transform_select_stmt<'mutref>(&mut self, mut node: nodes::SelectStmtMut<'mem, 'mutref>) {
+        let top = std::mem::take(&mut self.proxies_allowed);
         self.with_frame(|masker| {
             if let Some(with) = node.with_clause_mut() {
                 masker.transform_with_clause(with);
@@ -1199,6 +1292,9 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             let targets: Vec<_> = node.target_list().iter().collect();
             if let Some(targets) = masker.expand_stars(&targets) {
                 node.set_target_list(masker.mem.make_list(&targets));
+            }
+            if top {
+                masker.route_proxies(&node);
             }
             masker.transform_res_target_list(node.target_list_mut());
             masker.transform_list(node.distinct_clause_mut());

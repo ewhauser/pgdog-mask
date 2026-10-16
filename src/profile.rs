@@ -10,8 +10,9 @@ use tracing::warn;
 
 use crate::analyzer::lineage::{Lineage, view_lineage, view_relations};
 use crate::catalog::{Catalog, Relation, RelationKind};
-use crate::config::{Config, Error, General, Policy};
+use crate::config::{Config, Error, General, MaskKind, Policy};
 use crate::mask::{Mask, compile};
+use crate::proxy::{Options, ProxyMask, Registry};
 use crate::tags::{self, DatabaseTags};
 
 /// A policy with its masks compiled.
@@ -22,11 +23,27 @@ pub struct CompiledPolicy {
     rules: Vec<(HashSet<String>, Mask)>,
 }
 
+/// A proxy mask built for a policy or rule.
+#[derive(Clone)]
+pub struct ProxyInstance {
+    /// Name it's registered under.
+    pub name: String,
+    pub mask: Arc<dyn ProxyMask>,
+}
+
+impl std::fmt::Debug for ProxyInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProxyInstance({})", self.name)
+    }
+}
+
 /// Configuration with compiled policies.
 #[derive(Debug)]
 pub struct Policies {
     pub config: Config,
     pub policies: Vec<CompiledPolicy>,
+    /// Proxy masks, referenced by index from compiled masks.
+    pub proxies: Vec<ProxyInstance>,
     templates: Templates,
 }
 
@@ -45,31 +62,57 @@ impl std::fmt::Debug for Templates {
 const MAX_TEMPLATES: usize = 4096;
 
 impl Policies {
+    /// Compile policies, with the built-in proxy masks.
     pub fn new(config: Config) -> Result<Self, Error> {
-        let policies = config
-            .policies
-            .iter()
-            .map(|policy| {
-                Ok(CompiledPolicy {
-                    default: compile(policy, &policy.mask_spec())?,
-                    rules: policy
-                        .rules
-                        .iter()
-                        .map(|rule| {
-                            Ok((
-                                rule.roles.iter().cloned().collect(),
-                                compile(policy, &rule.mask_spec())?,
-                            ))
-                        })
-                        .collect::<Result<_, Error>>()?,
-                    policy: policy.clone(),
-                })
-            })
-            .collect::<Result<_, Error>>()?;
+        Self::with_registry(config, &Registry::default())
+    }
+
+    /// Compile policies, building proxy masks from `registry`.
+    pub fn with_registry(config: Config, registry: &Registry) -> Result<Self, Error> {
+        let mut proxies = vec![];
+        let mut compile_spec = |policy: &Policy, spec: &crate::config::MaskSpec| {
+            let mut mask = compile(policy, spec)?;
+            if spec.kind == Some(MaskKind::Proxy) {
+                let name = spec.proxy.as_deref().unwrap_or_default();
+                let options = Options::new(spec.options.clone().unwrap_or_default());
+                let instance =
+                    registry
+                        .create(name, &options, &policy.data_type)
+                        .map_err(|err| {
+                            Error::Invalid(format!("policy \"{}\": {}", policy.name, err.0))
+                        })?;
+                proxies.push(ProxyInstance {
+                    name: name.to_owned(),
+                    mask: instance,
+                });
+                if let Mask::Masked { proxy, .. } = &mut mask {
+                    *proxy = Some(proxies.len() - 1);
+                }
+            }
+            Ok::<_, Error>(mask)
+        };
+
+        let mut policies = vec![];
+        for policy in &config.policies {
+            let default = compile_spec(policy, &policy.mask_spec())?;
+            let mut rules = vec![];
+            for rule in &policy.rules {
+                rules.push((
+                    rule.roles.iter().cloned().collect(),
+                    compile_spec(policy, &rule.mask_spec())?,
+                ));
+            }
+            policies.push(CompiledPolicy {
+                default,
+                rules,
+                policy: policy.clone(),
+            });
+        }
 
         Ok(Self {
             config,
             policies,
+            proxies,
             templates: Templates::default(),
         })
     }

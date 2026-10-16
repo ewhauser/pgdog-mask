@@ -24,6 +24,18 @@ pub struct Context<'a> {
     pub search_path: Vec<String>,
 }
 
+/// An output column of the top-level SELECT masked by a proxy mask in the
+/// results, instead of in the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProxyColumn {
+    /// Position in the result.
+    pub column: u16,
+    /// Index of the proxy mask in [`crate::profile::Policies::proxies`].
+    pub proxy: usize,
+    /// Type OID of the column.
+    pub type_oid: u32,
+}
+
 /// Analysis result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -34,6 +46,8 @@ pub enum Outcome {
         /// Reads or writes relations with masked columns, so errors can carry
         /// masked values.
         touches_masked: bool,
+        /// Output columns for proxy masks.
+        proxies: Vec<ProxyColumn>,
     },
     /// Send this SQL instead.
     Rewritten {
@@ -42,6 +56,8 @@ pub enum Outcome {
         masked: BTreeSet<String>,
         raw: BTreeSet<String>,
         touches_masked: bool,
+        /// Output columns for proxy masks.
+        proxies: Vec<ProxyColumn>,
     },
     /// The statement can't be run safely.
     Blocked { reason: String },
@@ -54,6 +70,14 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     let parsed = make::try_owned(|mem| {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, ctx);
+        // Proxy masks apply to the rows of a single SELECT.
+        let single_select = {
+            let all: Vec<_> = stmts.as_ref().iter().collect();
+            matches!(all.as_slice(), [stmt] if matches!(stmt.stmt(), pg_raw_parse::Node::SelectStmt(_)))
+        };
+        if single_select {
+            masker.allow_proxies();
+        }
         for stmt in stmts.as_mut() {
             masker.statement(stmt);
         }
@@ -63,6 +87,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             masker.masked,
             masker.raw,
             masker.touched,
+            masker.proxies,
         ));
         Ok::<_, pg_raw_parse::Error>(stmts)
     });
@@ -76,7 +101,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         }
     };
 
-    let Some((blocked, changed, masked, raw, touches_masked)) = result else {
+    let Some((blocked, changed, masked, raw, touches_masked, proxies)) = result else {
         return Outcome::Blocked {
             reason: "statement could not be analyzed".into(),
         };
@@ -90,6 +115,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         return Outcome::Unchanged {
             raw,
             touches_masked,
+            proxies,
         };
     }
 
@@ -99,6 +125,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             masked,
             raw,
             touches_masked,
+            proxies,
         },
         Err(err) => Outcome::Blocked {
             reason: format!("failed to build the masked statement: {err}"),
@@ -117,12 +144,14 @@ pub fn analyze_shape(sql: &str, ctx: &Context<'_>) -> Option<Outcome> {
             masked,
             raw,
             touches_masked,
+            proxies,
         } => Outcome::Rewritten {
             sql: shape::Template::new(&shape_sql, literals.values.len())?
                 .render(&literals.values)?,
             masked,
             raw,
             touches_masked,
+            proxies,
         },
         other => other,
     })

@@ -126,6 +126,27 @@ SQL functions are analyzed. A function that reads no masked columns is called as
 
 Built-in masks are `none`, `null`, `constant` (`value`), `default`, `partial` (`keep_prefix`, `keep_suffix`, `fill`), `email`, `hash`, `round` (`digits`), `truncate` (`unit`), and `sql` (`expression`, over `val` and the policy's `arguments`). Every mask is cast back to the column's type.
 
+### Proxy masks
+
+`mask = "proxy"` masks a column in code, in the plugin, instead of in SQL: for keyed hashes whose key must never appear in statements, format-preserving encryption, vault tokens, or your own logic.
+
+```toml
+[[policies]]
+name = "card"
+data_type = "character varying"
+mask = "proxy"
+proxy = "ff1"                              # or "hmac_sha256", or your own
+options = { key_env = "CARD_FF1_KEY" }     # hex AES key, from the environment
+fallback = "partial"                       # SQL mask for every other reference
+keep_suffix = 4
+```
+
+Proxy masks apply to plain output columns of a top-level `SELECT`. Everywhere else (filters, joins, ordering, subqueries, views, `COPY`), the column gets the SQL `fallback`, `null` by default.
+
+Built-in proxy masks: `hmac_sha256` (options `key_env` or `key_file`, `length`) and `ff1` (options `key_env` or `key_file`, `alphabet`, `tweak`).
+
+To write your own, implement `pgdog_mask::proxy::ProxyMask` and build your own plugin with `pgdog_mask::masking_plugin!`, depending on `pgdog-mask` with `default-features = false`. See [`example/custom-mask`](example/custom-mask) and `docs/DESIGN.md` §7.2.
+
 ### Raw search
 
 `search = "raw"` lets a role find rows by a masked column's real value: `WHERE ssn = $1`, `IN`, `= ANY`, `IS NULL`, `IS DISTINCT FROM`, optionally wrapped in `lower`/`upper`/`trim`. Results are still masked. This deliberately allows guessing a value and confirming it. It does not allow extracting values: casts, arbitrary functions, and other expressions around the column remain masked. Range and `LIKE` operators are opt-in via `search_operators` because they let a value be recovered quickly. Every raw search is logged.

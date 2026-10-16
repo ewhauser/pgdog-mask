@@ -473,13 +473,30 @@ All built-ins compile to SQL templates. `none` is the identity. Parameters are f
 | `round` | numeric | `digits` | `round(val, digits)` |
 | `truncate` | date, timestamp | `unit` | `date_trunc(unit, val)::T` |
 | `sql` | as declared | `expression` | user expression over `val` and `arguments` |
-| `hmac_sha256`, `tokenize`, `ff1` | text (v1) | `key_env`/`key_file`, `fallback` | proxy masks (§7.2) |
+| `proxy` | as the proxy mask accepts | `proxy`, `options`, `fallback` | computed in code on result rows (§7.2) |
 
 ### 7.2 Proxy masks
 
-Proxy masks run in the plugin on result rows. Implementations are registered in `masking-plugin`: `hmac_sha256`, `tokenize` (HTTP/gRPC vault client behind an in-process cache), and FPE `ff1`. Secrets come from the environment or files and never appear in SQL.
+Proxy masks are written in Rust and run in the plugin on result rows, through PgDog's column-mask hook (§8.3). They're for values SQL can't or shouldn't compute: a keyed hash whose key must never appear in statement text (where `pg_stat_statements`, logs and `EXPLAIN` would expose it), format-preserving encryption, vault tokens, or any transformation a developer writes in code.
 
-The analyzer only routes a reference to the proxy channel when it is a passthrough output of the top-level projection: a bare column, optionally aliased, at a known ordinal. Every other reference to the column gets `fallback` through the rewrite. So `WHERE customer_id = $1` compares against the fallback (`NULL`), unless the rule sets `search = "raw"`.
+```toml
+[[policies]]
+name = "card"
+data_type = "character varying"
+mask = "proxy"
+proxy = "ff1"                                        # registered mask name
+options = { key_env = "CARD_FF1_KEY" }               # passed to the mask
+fallback = "partial"                                 # SQL mask everywhere else (default "null")
+keep_suffix = 4
+```
+
+Built-in: `hmac_sha256` (hex HMAC, options `key_env`/`key_file`, `length`) and `ff1` (FF1 with AES, options `key_env`/`key_file` holding a hex key, `alphabet`, `tweak`; keeps non-alphabet characters, so formats like `NNNN-NNNN-NNNN-NNNN` survive). Secrets come from the environment or files and never appear in SQL or the config file.
+
+**Custom masks.** pgdog-mask is also a library. A developer implements `proxy::ProxyMask` (`accepts`, `mask`, optionally `mask_batch` and `blocking`), registers a factory under a name in a `proxy::Registry`, and builds their own plugin with `pgdog_mask::masking_plugin!`, depending on pgdog-mask with default features off. `example/custom-mask` is a vault-tokenization mask built that way. Masks get typed values (`pgdog_plugin::types::Datum`), decoded from whatever format the client asked for and encoded back into it, so they keep the column's type. Masks declared blocking run on PgDog's blocking thread pool, and `mask_batch` lets a mask make one remote call per batch of rows.
+
+**Where they apply.** The analyzer only uses a proxy mask for a plain output column of a single top-level `SELECT`: a bare column, optionally aliased, at a known position, and not used for `ORDER BY` (by name or ordinal), `DISTINCT`, `GROUP BY`/`HAVING` or `SELECT INTO`. Every other reference to the column, in `WHERE`, joins, subqueries, CTEs, views, functions, set operations, `COPY` and DML, gets the SQL `fallback` through the rewrite. So `WHERE card = $1` compares against the fallback unless the rule sets `search = "raw"`, and ordering, filtering and aggregates never run on raw values.
+
+**Mask IDs.** Each proxy mask instance gets a mask ID when the configuration loads. IDs are never reused: a reload adds new instances, and statements prepared before it keep working until PgDog checks them again at their next `Bind`.
 
 ### 7.3 Load-time validation
 
@@ -674,7 +691,7 @@ ewhauser/pgdog-mask      # this plugin, depending on pgdog-plugin at a pinned ma
 | **P0: API** ✅ | `masking/plugin-api` | 0.7.0: capabilities, `statement` verdicts with generations, `function_call`, batched `mask_rows`, `redact_error`, typed `catalog` with selectable parts, `reload`; `catch_unwind`, `required`, test plugins |
 | **P1: MVP** ✅ | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, `explain` CLI, canary suite |
 | **P2: hardening** (mostly ✅) | `masking/plugin` | SQL-function analysis and inlining ✅, view inlining ✅, partitions ✅ (P1), conditional masking ✅ (P1), tags and classifiers (`config`/`comment`/`security_label`) ✅, error/notice scrubbing ✅, `lint`, live template validation |
-| **P3: proxy masks** | `masking/plugin` | HMAC, FPE, vault tokenization |
+| **P3: proxy masks** ✅ | this repository | typed column masks in the API, `hmac_sha256` and `ff1`, the `ProxyMask` library API and `masking_plugin!`, vault tokenization as an example of a custom mask |
 | **Later** | | row access policies (inject `WHERE` predicates through the same statement hook), JSON-path masking (`jsonb_set`-based templates) |
 
 ---

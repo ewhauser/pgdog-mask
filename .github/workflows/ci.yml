@@ -40,6 +40,13 @@ jobs:
       - name: Unit and canary tests
         run: cargo test
 
+      - name: Custom mask example
+        working-directory: example/custom-mask
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
       # PgDog's Linux build links with clang and mold.
       - name: Build dependencies for PgDog
         run: sudo apt-get update && sudo apt-get install -y mold postgresql-client

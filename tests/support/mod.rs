@@ -99,6 +99,7 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
             comment: row.get(10).cloned().flatten(),
             security_labels: serde_json::from_str::<Vec<SecurityLabel>>(&text(&row, 11))
                 .unwrap_or_default(),
+            type_oid: text(&row, 12).parse().unwrap_or_default(),
         };
         relation.columns.insert(column.column_name.clone(), column);
     }
@@ -176,6 +177,7 @@ fn relation(relation: Relation) -> plugin::Relation {
                 name: column.column_name,
                 data_type: column.data_type,
                 type_name: column.type_name,
+                type_oid: column.type_oid,
                 is_primary_key: column.is_primary_key,
                 comment: column.comment,
                 security_labels: column

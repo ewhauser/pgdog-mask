@@ -1,0 +1,17 @@
+[package]
+name = "acme-mask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Example: the pgdog-mask plugin with a custom proxy mask"
+
+# Its own workspace, so it builds on its own.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Default features off: this crate builds the plugin, with its own masks.
+pgdog-mask = { path = "../..", default-features = false }
+parking_lot = "0.12"

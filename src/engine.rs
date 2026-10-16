@@ -8,14 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use pgdog_plugin::{
-    Access, Deny, ErrorFields, Redaction, Session, SqlState, Verdict, redact::field::DETAIL,
+    Access, ColumnMask, Deny, ErrorFields, MaskBatch, MaskError, MaskId, MaskOutput, Redaction,
+    Session, SqlState, Verdict, redact::field::DETAIL,
 };
 use tracing::{Level, debug, enabled, error, info, warn};
 
-use crate::analyzer::{Context, Outcome, analyze, shape};
+use crate::analyzer::{Context, Outcome, ProxyColumn, analyze, shape};
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
-use crate::profile::{Assignments, Policies, Profile};
+use crate::profile::{Assignments, Policies, Profile, ProxyInstance};
+use crate::proxy::{self, Registry};
 use crate::tags;
 
 /// `cannot_connect_now`: the schema of the database isn't loaded yet.
@@ -25,18 +27,40 @@ const CANNOT_CONNECT_NOW: &str = "57P03";
 struct Settings {
     policies: Policies,
     epoch: u64,
+    /// Mask ID of the first of `policies.proxies` (see [`Engine::proxies`]).
+    proxy_base: u64,
     /// Profiles by user and database. Users and their roles only change
     /// with the configuration, so these live as long as the settings do.
     profiles: ArcSwap<HashMap<String, HashMap<String, Arc<Profile>>>>,
 }
 
 impl Settings {
-    fn new(policies: Policies, epoch: u64) -> Self {
+    fn new(policies: Policies, epoch: u64, proxy_base: u64) -> Self {
         Self {
             policies,
             epoch,
+            proxy_base,
             profiles: ArcSwap::default(),
         }
+    }
+
+    /// Column masks for the proxy columns of a statement.
+    fn column_masks(&self, proxies: &[ProxyColumn]) -> Proxies {
+        proxies
+            .iter()
+            .map(|proxy| {
+                let mask = ColumnMask::new(
+                    proxy.column,
+                    MaskId(self.proxy_base + proxy.proxy as u64),
+                    proxy.type_oid,
+                );
+                if self.policies.proxies[proxy.proxy].mask.blocking() {
+                    mask.blocking()
+                } else {
+                    mask
+                }
+            })
+            .collect()
     }
 
     /// Compute a profile and add it to the snapshot.
@@ -167,11 +191,14 @@ struct Database {
     settings_epoch: u64,
 }
 
+/// Output columns masked by proxy masks in the results.
+type Proxies = Arc<[ColumnMask]>;
+
 /// Cached decision for a statement shape.
 #[derive(Debug, Clone)]
 enum ShapeDecision {
-    Continue,
-    Rewrite(Arc<shape::Template>),
+    Continue(Proxies),
+    Rewrite(Arc<shape::Template>, Proxies),
     Block(String),
 }
 
@@ -179,10 +206,10 @@ impl ShapeDecision {
     /// `None` if the rewrite can't be turned into a template.
     fn new(decision: Decision, literals: usize) -> Option<Self> {
         Some(match decision {
-            Decision::Continue => Self::Continue,
+            Decision::Continue(proxies) => Self::Continue(proxies),
             Decision::Block(reason) => Self::Block(reason),
-            Decision::Rewrite(sql) => {
-                Self::Rewrite(Arc::new(shape::Template::new(&sql, literals)?))
+            Decision::Rewrite(sql, proxies) => {
+                Self::Rewrite(Arc::new(shape::Template::new(&sql, literals)?), proxies)
             }
         })
     }
@@ -190,9 +217,11 @@ impl ShapeDecision {
     /// The decision for a statement with this shape and these literals.
     fn render(self, literals: &[String]) -> Option<Decision> {
         Some(match self {
-            Self::Continue => Decision::Continue,
+            Self::Continue(proxies) => Decision::Continue(proxies),
             Self::Block(reason) => Decision::Block(reason),
-            Self::Rewrite(template) => Decision::Rewrite(template.render(literals)?),
+            Self::Rewrite(template, proxies) => {
+                Decision::Rewrite(template.render(literals)?, proxies)
+            }
         })
     }
 }
@@ -200,8 +229,10 @@ impl ShapeDecision {
 /// What to do with a statement, cached by statement and profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    Continue,
-    Rewrite(String),
+    /// Send it as is, masking these output columns in the results.
+    Continue(Proxies),
+    /// Send this SQL instead, masking these output columns in the results.
+    Rewrite(String, Proxies),
     Block(String),
 }
 
@@ -218,6 +249,12 @@ pub struct Engine {
     generation: AtomicU64,
     /// Numbers catalogs as they arrive.
     catalog_epoch: AtomicU64,
+    /// Every proxy mask any settings have used, by mask ID. Never shrinks:
+    /// statements prepared before a reload keep their mask IDs until PgDog
+    /// checks them again.
+    proxies: ArcSwap<Vec<ProxyInstance>>,
+    /// Proxy masks policies can name.
+    registry: Mutex<Arc<Registry>>,
 }
 
 impl Default for Engine {
@@ -227,17 +264,32 @@ impl Default for Engine {
 }
 
 impl Engine {
+    /// An engine with the built-in proxy masks.
     pub fn new(config: Config) -> Result<Self, Error> {
+        Self::with_registry(config, Registry::default())
+    }
+
+    /// An engine with the proxy masks of `registry`.
+    pub fn with_registry(config: Config, registry: Registry) -> Result<Self, Error> {
         let cache = Cache::new(config.general.cache_size);
+        let policies = Policies::with_registry(config, &registry)?;
+        let proxies = policies.proxies.clone();
         Ok(Self {
             path: Mutex::new(None),
-            settings: ArcSwap::from_pointee(Settings::new(Policies::new(config)?, 1)),
+            settings: ArcSwap::from_pointee(Settings::new(policies, 1, 0)),
             databases: ArcSwap::default(),
             shapes: ArcSwap::from_pointee(Cache::new(cache.per_shard * CACHE_SHARDS)),
             cache: ArcSwap::from_pointee(cache),
             generation: AtomicU64::new(1),
             catalog_epoch: AtomicU64::new(0),
+            proxies: ArcSwap::from_pointee(proxies),
+            registry: Mutex::new(Arc::new(registry)),
         })
+    }
+
+    /// Use the proxy masks of `registry` from the next configuration on.
+    pub fn set_registry(&self, registry: Registry) {
+        *self.registry.lock() = Arc::new(registry);
     }
 
     /// Generation of the plugin's decisions, see [`pgdog_plugin::Plugin::generation`].
@@ -261,8 +313,16 @@ impl Engine {
     /// Replace the configuration.
     pub fn apply(&self, config: Config) -> Result<(), Error> {
         let cache = Cache::new(config.general.cache_size);
-        let policies = Policies::new(config)?;
+        let registry = self.registry.lock().clone();
+        let policies = Policies::with_registry(config, &registry)?;
         let epoch = self.settings.load().epoch + 1;
+        let mut proxy_base = 0;
+        self.proxies.rcu(|proxies| {
+            proxy_base = proxies.len() as u64;
+            let mut proxies = Vec::clone(proxies);
+            proxies.extend(policies.proxies.iter().cloned());
+            proxies
+        });
         info!(
             "[pgdog_mask] loaded {} policies, {} masked columns (mode: {:?})",
             policies.config.policies.len(),
@@ -270,7 +330,7 @@ impl Engine {
             policies.config.general.mode,
         );
         self.settings
-            .store(Arc::new(Settings::new(policies, epoch)));
+            .store(Arc::new(Settings::new(policies, epoch, proxy_base)));
         // Keys include the settings epoch, so old entries can't be hit; drop them anyway.
         self.shapes
             .store(Arc::new(Cache::new(cache.per_shard * CACHE_SHARDS)));
@@ -374,7 +434,16 @@ impl Engine {
             }
 
             match (self.decide(session, sql, &settings, profile), mode) {
-                (Decision::Rewrite(sql), Mode::Enforce) => Verdict::rewrite(sql),
+                (Decision::Continue(proxies), Mode::Enforce) if !proxies.is_empty() => {
+                    Verdict::Rewrite {
+                        sql: sql.to_owned(),
+                        columns: proxies.to_vec(),
+                    }
+                }
+                (Decision::Rewrite(sql, proxies), Mode::Enforce) => Verdict::Rewrite {
+                    sql,
+                    columns: proxies.to_vec(),
+                },
                 (Decision::Block(reason), Mode::Enforce) => Verdict::Deny(denied(reason)),
                 // Shadow mode: decisions are logged when they're made.
                 _ => Verdict::Allow,
@@ -406,6 +475,37 @@ impl Engine {
                 _ => Access::Allow,
             }
         })
+    }
+
+    /// Mask a batch of result rows with proxy masks. See [`crate::proxy`].
+    pub fn mask_rows(&self, batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+        let proxies = self.proxies.load();
+        for column in batch.columns() {
+            let instance = proxies
+                .get(column.mask.0 as usize)
+                .ok_or_else(|| MaskError::new(format!("unknown mask ID {}", column.mask.0)))?;
+            let failed = |err: MaskError| MaskError::new(format!("{}: {}", instance.name, err.0));
+
+            let values = column
+                .values()
+                .map(|value| proxy::decode(value, column.type_oid, column.format))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(failed)?;
+            let count = values.len();
+            let masked = instance.mask.mask_batch(values).map_err(failed)?;
+            if masked.len() != count {
+                return Err(failed(MaskError::new(format!(
+                    "returned {} values for {count}",
+                    masked.len()
+                ))));
+            }
+            for value in &masked {
+                let encoded =
+                    proxy::encode(value, column.type_oid, column.format).map_err(failed)?;
+                out.push(encoded.as_deref());
+            }
+        }
+        Ok(())
     }
 
     /// Remove `DETAIL` from the errors and notices masked users get: it can
@@ -509,7 +609,7 @@ impl Engine {
                 None => {
                     let outcome = analyze(&literals.shape, &ctx);
                     let shape = ShapeDecision::new(
-                        outcome_decision(outcome, &session.user, sql, shadow),
+                        outcome_decision(outcome, settings, &session.user, sql, shadow),
                         literals.values.len(),
                     );
                     if let Some(shape) = &shape {
@@ -523,26 +623,36 @@ impl Engine {
             }
         }
 
-        let decision = outcome_decision(analyze(sql, &ctx), &session.user, sql, shadow);
+        let decision = outcome_decision(analyze(sql, &ctx), settings, &session.user, sql, shadow);
         cache.put(key, decision.clone());
         decision
     }
 }
 
 /// Decision for an analysis outcome, logged.
-fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) -> Decision {
+fn outcome_decision(
+    outcome: Outcome,
+    settings: &Settings,
+    user: &str,
+    original: &str,
+    shadow: bool,
+) -> Decision {
     match outcome {
-        Outcome::Unchanged { raw, .. } => {
+        Outcome::Unchanged { raw, proxies, .. } => {
             if !raw.is_empty() {
                 info!(
                     "[pgdog_mask] user \"{}\" searched raw values of {:?}",
                     user, raw
                 );
             }
-            Decision::Continue
+            Decision::Continue(settings.column_masks(&proxies))
         }
         Outcome::Rewritten {
-            sql, masked, raw, ..
+            sql,
+            masked,
+            raw,
+            proxies,
+            ..
         } => {
             if !raw.is_empty() {
                 info!(
@@ -554,7 +664,7 @@ fn outcome_decision(outcome: Outcome, user: &str, original: &str, shadow: bool) 
                 user,
                 original,
                 &format!("masked {masked:?}"),
-                Decision::Rewrite(sql),
+                Decision::Rewrite(sql, settings.column_masks(&proxies)),
                 shadow,
             )
         }
@@ -588,7 +698,7 @@ fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: b
         "[pgdog_mask]"
     };
     match &decision {
-        Decision::Rewrite(_) => {
+        Decision::Rewrite(..) => {
             if shadow {
                 info!(
                     "{prefix} would rewrite statement for user \"{user}\", {what}: {}",
@@ -607,7 +717,7 @@ fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: b
                 normalized(sql)
             )
         }
-        Decision::Continue => (),
+        Decision::Continue(_) => (),
     }
     decision
 }
@@ -667,12 +777,12 @@ mod test {
         let engine = engine(CONFIG);
         assert!(matches!(
             decide(&engine, "anonymous", "SELECT ssn FROM users"),
-            Decision::Rewrite(_)
+            Decision::Rewrite(..)
         ));
-        assert_eq!(
+        assert!(matches!(
             decide(&engine, "anonymous", "SELECT id FROM orders"),
-            Decision::Continue
-        );
+            Decision::Continue(proxies) if proxies.is_empty()
+        ));
 
         // Deterministic: PgDog relies on it for prepared statements.
         assert_eq!(
@@ -731,7 +841,7 @@ mod test {
             settings_epoch: 1,
             schema_epoch: 1,
         };
-        cache.put(key, Decision::Continue);
+        cache.put(key, Decision::Continue(Arc::new([])));
         assert!(cache.get(key).is_some());
 
         // Force a slot collision: same slot, different statement.
@@ -785,7 +895,7 @@ mod test {
             "anonymous",
             "SELECT ssn FROM users WHERE id = 2 AND name = 'it''s'",
         );
-        let (Decision::Rewrite(a), Decision::Rewrite(b)) = (first, second) else {
+        let (Decision::Rewrite(a, _), Decision::Rewrite(b, _)) = (first, second) else {
             panic!("rewrites");
         };
         assert!(a.ends_with("WHERE id = 1 AND name = 'a'"), "{a}");
@@ -897,5 +1007,87 @@ mod test {
             disabled.redact_error(&session("anonymous"), &error),
             Redaction::Keep
         );
+    }
+
+    #[test]
+    fn test_proxy_masks() {
+        use pgdog_plugin::{MaskColumn, Value, types::Format};
+
+        const CONFIG: &str = r#"
+[[policies]]
+name = "ssn"
+data_type = "character varying"
+mask = "proxy"
+proxy = "test.upper"
+
+[[masked_columns]]
+name = "users"
+column = "ssn"
+policy = "ssn"
+"#;
+        struct Upper;
+        impl crate::proxy::ProxyMask for Upper {
+            fn accepts(&self, _data_type: &str) -> bool {
+                true
+            }
+            fn mask(&self, value: crate::proxy::Datum) -> Result<crate::proxy::Datum, MaskError> {
+                match value {
+                    crate::proxy::Datum::Text(text) => {
+                        Ok(crate::proxy::Datum::Text(text.to_uppercase()))
+                    }
+                    _ => Err(MaskError::new("not text")),
+                }
+            }
+        }
+        let mut registry = Registry::default();
+        registry.register("test.upper", |_: &crate::proxy::Options| Ok(Upper));
+
+        let engine = Engine::with_registry(Config::from_toml(CONFIG).unwrap(), registry).unwrap();
+        let catalog = catalog();
+        let settings = engine.settings.load();
+        let mut databases = HashMap::new();
+        databases.insert(
+            "db".to_owned(),
+            Arc::new(Database {
+                assignments: Assignments::new(&settings.policies, "db", &catalog),
+                catalog: Arc::new(catalog),
+                schema_epoch: 1,
+                settings_epoch: settings.epoch,
+            }),
+        );
+        engine.databases.store(Arc::new(databases));
+
+        let Verdict::Rewrite { sql, columns } =
+            engine.statement(&session("anonymous"), "SELECT id, ssn FROM users")
+        else {
+            panic!("rewrite");
+        };
+        assert_eq!(sql, "SELECT id, ssn FROM users");
+        assert_eq!(columns.len(), 1);
+        let mask = columns[0];
+        assert_eq!((mask.column, mask.type_oid), (1, 1043));
+
+        let mask_rows = |engine: &Engine, format| {
+            let values = [Value::new(Some(b"abc")), Value::new(None)];
+            let batch_columns = [MaskColumn::new(&mask, format, &values)];
+            let batch = MaskBatch::new(2, &batch_columns);
+            let mut out = MaskOutput::default();
+            engine.mask_rows(&batch, &mut out).map(|_| out)
+        };
+        for format in [Format::Text, Format::Binary] {
+            let out = mask_rows(&engine, format).unwrap();
+            assert_eq!(out.len(), 2);
+            assert!(format!("{out:?}").contains("[65, 66, 67]"), "{out:?}");
+        }
+
+        // A reload doesn't invalidate mask IDs already handed out.
+        engine.apply(Config::from_toml(CONFIG).unwrap()).unwrap();
+        assert!(mask_rows(&engine, Format::Text).is_ok());
+        let Verdict::Rewrite { columns, .. } =
+            engine.statement(&session("anonymous"), "SELECT ssn FROM users")
+        else {
+            panic!("rewrite");
+        };
+        assert_ne!(columns[0].mask, mask.mask, "new settings, new mask IDs");
     }
 }

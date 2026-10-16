@@ -108,11 +108,14 @@ pub enum Mask {
     /// The column is not masked for this user.
     Unmasked,
     Masked {
-        /// SQL expression over `val` and the policy arguments.
+        /// SQL expression over `val` and the policy arguments. For proxy
+        /// masks, the fallback for references the proxy mask can't cover.
         template: String,
         /// Operators usable on the raw value in predicates. Empty unless
         /// the rule sets `search = "raw"`.
         raw_search: HashSet<SearchOp>,
+        /// Index of the proxy mask in [`crate::profile::Policies::proxies`].
+        proxy: Option<usize>,
     },
 }
 
@@ -135,8 +138,35 @@ pub fn compile(policy: &Policy, spec: &MaskSpec) -> Result<Mask, Error> {
         .kind
         .ok_or_else(|| context("every policy and rule needs a \"mask\"".into()))?;
 
+    if kind == MaskKind::Proxy {
+        if spec.proxy.is_none() {
+            return Err(context("mask \"proxy\" needs a \"proxy\"".into()));
+        }
+        let fallback = spec.fallback.unwrap_or(MaskKind::Null);
+        if matches!(fallback, MaskKind::Proxy | MaskKind::None) {
+            return Err(context("a proxy mask's fallback must be a SQL mask".into()));
+        }
+        // The fallback uses the rest of the spec, e.g. keep_suffix for "partial".
+        return compile(
+            policy,
+            &MaskSpec {
+                kind: Some(fallback),
+                proxy: None,
+                options: None,
+                fallback: None,
+                ..spec.clone()
+            },
+        );
+    }
+    if spec.proxy.is_some() || spec.options.is_some() || spec.fallback.is_some() {
+        return Err(context(
+            "\"proxy\", \"options\" and \"fallback\" need mask = \"proxy\"".into(),
+        ));
+    }
+
     let template = match kind {
         MaskKind::None => return Ok(Mask::Unmasked),
+        MaskKind::Proxy => unreachable!("handled above"),
         MaskKind::Null => "NULL".to_owned(),
         MaskKind::Constant => literal(
             spec.value
@@ -212,6 +242,7 @@ pub fn compile(policy: &Policy, spec: &MaskSpec) -> Result<Mask, Error> {
     Ok(Mask::Masked {
         template,
         raw_search,
+        proxy: None,
     })
 }
 
@@ -299,6 +330,7 @@ fill = "#"
         let Mask::Masked {
             template,
             raw_search,
+            ..
         } = compile(&p, &p.mask_spec()).unwrap()
         else {
             panic!("masked");
