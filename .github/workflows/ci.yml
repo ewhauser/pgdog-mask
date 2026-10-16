@@ -44,5 +44,12 @@ jobs:
       - name: Build dependencies for PgDog
         run: sudo apt-get update && sudo apt-get install -y mold postgresql-client
 
+      # PgDog built from the commit pinned in Cargo.toml.
+      - name: Cache PgDog
+        uses: actions/cache@v4
+        with:
+          path: .pgdog
+          key: pgdog-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml') }}
+
       - name: End-to-end tests through PgDog
         run: bash integration/run.sh

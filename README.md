@@ -156,7 +156,7 @@ bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, gorm) with ever
 bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin
 ```
 
-The integration scripts build PgDog from the repository and commit `pgdog-plugin` is pinned to in `Cargo.toml`, in `target/pgdog/<commit>`. Set `PGDOG_BIN` to use your own build instead.
+The integration scripts build PgDog from the repository and commit `pgdog-plugin` is pinned to in `Cargo.toml`, in `.pgdog/<commit>`. Set `PGDOG_BIN` to use your own build instead.
 - `compat.sh` also uses PgDog's integration suites and needs its databases (`integration/setup.sh` in PgDog's repository).
 - `bench.sh` needs `pgbench -i -s 20 masking_bench` and `integration/bench/setup.sql`.
 

@@ -16,7 +16,7 @@ export PGDATABASE=${PGDATABASE:-pgdog}
 
 # A PgDog source checkout at the pinned revision.
 function pgdog_src() {
-    local src="${ROOT}/target/pgdog/${PGDOG_REV}"
+    local src="${ROOT}/.pgdog/${PGDOG_REV}"
     if [ ! -d "${src}/.git" ]; then
         rm -rf "${src}"
         git clone --quiet --filter=blob:none "${PGDOG_REPO}" "${src}" >&2
