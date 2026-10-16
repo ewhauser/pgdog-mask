@@ -16,7 +16,7 @@ The configuration file is TOML in the style of PgDog's own files: top-level `[[a
 | `view_allowlist` | `[]` | Views masked users may query without analysis. Listing one attests that it doesn't return masked data. |
 | `inline_views` | `true` | Inline views over masked columns with masks applied. `false` queries every view like a table. See [Views and functions](../../configure/views-functions/). |
 | `scrub_error_detail` | `true` | Remove `DETAIL` from the errors and notices masked users get. See [Error details](../../configure/errors/). |
-| `tag_source` | `"config"` | Where column tags come from besides this file: `config`, `comment` (`pgdog:tag=<name>` in column comments) or `security_label`. |
+| `tag_source` | `"config"` | Where column tags come from besides this file: `config`, `comment` (`pgdog:tag=<name>` in column comments) or `security_label`. See [Tags in the database](../../configure/columns/#tags-in-the-database). |
 | `security_label_provider` | `"pgdog"` | Label provider read with `tag_source = "security_label"`. |
 | `cache_size` | `100000` | Number of analyzed statements to cache. |
 
@@ -59,7 +59,7 @@ Assigns a policy to columns. See [Choose masked columns](../../configure/columns
 
 | Key | Required | Description |
 | --- | --- | --- |
-| `column` | yes | Column name. |
+| `column` | yes | Column name. Each column can be assigned once per database, schema and table. |
 | `policy` or `tag` | one of them | The policy, or a tag mapped to one in `[[tags]]`. |
 | `database` | no | PgDog database. |
 | `schema` | no | Schema. |
@@ -70,8 +70,10 @@ Assigns a policy to columns. See [Choose masked columns](../../configure/columns
 
 | Key | Required | Description |
 | --- | --- | --- |
-| `name` | yes | Tag, e.g. `pii.ssn`. |
+| `name` | yes | Tag, e.g. `pii.ssn`. Each tag can be defined once. |
 | `policy` | yes | Policy for columns with the tag. |
+
+A column whose database tags have no `[[tags]]` entry, or map to different policies, reads as `NULL` for masked users.
 
 ## `[[classifiers]]`
 

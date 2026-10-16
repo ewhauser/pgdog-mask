@@ -23,4 +23,6 @@ Plugins can't be added or removed by a reload; that needs a restart.
 
 ## Schema changes
 
-The plugin works from the catalog PgDog loads at startup and on reload, or after DDL when PgDog's `reload_schema_on_ddl` is on. New tables and columns, view definitions, functions, and [database tags](../../configure/columns/#tags-in-the-database) take effect when PgDog next loads the schema. Statements on relations the plugin hasn't seen yet are blocked for masked users, unless `on_unresolved = "allow"`.
+The plugin works from the catalog PgDog loads: at startup, on reload, and after DDL sent through PgDog when its `reload_schema_on_ddl` is on (the default). DDL includes `CREATE`, `ALTER` and `DROP`, and `COMMENT ON COLUMN` and `SECURITY LABEL … ON COLUMN`, so [database tags](../../configure/columns/#when-tag-changes-apply) set through PgDog apply right away.
+
+Changes made directly on Postgres, such as migrations that don't go through PgDog, apply at the next reload or restart. Until then, statements on relations the plugin hasn't seen are blocked for masked users, unless `on_unresolved = "allow"`, and new tags don't mask anything yet.

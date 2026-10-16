@@ -1,12 +1,12 @@
 //! Masking profiles: which mask each policy applies for a given user.
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use parking_lot::RwLock;
 use pg_raw_parse::{Owned, StmtList};
 use regex::Regex;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::error;
 
 use crate::analyzer::lineage::{Lineage, view_lineage, view_relations};
 use crate::catalog::{Catalog, Relation, RelationKind};
@@ -37,11 +37,19 @@ impl std::fmt::Debug for ProxyInstance {
     }
 }
 
+/// Name of the policy for columns whose tags can't be resolved to one policy.
+pub const UNRESOLVED_TAGS: &str = "pgdog_mask.unresolved_tags";
+
 /// Configuration with compiled policies.
 #[derive(Debug)]
 pub struct Policies {
     pub config: Config,
+    /// The config's policies, in order, then the policy for unresolved tags.
     pub policies: Vec<CompiledPolicy>,
+    /// Index of the policy for columns whose database tags have no `[[tags]]`
+    /// entry, or map to several policies: they read as NULL for every user
+    /// who isn't exempt.
+    pub unresolved: usize,
     /// Proxy masks, referenced by index from compiled masks.
     pub proxies: Vec<ProxyInstance>,
     templates: Templates,
@@ -109,9 +117,23 @@ impl Policies {
             });
         }
 
+        // Fail closed on tags that can't be resolved: NULL for everyone but
+        // exempt users, who see every column.
+        let unresolved = policies.len();
+        let policy: Policy = toml::from_str(&format!(
+            "name = \"{UNRESOLVED_TAGS}\"\ndata_type = \"text\"\nmask = \"null\""
+        ))
+        .expect("valid policy");
+        policies.push(CompiledPolicy {
+            default: compile(&policy, &policy.mask_spec())?,
+            rules: vec![],
+            policy,
+        });
+
         Ok(Self {
             config,
             policies,
+            unresolved,
             proxies,
             templates: Templates::default(),
         })
@@ -163,7 +185,9 @@ impl Policies {
             .collect();
 
         Profile {
-            exempt: !masks.iter().any(Mask::is_masked),
+            // The policy for unresolved tags masks everyone; users that no
+            // configured policy masks are still exempt.
+            exempt: !masks[..self.unresolved].iter().any(Mask::is_masked),
             hash: hasher.finish(),
             masks,
         }
@@ -250,18 +274,41 @@ impl Assignments {
         }
 
         // Database tags add masks to columns the config doesn't mention.
+        // A tag without a [[tags]] entry, or tags for several policies, fail
+        // closed: the column reads as NULL.
         let database_tags = tags::database_tags(&config.general, catalog);
         for ((schema, table, column), tags) in &database_tags {
-            for tag in tags {
-                match config.tag_policy(tag).and_then(|p| policy_index(&p.name)) {
-                    Some(policy) => this.assign_missing(schema, table, column, policy),
-                    None => warn!(
-                        "[pgdog_mask] column {schema}.{table}.{column} has tag \"{tag}\", which has no [[tags]] entry; it isn't masked"
-                    ),
-                }
+            if this.is_assigned(schema, table, column) {
+                continue;
             }
+            let unknown: Vec<_> = tags
+                .iter()
+                .filter(|tag| config.tag_policy(tag).is_none())
+                .collect();
+            let resolved: BTreeSet<usize> = tags
+                .iter()
+                .filter_map(|tag| config.tag_policy(tag).and_then(|p| policy_index(&p.name)))
+                .collect();
+            let policy = if !unknown.is_empty() {
+                error!(
+                    "[pgdog_mask] column {schema}.{table}.{column} has tags {unknown:?} with no [[tags]] entry; it reads as NULL for masked users"
+                );
+                policies.unresolved
+            } else if resolved.len() > 1 {
+                error!(
+                    "[pgdog_mask] column {schema}.{table}.{column} has tags {tags:?} for different policies; it reads as NULL for masked users"
+                );
+                policies.unresolved
+            } else {
+                match resolved.first() {
+                    Some(policy) => *policy,
+                    None => continue,
+                }
+            };
+            this.assign_missing(schema, table, column, policy);
         }
 
+        let mut classified: BTreeMap<tags::ColumnKey, BTreeSet<usize>> = BTreeMap::new();
         for classifier in &config.classifiers {
             if classifier
                 .database
@@ -284,15 +331,46 @@ impl Assignments {
                     && classifier.name.as_deref().is_none_or(|n| n == r.name)
             }) {
                 for column in relation.columns.iter().filter(|c| regex.is_match(&c.name)) {
-                    this.assign_missing(&relation.schema, &relation.name, &column.name, policy);
+                    classified
+                        .entry((
+                            relation.schema.clone(),
+                            relation.name.clone(),
+                            column.name.clone(),
+                        ))
+                        .or_default()
+                        .insert(policy);
                 }
             }
+        }
+
+        // Classifiers that match the same column with different policies fail
+        // closed, like conflicting database tags.
+        for ((schema, table, column), policies_matched) in &classified {
+            if this.is_assigned(schema, table, column) {
+                continue;
+            }
+            let policy = match policies_matched.iter().collect::<Vec<_>>().as_slice() {
+                [policy] => **policy,
+                _ => {
+                    error!(
+                        "[pgdog_mask] column {schema}.{table}.{column} matches classifiers for different policies; it reads as NULL for masked users"
+                    );
+                    policies.unresolved
+                }
+            };
+            this.assign_missing(schema, table, column, policy);
         }
 
         this.database_tags = database_tags;
         this.inherit_partitions(catalog);
         this.views(&config.general, catalog);
         this
+    }
+
+    fn is_assigned(&self, schema: &str, table: &str, column: &str) -> bool {
+        self.relations
+            .get(&(schema.to_owned(), table.to_owned()))
+            .is_some_and(|columns| columns.contains_key(column))
     }
 
     fn assign_missing(&mut self, schema: &str, table: &str, column: &str, policy: usize) {
@@ -587,6 +665,10 @@ policy = "email"
 name = "secret"
 policy = "secret"
 
+[[tags]]
+name = "pii.ssn"
+policy = "ssn"
+
 [[masked_columns]]
 name = "users"
 column = "ssn"
@@ -601,6 +683,11 @@ arguments = ["opted_in"]
 [[classifiers]]
 column_regex = "e_?mail_address|secret_.*"
 tag = "secret"
+
+# Conflicts with the classifier above on secret_key.
+[[classifiers]]
+column_regex = "secret_key"
+tag = "pii.ssn"
 "#;
 
     fn tagged_catalog() -> Catalog {
@@ -613,6 +700,11 @@ tag = "secret"
         name.comment = Some("Full name. pgdog:tag=secret".into());
         let mut nickname = Column::new("nickname", "text");
         nickname.comment = Some("pgdog:tag=unknown".into());
+        // Tags for two policies.
+        let mut alias = Column::new("alias", "text");
+        alias.comment = Some("pgdog:tag=secret,pii.ssn".into());
+        let mut handle = Column::new("handle", "text");
+        handle.comment = Some("pgdog:tag=pii.ssn pgdog:tag=pii.ssn".into());
         let users = Relation::new(
             "public",
             "users",
@@ -624,6 +716,8 @@ tag = "secret"
                 Column::new("opted_in", "boolean"),
                 name,
                 nickname,
+                alias,
+                handle,
                 Column::new("email_address", "text"),
                 Column::new("secret_key", "text"),
                 Column::new("emails", "text"),
@@ -671,14 +765,18 @@ tag = "secret"
         let policy = |table: &str, column: &str| {
             assignments
                 .column("public", table, column)
-                .map(|a| policies.config.policies[a.policy].name.as_str())
+                .map(|a| policies.policies[a.policy].policy.name.as_str())
         };
 
         assert_eq!(policy("users", "ssn"), Some("ssn"));
         assert_eq!(policy("users", "name"), Some("secret"));
-        assert_eq!(policy("users", "nickname"), None);
         assert_eq!(policy("users", "email_address"), Some("secret"));
-        assert_eq!(policy("users", "secret_key"), Some("secret"));
+        assert_eq!(policy("users", "handle"), Some("ssn"), "the same tag twice");
+        // Fail closed: an unknown tag, tags for different policies, and
+        // classifiers for different policies.
+        assert_eq!(policy("users", "nickname"), Some(UNRESOLVED_TAGS));
+        assert_eq!(policy("users", "alias"), Some(UNRESOLVED_TAGS));
+        assert_eq!(policy("users", "secret_key"), Some(UNRESOLVED_TAGS));
         // Classifiers match the whole name.
         assert_eq!(policy("users", "emails"), None);
         assert_eq!(policy("users", "id"), None);
@@ -688,8 +786,43 @@ tag = "secret"
                 .keys()
                 .map(|(_, _, c)| c.as_str())
                 .collect::<Vec<_>>(),
-            ["name", "nickname", "ssn"]
+            ["alias", "handle", "name", "nickname", "ssn"]
         );
+
+        // Unresolved tags read as NULL for masked users, and don't stop
+        // exempt users from being exempt.
+        let profile = policies.profile("anyone", "db");
+        assert!(!profile.exempt);
+        assert_eq!(
+            profile.masks[policies.unresolved],
+            crate::mask::Mask::Masked {
+                template: "NULL".into(),
+                raw_search: Default::default(),
+                proxy: None,
+            }
+        );
+        let none = Policies::new(
+            Config::from_toml(
+                r#"
+[[users]]
+name = "admin"
+roles = ["admin"]
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "null"
+
+[[policies.rules]]
+roles = ["admin"]
+mask = "none"
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(none.profile("admin", "db").exempt);
+        assert!(!none.profile("other", "db").exempt);
 
         // Without tag_source, comments are ignored.
         let config = TAGS.replace("tag_source = \"comment\"", "");

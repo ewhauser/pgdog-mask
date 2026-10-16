@@ -1217,7 +1217,7 @@ dependencies = [
 [[package]]
 name = "pgdog-config"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=40a3d1b516d6072406f0286bab7d722bdb80f82a#40a3d1b516d6072406f0286bab7d722bdb80f82a"
+source = "git+https://github.com/ewhauser/pgdog?rev=b90f19265020a434d5cd5446e51abfda84865a17#b90f19265020a434d5cd5446e51abfda84865a17"
 dependencies = [
  "derive_more",
  "indexmap 2.14.2",
@@ -1265,7 +1265,7 @@ dependencies = [
 [[package]]
 name = "pgdog-plugin"
 version = "0.7.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=40a3d1b516d6072406f0286bab7d722bdb80f82a#40a3d1b516d6072406f0286bab7d722bdb80f82a"
+source = "git+https://github.com/ewhauser/pgdog?rev=b90f19265020a434d5cd5446e51abfda84865a17#b90f19265020a434d5cd5446e51abfda84865a17"
 dependencies = [
  "bindgen 0.71.1",
  "libloading",
@@ -1278,7 +1278,7 @@ dependencies = [
 [[package]]
 name = "pgdog-postgres-types"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=40a3d1b516d6072406f0286bab7d722bdb80f82a#40a3d1b516d6072406f0286bab7d722bdb80f82a"
+source = "git+https://github.com/ewhauser/pgdog?rev=b90f19265020a434d5cd5446e51abfda84865a17#b90f19265020a434d5cd5446e51abfda84865a17"
 dependencies = [
  "bytes",
  "chrono",
@@ -1294,7 +1294,7 @@ dependencies = [
 [[package]]
 name = "pgdog-stats"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=40a3d1b516d6072406f0286bab7d722bdb80f82a#40a3d1b516d6072406f0286bab7d722bdb80f82a"
+source = "git+https://github.com/ewhauser/pgdog?rev=b90f19265020a434d5cd5446e51abfda84865a17#b90f19265020a434d5cd5446e51abfda84865a17"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1309,7 +1309,7 @@ dependencies = [
 [[package]]
 name = "pgdog-vector"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=40a3d1b516d6072406f0286bab7d722bdb80f82a#40a3d1b516d6072406f0286bab7d722bdb80f82a"
+source = "git+https://github.com/ewhauser/pgdog?rev=b90f19265020a434d5cd5446e51abfda84865a17#b90f19265020a434d5cd5446e51abfda84865a17"
 dependencies = [
  "schemars 1.2.3",
  "serde",

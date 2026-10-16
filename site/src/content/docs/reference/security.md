@@ -14,7 +14,8 @@ Leaks are tested directly: the canary suite seeds masked columns with unique val
 1. **Clients can't reach Postgres directly.** Masking only applies to connections through PgDog. Enforce this with network policy and credentials.
 2. **The Postgres role masked users run as doesn't own the masked tables, and can't create functions or views.** This is defense in depth, should the analyzer have a bug: a role that can't create code can't hide a leak in it.
 3. **Configuration and keys are protected like credentials.** Whoever can change the configuration can unmask any column. Keep proxy mask keys in environment variables or files readable only by PgDog.
-4. **PgDog runs with `required = true`** for the plugin, so it never serves traffic without masking.
+4. **Column comments and security labels are protected like configuration**, with `tag_source = "comment"` or `"security_label"`. Removing a tag unmasks its column. Masked users can't change them through PgDog, but table owners and migrations can.
+5. **PgDog runs with `required = true`** for the plugin, so it never serves traffic without masking.
 
 ## Identity
 

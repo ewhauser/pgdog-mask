@@ -338,7 +338,15 @@ impl Config {
             }
         }
 
-        let tags: HashSet<_> = self.tags.iter().map(|tag| tag.name.as_str()).collect();
+        let mut tags = HashSet::new();
+        for tag in &self.tags {
+            if !tags.insert(tag.name.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "tag \"{}\" is defined more than once",
+                    tag.name
+                )));
+            }
+        }
         for tag in &self.tags {
             if !names.contains(tag.policy.as_str()) {
                 return Err(Error::Invalid(format!(
@@ -363,7 +371,21 @@ impl Config {
             }
         }
 
+        let mut columns = HashSet::new();
         for column in &self.masked_columns {
+            let scope = (
+                column.database.as_deref(),
+                column.schema.as_deref(),
+                column.name.as_deref(),
+                column.column.as_str(),
+            );
+            if !columns.insert(scope) {
+                return Err(Error::Invalid(format!(
+                    "masked column {}.{} is assigned more than once",
+                    column.name.as_deref().unwrap_or("*"),
+                    column.column
+                )));
+            }
             let target = format!(
                 "{}.{}",
                 column.name.as_deref().unwrap_or("*"),
@@ -524,5 +546,69 @@ tag = "pii.email"
     #[test]
     fn test_unknown_field() {
         assert!(Config::from_toml("[general]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn test_conflicting_assignments() {
+        let base = r#"
+[[policies]]
+name = "a"
+data_type = "text"
+mask = "null"
+
+[[policies]]
+name = "b"
+data_type = "text"
+mask = "default"
+"#;
+        let err = Config::from_toml(&format!(
+            "{base}
+[[tags]]
+name = \"pii\"
+policy = \"a\"
+
+[[tags]]
+name = \"pii\"
+policy = \"b\"
+"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tag \"pii\" is defined more than once"),
+            "{err}"
+        );
+
+        let err = Config::from_toml(&format!(
+            "{base}
+[[masked_columns]]
+name = \"users\"
+column = \"ssn\"
+policy = \"a\"
+
+[[masked_columns]]
+name = \"users\"
+column = \"ssn\"
+policy = \"b\"
+"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("assigned more than once"), "{err}");
+
+        // The same column of different tables is fine.
+        Config::from_toml(&format!(
+            "{base}
+[[masked_columns]]
+name = \"users\"
+column = \"ssn\"
+policy = \"a\"
+
+[[masked_columns]]
+name = \"customers\"
+column = \"ssn\"
+policy = \"b\"
+"
+        ))
+        .unwrap();
     }
 }

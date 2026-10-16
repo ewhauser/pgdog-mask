@@ -118,7 +118,9 @@ tag = "pii.ssn"
 
 With `tag_source = "comment"`, a column comment containing `pgdog:tag=<name>` tags the column, e.g. `COMMENT ON COLUMN users.ssn IS 'Social security number. pgdog:tag=pii.ssn'`. With `tag_source = "security_label"`, the label set by `SECURITY LABEL FOR pgdog ON COLUMN users.ssn IS 'pii.ssn'` does; this needs a label provider loaded in Postgres. Tags map to policies through `[[tags]]`, so policies stay in the config file.
 
-Database tags only add masking: `[[masked_columns]]` wins, then database tags, then classifiers. Tags that disappear between schema loads are logged at `warn`, since that unmasks a column.
+Database tags only add masking: `[[masked_columns]]` wins, then database tags, then classifiers. Tags that can't be resolved fail closed: a tag with no `[[tags]]` entry, or tags (or classifiers) for different policies, make the column read as `NULL` for masked users, with an error in the log. Tags that disappear between schema loads are logged at `warn`, since that unmasks a column.
+
+Tag changes apply when PgDog next loads the schema. `COMMENT ON COLUMN` and `SECURITY LABEL … ON COLUMN` sent through PgDog reload it right away (with `reload_schema_on_ddl`, the default); changes made directly on Postgres apply at the next reload or restart. See [Tags in the database](https://ewhauser.github.io/pgdog-mask/configure/columns/#tags-in-the-database).
 
 ### Views and functions
 

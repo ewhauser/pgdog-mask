@@ -333,3 +333,71 @@ async fn test_proxy_masks() {
         ]]
     );
 }
+
+/// Tags that can't be resolved to one policy fail closed: the column reads
+/// as NULL for masked users.
+#[tokio::test]
+async fn test_unresolved_tags_fail_closed() {
+    if !enabled() {
+        return;
+    }
+    let client = connect("masked").await;
+    let rows = simple(
+        &client,
+        "SELECT nickname, codename FROM masking_e2e.users WHERE id = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![None, None]]);
+
+    let admin = connect("admin").await;
+    let rows = simple(
+        &admin,
+        "SELECT nickname, codename FROM masking_e2e.users WHERE id = 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("ally".into()), Some("red".into())]]);
+}
+
+/// A tag set with COMMENT ON through PgDog applies without a restart:
+/// PgDog reloads the schema after the DDL and sends the plugin the new catalog.
+#[tokio::test]
+async fn test_tags_apply_live() {
+    if !enabled() {
+        return;
+    }
+    let admin = connect("admin").await;
+    let masked = connect("masked").await;
+    let alias =
+        || async { simple(&masked, "SELECT alias FROM masking_e2e.users WHERE id = 1").await };
+    assert_eq!(alias().await, vec![vec![Some("al".into())]]);
+
+    admin
+        .batch_execute("COMMENT ON COLUMN masking_e2e.users.alias IS 'pgdog:tag=secret'")
+        .await
+        .unwrap();
+    // The schema reloads in the background.
+    let mut masked_now = false;
+    for _ in 0..50 {
+        if alias().await == vec![vec![None]] {
+            masked_now = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(masked_now, "the tag didn't apply");
+
+    // Removing the tag unmasks the column, the same way.
+    admin
+        .batch_execute("COMMENT ON COLUMN masking_e2e.users.alias IS NULL")
+        .await
+        .unwrap();
+    let mut unmasked = false;
+    for _ in 0..50 {
+        if alias().await == vec![vec![Some("al".into())]] {
+            unmasked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(unmasked, "the tag's removal didn't apply");
+}

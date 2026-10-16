@@ -29,6 +29,7 @@ Every blocked statement is logged at `warn` with the user, the reason, and the s
 
 ## Results look wrong
 
-- **A column isn't masked.** Check that the user isn't exempt (`[[users]]` roles and the policy's rules), that the column's assignment matches its database, schema and table, and, for database tags, that PgDog has reloaded the schema since the tag was added.
+- **A column isn't masked.** Check that the user isn't exempt (`[[users]]` roles and the policy's rules), and that the column's assignment matches its database, schema and table. For a [database tag](../../configure/columns/#tags-in-the-database), check that `tag_source` is set, and that PgDog has loaded the schema since the tag was added: tags set directly on Postgres need a reload.
+- **A column reads as `NULL` for everyone masked.** Its tags don't resolve to one policy: a tag without a `[[tags]]` entry, or tags or classifiers for different policies. The plugin logs which, at `error`.
 - **A query finds nothing.** Conditions on masked columns compare masked values. Use [raw search](../../configure/raw-search/) for roles that need to look rows up.
 - **Ordering changed.** `ORDER BY` a masked column sorts by the mask.
