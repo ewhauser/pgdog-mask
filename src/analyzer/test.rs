@@ -967,3 +967,41 @@ fn test_shape_path_matches_full_analysis() {
     }
     assert!(checked > 100, "most of the corpus has a shape: {checked}");
 }
+
+#[test]
+fn test_ddl() {
+    for sql in [
+        "DROP TABLE IF EXISTS scratch",
+        "DROP TABLE users",
+        "CREATE SEQUENCE s",
+        "ALTER SEQUENCE s RESTART",
+        "ALTER TABLE orders ADD COLUMN note text",
+        "CREATE INDEX ON orders (user_id)",
+        "ALTER TABLE orders RENAME COLUMN total TO amount",
+    ] {
+        match analyze_as("anonymous", sql) {
+            Outcome::Unchanged { .. } => (),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+
+    for sql in [
+        // Leak values through errors.
+        "ALTER TABLE users ALTER COLUMN ssn TYPE int USING ssn::int",
+        "CREATE INDEX ON users ((ssn::int))",
+        // Unmask.
+        "ALTER TABLE users RENAME COLUMN ssn TO not_ssn",
+        "ALTER TABLE users RENAME TO people",
+        "ALTER SCHEMA public RENAME TO other",
+        "ALTER TABLE users SET SCHEMA other",
+        "COMMENT ON COLUMN users.ssn IS 'nothing to see'",
+        // Expose rows through an unmasked table.
+        "ALTER TABLE orders ATTACH PARTITION users FOR VALUES IN (1)",
+        "ALTER TABLE orders INHERIT users",
+        // Functions are still checked.
+        "ALTER TABLE orders ADD COLUMN x text DEFAULT my_func(1)",
+        "GRANT SELECT ON users TO public",
+    ] {
+        blocked("anonymous", sql);
+    }
+}

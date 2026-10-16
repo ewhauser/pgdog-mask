@@ -122,7 +122,7 @@ All of these fail closed with SQLSTATE `42501`:
 - call functions that aren't in the schema snapshot;
 - call SQL-executing built-ins such as `query_to_xml`, `dblink*` and `lo_*`;
 - query `pg_stats`, `pg_statistic` or `pg_stat_statements`;
-- run `DO`, DDL other than tables, `MERGE`, or `COPY … TO PROGRAM/file`;
+- run `DO`, `MERGE`, `COPY … TO PROGRAM/file`, or DDL other than creating tables, `DROP`, sequences, and `ALTER TABLE`/`CREATE INDEX`/renames of relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, renames would unmask columns, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
 - write through views that read masked columns, or read columns of table-like views computed from masked columns;
 - query views missing from the schema snapshot's definitions;
 - query relations missing from the schema snapshot;
@@ -135,9 +135,25 @@ All of these fail closed with SQLSTATE `42501`:
 ```bash
 cargo test -p pgdog-masking            # unit tests + canary leak tests (needs Postgres)
 bash integration/masking/run.sh        # end-to-end through PgDog
+bash integration/masking/compat.sh     # Go drivers and ORMs (pgx, pq, gorm) with every user masked
 ```
 
+`compat.sh` runs the Go integration suites through PgDog with every user masked, so every statement the drivers send is analyzed. Results should match `integration/go/run.sh`, which runs without the plugin.
+
 The canary tests seed masked columns with unique values, run an adversarial corpus through the analyzer as a masked user, execute the result in Postgres, and fail if a canary appears anywhere in rows, errors, notices or `COPY` output. They load the schema with PgDog's own catalog queries.
+
+## Performance
+
+Decisions are cached per statement and masking profile, and statements that differ only in their literals share one analysis (statement shapes), so simple-protocol clients that inline values don't re-analyze every statement. Per statement, measured with `cargo bench -p pgdog-masking --bench overhead`:
+
+| | |
+|---|---|
+| exempt user | ~30ns |
+| masked user, cached statement | 120–320ns |
+| masked user, new literals (simple protocol) | 2–6µs |
+| masked user, new statement shape | 3–35µs (once per shape) |
+
+End to end, `integration/masking/bench/bench.sh` runs pgbench against Postgres, PgDog, and PgDog with the plugin for exempt and masked users. Prepared statements and point queries show no measurable overhead. A 34-column `SELECT table.*` with masked columns over the simple protocol runs about 16% slower for masked users. Most of that is Postgres planning and evaluating the expanded, masked select list, which `*` expansion requires.
 
 ## Error details
 

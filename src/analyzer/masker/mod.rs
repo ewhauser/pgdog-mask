@@ -279,7 +279,73 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return;
         }
         self.check_shadowing(node);
+        self.check_ddl(node);
         transform::transform_raw_stmt(stmt, self);
+    }
+
+    /// DDL masked users may run can't touch relations with masked columns:
+    /// expressions in ALTER TABLE or CREATE INDEX can leak values through errors,
+    /// renames would unmask them, and attaching or inheriting would expose their
+    /// rows through another table.
+    fn check_ddl(&mut self, node: Node<'_>) {
+        if !matches!(
+            node,
+            Node::AlterTableStmt(_) | Node::IndexStmt(_) | Node::RenameStmt(_)
+        ) {
+            return;
+        }
+
+        // The target relation, and relations attached or inherited by ALTER TABLE.
+        // (Postgres' expression walker doesn't handle DDL, so this reads the
+        // statements directly.)
+        let mut range_vars: Vec<&nodes::RangeVar> = vec![];
+        match node {
+            Node::AlterTableStmt(alter) => {
+                range_vars.extend(alter.relation());
+                for cmd in alter.cmds().iter() {
+                    if let Node::AlterTableCmd(cmd) = cmd {
+                        match cmd.def() {
+                            Node::PartitionCmd(partition) => range_vars.extend(partition.name()),
+                            Node::RangeVar(parent) => range_vars.push(parent),
+                            _ => (),
+                        }
+                    }
+                }
+            }
+            Node::IndexStmt(index) => range_vars.extend(index.relation()),
+            Node::RenameStmt(rename) => range_vars.extend(rename.relation()),
+            _ => (),
+        }
+        let relations: Vec<_> = range_vars
+            .into_iter()
+            .filter_map(|range_var| {
+                range_var
+                    .relname()
+                    .map(|name| (range_var.schemaname().map(str::to_owned), name.to_owned()))
+            })
+            .collect();
+
+        // Renames of schemas and other objects without a relation could move
+        // masked tables out from under the configuration.
+        if relations.is_empty() {
+            self.block("this statement is not allowed for masked users");
+            return;
+        }
+
+        for (schema, name) in relations {
+            if let Some(relation) =
+                self.ctx
+                    .catalog
+                    .resolve(schema.as_deref(), &name, &self.ctx.search_path)
+                && self.is_masked_relation(relation)
+            {
+                self.block(format!(
+                    "masked users can't alter {}.{}, which has masked columns",
+                    relation.schema, relation.name
+                ));
+                return;
+            }
+        }
     }
 
     /// Masked users can't create tables that shadow masked relations.

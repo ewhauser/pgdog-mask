@@ -108,6 +108,14 @@ pub(super) fn check_statement(node: Node<'_>) -> Result<(), String> {
             | Node::CreateTableAsStmt(_)
             | Node::TruncateStmt(_)
             | Node::VacuumStmt(_)
+            // DDL that can't read data. ALTER TABLE, CREATE INDEX and renames are
+            // further limited to relations without masked columns.
+            | Node::DropStmt(_)
+            | Node::CreateSeqStmt(_)
+            | Node::AlterSeqStmt(_)
+            | Node::AlterTableStmt(_)
+            | Node::IndexStmt(_)
+            | Node::RenameStmt(_)
     );
 
     if allowed {
