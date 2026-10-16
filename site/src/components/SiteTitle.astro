@@ -1,0 +1,49 @@
+---
+// Brand lockup: three bars, partly masked, and "pgdog / mask".
+const { siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="brand" aria-label="pgdog-mask home">
+	<span class="mark" aria-hidden="true"><i></i><i></i><i class="masked"></i><i class="masked"></i></span>
+	<span translate="no">pgdog<span class="brand-divider">/</span><span class="muted">mask</span></span>
+</a>
+
+<style>
+	.brand {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 21px;
+		font-weight: 650;
+		letter-spacing: -0.8px;
+		color: var(--sl-color-white);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.brand:hover {
+		text-decoration: none;
+	}
+	.brand-divider {
+		font-weight: 300;
+		color: var(--brand-divider);
+		padding: 0 2px;
+	}
+	.muted {
+		color: var(--sl-color-gray-3);
+		font-weight: 550;
+	}
+	.mark {
+		display: grid;
+		grid-template-columns: 7px 11px;
+		grid-template-rows: repeat(2, 7px);
+		gap: 3px;
+		margin-right: 4px;
+	}
+	.mark i {
+		background: var(--accent);
+		border-radius: 2px;
+	}
+	.mark i.masked {
+		opacity: 0.35;
+	}
+</style>

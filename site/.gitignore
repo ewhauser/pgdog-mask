@@ -1,0 +1,7 @@
+# build output
+dist/
+.astro/
+node_modules/
+
+# pages synced from ../docs (pnpm sync)
+src/content/docs/contribute/design.md

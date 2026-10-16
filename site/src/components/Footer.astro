@@ -1,0 +1,21 @@
+---
+import Default from '@astrojs/starlight/components/Footer.astro';
+---
+
+<Default />
+<p class="site-notice">
+	Experimental software. Requires PgDog's plugin API 0.7, on the
+	<a href="https://github.com/ewhauser/pgdog/tree/masking/plugin-api">ewhauser/pgdog fork</a>.
+	<a href={`${import.meta.env.BASE_URL}reference/compatibility/`}>Compatibility</a>
+	· <a href={`${import.meta.env.BASE_URL}reference/limitations/`}>Limitations</a>
+</p>
+
+<style>
+	.site-notice {
+		margin-top: 1.5rem;
+		padding-top: 1rem;
+		border-top: 1px solid var(--sl-color-hairline);
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
+	}
+</style>

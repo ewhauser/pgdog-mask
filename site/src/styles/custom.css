@@ -1,0 +1,133 @@
+/* Layout and type follow the celld-operator site: Inter, tight headings,
+   bordered tables. The accent is a deep blue. */
+:root {
+	--accent: #2f4fb5;
+	--brand-divider: #a3a9b8;
+
+	--sl-font: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+	--sl-font-mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+	--sl-nav-height: 68px;
+	--sl-content-width: 46rem;
+	font-synthesis: none;
+}
+
+/* Dark theme: the same blue family on a deep blue-black ground. */
+:root {
+	--accent: #8ea6f0;
+	--sl-color-accent-low: #1c2647;
+	--sl-color-accent: #7f98e8;
+	--sl-color-accent-high: #d3ddfa;
+	--sl-color-white: #eceef4;
+	--sl-color-gray-1: #dde1ea;
+	--sl-color-gray-2: #b6bccb;
+	--sl-color-gray-3: #868d9f;
+	--sl-color-gray-4: #5a6175;
+	--sl-color-gray-5: #3a4154;
+	--sl-color-gray-6: #262c3d;
+	--sl-color-gray-7: #1b2030;
+	--sl-color-black: #131722;
+	--brand-divider: #5a6175;
+}
+
+:root[data-theme='light'] {
+	--accent: #2f4fb5;
+	--sl-color-accent-low: #e8edfb;
+	--sl-color-accent: #2f4fb5;
+	--sl-color-accent-high: #1d3480;
+	--sl-color-white: #1f2638;
+	--sl-color-gray-1: #2d3448;
+	--sl-color-gray-2: #3f4659;
+	--sl-color-gray-3: #707789;
+	--sl-color-gray-4: #a3a9b8;
+	--sl-color-gray-5: #c8ccd6;
+	--sl-color-gray-6: #dee1e8;
+	--sl-color-gray-7: #eceef3;
+	--sl-color-black: #f6f7fa;
+	--sl-color-bg-sidebar: #f6f7fa;
+	--sl-color-bg-nav: #f6f7fa;
+	--sl-color-bg-inline-code: #eceef3;
+	--sl-color-text-invert: #f6f7fa;
+	--brand-divider: #a3a9b8;
+}
+
+/* Headings */
+.sl-markdown-content h1,
+.content-panel h1,
+.hero h1 {
+	letter-spacing: -0.8px;
+	font-weight: 600;
+}
+.sl-markdown-content h2 {
+	font-size: var(--sl-text-h4);
+	letter-spacing: -0.4px;
+	font-weight: 600;
+}
+.sl-markdown-content h3 {
+	font-size: var(--sl-text-lg);
+	font-weight: 600;
+}
+.sl-markdown-content {
+	line-height: 1.65;
+}
+
+/* Tables. Narrow screens keep Starlight's scrolling block. */
+.sl-markdown-content table {
+	display: block;
+	overflow-x: auto;
+	border: 1px solid var(--sl-color-gray-6);
+	border-radius: 9px;
+	border-collapse: separate;
+	border-spacing: 0;
+	overflow-y: hidden;
+	font-size: var(--sl-text-sm);
+}
+.sl-markdown-content thead th {
+	background: var(--sl-color-gray-7);
+	color: var(--sl-color-gray-2);
+	font-size: var(--sl-text-xs);
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.6px;
+	border-bottom: 1px solid var(--sl-color-gray-6);
+}
+.sl-markdown-content th,
+.sl-markdown-content td {
+	border: 0;
+	padding: 0.65rem 1rem;
+	vertical-align: top;
+}
+.sl-markdown-content tbody tr + tr td,
+.sl-markdown-content tbody tr + tr th {
+	border-top: 1px solid var(--sl-color-gray-7);
+}
+.sl-markdown-content tbody tr:hover {
+	background: color-mix(in srgb, var(--sl-color-gray-7) 45%, transparent);
+}
+
+@media (min-width: 50rem) {
+	.sl-markdown-content table {
+		display: table;
+		width: 100%;
+	}
+}
+
+/* Code */
+.sl-markdown-content code:not(pre code) {
+	font-size: 0.85em;
+	border-radius: 4px;
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+	outline: 3px solid var(--sl-color-accent);
+	outline-offset: 3px;
+}
+
+/* Keep the introduction and its actions visible without a splash-page-sized gap. */
+.hero { padding-block: 2rem; grid-template-columns: 1fr; }
+.hero h1 { max-width: 24ch; font-size: clamp(2.25rem, 4vw, 3.25rem); }
+.hero .tagline { max-width: 54ch; }
+.sl-markdown-content details { margin-block: 1rem; }
+.sl-markdown-content details > summary { cursor: pointer; font-weight: 600; }

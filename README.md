@@ -1,6 +1,8 @@
 # pgdog-mask
 
-Dynamic data masking for [PgDog](https://github.com/pgdogdev/pgdog), modeled on Snowflake's dynamic data masking. Design: [docs/DESIGN.md](docs/DESIGN.md).
+Dynamic data masking for [PgDog](https://github.com/pgdogdev/pgdog), modeled on Snowflake's dynamic data masking.
+
+Documentation: https://ewhauser.github.io/pgdog-mask/ (source in [`site/`](site)). Design: [docs/DESIGN.md](docs/DESIGN.md).
 
 For PgDog users with masking policies, the plugin parses each statement before PgDog does. It then resolves every column reference to `schema.table.column`, and replaces each reference to a masked column with the policy's mask expression. This applies wherever the reference appears:
 - the select list, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY` and window clauses;
@@ -206,4 +208,4 @@ End to end, `integration/bench/bench.sh` runs pgbench against Postgres, PgDog, a
 
 ## Error details
 
-Errors and notices can carry row values in their `DETAIL`, e.g. a `CHECK` violation's `Failing row contains (...)`. For statements that read or write relations with masked columns, the plugin removes `DETAIL` from `ErrorResponse` and `NoticeResponse` before they reach the client.
+Errors and notices can carry row values in their `DETAIL`, e.g. a `CHECK` violation's `Failing row contains (...)`. For masked users, the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` before it reaches the client; the severity and SQLSTATE are kept. `scrub_error_detail = false` turns this off.
