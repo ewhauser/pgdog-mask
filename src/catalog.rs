@@ -336,22 +336,15 @@ impl Catalog {
         self.operators.contains_key(name)
     }
 
-    /// User-defined functions a call could resolve to: by name, in the given
-    /// schema or the `search_path`.
-    pub fn functions(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-        search_path: &[String],
-    ) -> Vec<&Function> {
+    /// User-defined functions a call could resolve to, by name: in `schema`,
+    /// or for an unqualified call, in any schema. Postgres resolves it with
+    /// the session's search_path, which may not be the one PgDog follows.
+    pub fn functions(&self, schema: Option<&str>, name: &str) -> Vec<&Function> {
         self.functions
             .get(name)
             .into_iter()
             .flatten()
-            .filter(|function| match schema {
-                Some(schema) => function.schema == schema,
-                None => search_path.contains(&function.schema),
-            })
+            .filter(|function| schema.is_none_or(|schema| function.schema == schema))
             .collect()
     }
 
@@ -455,12 +448,12 @@ mod test {
         assert!(!view.option("security_invoker"));
         assert!(view.definition.is_some());
 
-        let path = ["public".to_owned()];
-        let last4 = catalog.functions(None, "last4", &path);
+        let last4 = catalog.functions(None, "last4");
         assert_eq!(last4.len(), 1);
         assert!(last4[0].accepts(1));
         assert!(!last4[0].accepts(2));
-        assert!(catalog.functions(None, "last4", &[]).is_empty());
+        assert_eq!(catalog.functions(Some("public"), "last4").len(), 1);
+        assert!(catalog.functions(Some("other"), "last4").is_empty());
         assert!(catalog.is_system_function("lower"));
         assert!(!catalog.is_system_function("last4"));
     }

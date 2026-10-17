@@ -376,14 +376,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let general = &self.ctx.policies.config.general;
         let candidates: Vec<&'c Function> = match schema {
             Some("pg_catalog") => vec![],
-            Some(_) => catalog.functions(schema, name, &[]),
-            None => catalog.functions(None, name, &self.ctx.search_path),
+            schema => catalog.functions(schema, name),
         }
         .into_iter()
         .filter(|function| function.accepts(count))
         .collect();
 
-        if !candidates.is_empty() {
+        // Postgres may resolve an unqualified call with another search_path
+        // than the session's, which PgDog doesn't always follow: once one
+        // is on the session's, namesakes in other schemas are candidates too.
+        if candidates
+            .iter()
+            .any(|function| schema.is_some() || self.ctx.search_path.contains(&function.schema))
+        {
             return Target::Functions(candidates);
         }
         if rules::allowlisted(schema, name, &general.udf_allowlist) {
@@ -435,7 +440,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             [function] if functions.len() == 1 => Ok(CallTarget::Inline(function)),
             _ => {
                 self.block(format!(
-                    "function {name}() has several overloads and one reads masked columns, so it can't be inlined"
+                    "function {name}() has several overloads, or namesakes in other schemas, and one reads masked columns, so it can't be inlined"
                 ));
                 Err(())
             }
@@ -557,15 +562,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             [] => return None,
         };
         let count = call.args().iter().count();
-        let path: &[String] = if schema.is_some() {
-            &[]
-        } else {
-            &self.ctx.search_path
-        };
         let mut outputs = self
             .ctx
             .catalog
-            .functions(schema, name, path)
+            .functions(schema, name)
             .into_iter()
             .filter(|function| function.accepts(count))
             .map(|function| {

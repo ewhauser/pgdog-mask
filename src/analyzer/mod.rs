@@ -91,6 +91,10 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     let parsed = make::try_owned(|mem| {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, ctx);
+        let nodes: Vec<_> = stmts.as_ref().iter().map(|stmt| stmt.stmt()).collect();
+        if let Err(reason) = rules::check_resolution_settings(sql, &nodes) {
+            masker.blocked = Some(reason.to_owned());
+        }
         // Each statement gets the result masks of its position, and may
         // change name resolution for the ones after it.
         for (index, stmt) in stmts.as_mut().into_iter().enumerate() {

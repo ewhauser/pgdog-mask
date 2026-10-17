@@ -2138,10 +2138,11 @@ fn multi_statement() -> Vec<Case> {
             "SELECT id FROM orders; SELECT ssn FROM users WHERE id = 1; SELECT name FROM users",
             Same(vec![at(1, p(0))], false),
         ),
+        // PgDog only follows a search_path change sent as a query of its own.
         case(
             "S11",
             "SET search_path TO public; SELECT ssn FROM users",
-            Block("name resolution"),
+            Block("query of their own"),
         ),
         case(
             "S12",
@@ -2151,9 +2152,45 @@ fn multi_statement() -> Vec<Case> {
         case(
             "S13",
             "SELECT ssn FROM users; SET search_path TO other",
-            Same(vec![p(0)], false),
+            Block("query of their own"),
         ),
-        case("S14", "SET search_path TO other; SELECT 1", allow()),
+        case(
+            "S13",
+            "SELECT id FROM orders; SET search_path TO other",
+            Block("query of their own"),
+        ),
+        case(
+            "S13",
+            "; SET search_path TO other",
+            Block("query of their own"),
+        ),
+        case(
+            "S13",
+            "/* hint */ SET search_path TO other",
+            Block("query of their own"),
+        ),
+        case("S13", "SELECT 1; RESET ALL", Block("query of their own")),
+        case("S13", "SELECT 1; DISCARD ALL", Block("query of their own")),
+        case(
+            "S13",
+            "SELECT 1; SET ROLE someone",
+            Block("query of their own"),
+        ),
+        case(
+            "S14",
+            "SET search_path TO other; SELECT 1",
+            Block("query of their own"),
+        ),
+        case("S14", "SET search_path TO other", allow()),
+        case("S14", "  set LOCAL search_path TO other", allow()),
+        case("S14", "RESET ALL", allow()),
+        case("S14", "DISCARD ALL", allow()),
+        case("S14", "SET ROLE someone", allow()),
+        case(
+            "S14",
+            "SET statement_timeout TO 1000; SELECT ssn FROM users",
+            Same(vec![at(1, p(0))], false),
+        ),
         // Empty statements don't count.
         case(
             "S15",

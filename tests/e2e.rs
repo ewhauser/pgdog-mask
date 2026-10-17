@@ -446,6 +446,15 @@ async fn test_proxy_multi_statement() {
         "SELECT set_config('search_path', 'masking_e2e', false)",
     )
     .await;
+    // Nor a SET that isn't the query's first statement: it would also stay
+    // on the pooled server connection for the next client.
+    for sql in [
+        "SELECT 1; SET search_path TO masking_e2e",
+        "; SET search_path TO masking_e2e",
+        "SELECT 1; RESET ALL",
+    ] {
+        assert_blocked(&fresh, sql).await;
+    }
     fresh
         .batch_execute("SET search_path TO masking_e2e")
         .await

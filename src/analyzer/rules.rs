@@ -247,19 +247,56 @@ pub(super) fn changes_resolution_setting(name: &str) -> bool {
 pub(super) fn changes_resolution(node: Node<'_>) -> bool {
     match node {
         Node::ExplainStmt(explain) => changes_resolution(explain.query()),
-        Node::VariableSetStmt(set) => {
-            set.kind == VariableSetKind::VAR_RESET_ALL
-                || (set.kind != VariableSetKind::VAR_SET_MULTI
-                    && set.name().is_some_and(changes_resolution_setting))
-        }
-        Node::DiscardStmt(discard) => discard.target == DiscardMode::DISCARD_ALL,
         Node::SelectStmt(select) => into_clause(select).is_some(),
         Node::CreateStmt(_)
         | Node::CreateTableAsStmt(_)
         | Node::DropStmt(_)
         | Node::RenameStmt(_)
         | Node::AlterTableStmt(_) => true,
+        node => changes_resolution_settings(node),
+    }
+}
+
+/// Does a statement change `search_path` or the role: `SET`, `RESET`,
+/// `RESET ALL` or `DISCARD ALL`?
+fn changes_resolution_settings(node: Node<'_>) -> bool {
+    match node {
+        Node::VariableSetStmt(set) => {
+            set.kind == VariableSetKind::VAR_RESET_ALL
+                || (set.kind != VariableSetKind::VAR_SET_MULTI
+                    && set.name().is_some_and(changes_resolution_setting))
+        }
+        Node::DiscardStmt(discard) => discard.target == DiscardMode::DISCARD_ALL,
         _ => false,
+    }
+}
+
+/// Most whitespace before the command of a query PgDog is sure to look at.
+const LEADING_SPACE: usize = 64;
+
+/// PgDog follows a change to `search_path` or the role only in a query of
+/// its own, which it tells by the query's first word: not as a later
+/// statement of a query, nor after comments, a `;` or a lot of whitespace.
+/// The plugin would then resolve names with a search_path Postgres doesn't
+/// use, and the change would stay on the pooled server connection for the
+/// next client.
+pub(super) fn check_resolution_settings(sql: &str, stmts: &[Node<'_>]) -> Result<(), &'static str> {
+    if !stmts.iter().any(|stmt| changes_resolution_settings(*stmt)) {
+        return Ok(());
+    }
+    let alone = stmts.len() == 1;
+    let command = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let first_word = ["set", "reset", "discard"].iter().any(|word| {
+        command
+            .get(..word.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(word))
+    });
+    if alone && sql.len() - command.len() <= LEADING_SPACE && first_word {
+        Ok(())
+    } else {
+        Err(
+            "changes to search_path or the role must be sent as a query of their own, starting with SET, RESET or DISCARD: PgDog doesn't follow them otherwise",
+        )
     }
 }
 

@@ -45,11 +45,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Does a relation name resolve to a relation with proxy-masked columns?
-    pub(super) fn resolves_to_proxy_relation(&self, range_var: &nodes::RangeVar) -> bool {
+    pub(super) fn resolves_to_proxy_relation(&mut self, range_var: &nodes::RangeVar) -> bool {
         range_var.relname().is_some_and(|name| {
-            self.ctx
-                .catalog
-                .resolve(range_var.schemaname(), name, &self.ctx.search_path)
+            self.resolve_relation(range_var.schemaname(), name)
                 .is_some_and(|relation| self.has_proxy_masks(relation))
         })
     }
@@ -105,10 +103,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
         for range_var in range_vars {
             if let Some(name) = range_var.relname()
-                && let Some(relation) =
-                    self.ctx
-                        .catalog
-                        .resolve(range_var.schemaname(), name, &self.ctx.search_path)
+                && let Some(relation) = self.resolve_relation(range_var.schemaname(), name)
                 && self.is_masked_relation(relation)
             {
                 self.block(format!(
@@ -260,12 +255,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 self.block(RESOLUTION_CHANGED);
                 return;
             }
-            let schema = range_var.schemaname();
-            let Some(relation) = self
-                .ctx
-                .catalog
-                .resolve(schema, name, &self.ctx.search_path)
-            else {
+            let Some(relation) = self.resolve_relation(range_var.schemaname(), name) else {
                 if self.ctx.policies.config.general.on_unresolved == OnUnresolved::Block {
                     self.block(format!(
                         "relation \"{name}\" is not in the catalog, so its columns can't be checked"

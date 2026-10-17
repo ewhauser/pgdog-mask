@@ -25,6 +25,7 @@ use super::rules;
 use super::scope::{Cte, Frame, Item, ItemKind, derived_outputs, find_cte, unknown_columns};
 use super::shape::is_placeholder;
 use super::taint::{Lookup, OutputColumn, Outputs, Taint};
+use crate::catalog::Relation;
 use crate::config::OnUnresolved;
 use crate::mask::SearchOp;
 use functions::{CallCheck, CallUse, ParamMode};
@@ -497,6 +498,36 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         transform::transform_raw_stmt(stmt, self);
     }
 
+    /// The relation a name refers to. Postgres resolves an unqualified name
+    /// with the session's search_path, which may not be the one PgDog
+    /// follows: PgDog misses some changes to it (a `SET` inside a
+    /// multi-statement query, a pooled connection another client changed),
+    /// and `$user` follows the role. So every relation of that name, in any
+    /// schema, must read like the one it resolves to here; otherwise the name
+    /// must be qualified.
+    pub(super) fn resolve_relation(
+        &mut self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Option<&'c Relation> {
+        let catalog = self.ctx.catalog;
+        if schema.is_some() {
+            return catalog.resolve(schema, name, &[]);
+        }
+        let named = catalog.relations_named(name);
+        let resolved = catalog
+            .resolve(None, name, &self.ctx.search_path)
+            .or(named.first())?;
+        if let Some(other) = named.iter().find(|other| !self.reads_like(resolved, other)) {
+            self.block(format!(
+                "\"{name}\" may refer to {} or to {}, which read differently for masked users; qualify it with its schema",
+                resolved.qualified_name(),
+                other.qualified_name()
+            ));
+        }
+        Some(resolved)
+    }
+
     /// A FROM item naming a relation.
     fn add_range_var(&mut self, range_var: &nodes::RangeVar) {
         let Some(name) = range_var.relname() else {
@@ -518,11 +549,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         } else if self.path_changed {
             self.block(RESOLUTION_CHANGED);
             Item::derived(refname, unknown_columns())
-        } else if let Some(relation) = self
-            .ctx
-            .catalog
-            .resolve(schema, name, &self.ctx.search_path)
-        {
+        } else if let Some(relation) = self.resolve_relation(schema, name) {
             match self.view_verdict(relation) {
                 Verdict::Safe => (),
                 // Views are inlined in FROM lists; anywhere else they can't be.

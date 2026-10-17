@@ -319,6 +319,11 @@ pub(crate) fn functions() -> Vec<Function> {
 }
 
 pub(crate) fn catalog() -> Catalog {
+    catalog_with(vec![], vec![])
+}
+
+/// The test catalog, with more relations and functions.
+fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Catalog {
     let users = vec![
         column("id", "bigint"),
         column("name", "text"),
@@ -354,7 +359,7 @@ pub(crate) fn catalog() -> Catalog {
 
     let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
-        vec![
+        [
             relation("users", RelationKind::Table, users),
             partition,
             relation(
@@ -429,11 +434,14 @@ pub(crate) fn catalog() -> Catalog {
                 RelationKind::Table,
                 vec![column("id", "bigint"), column("labels", "text[]")],
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(relations)
+        .collect(),
     );
     catalog.full = true;
     catalog.set_system_functions(include_str!("test_builtin_functions.txt").lines());
-    catalog.add_functions(functions());
+    catalog.add_functions(functions().into_iter().chain(extra_functions).collect());
     catalog.add_operators(vec![
         Operator {
             schema: "public".into(),
@@ -1310,18 +1318,101 @@ fn test_ddl() {
 
 /// The test catalog with a second `archive`, in schema `other`.
 fn catalog_with_other_archive() -> Catalog {
-    let mut relations: Vec<Relation> = catalog().relations().cloned().collect();
-    relations.push(Relation::new(
-        "other",
-        "archive",
-        RelationKind::Table,
-        vec![column("id", "bigint")],
+    catalog_with(
+        vec![Relation::new(
+            "other",
+            "archive",
+            RelationKind::Table,
+            vec![column("id", "bigint")],
+        )],
+        vec![],
+    )
+}
+
+/// Postgres may resolve an unqualified name with another search_path than
+/// the session's: PgDog misses some changes to it, and pooled connections
+/// carry them over to other clients. So namesakes in other schemas must read
+/// the same, or the name must be qualified.
+#[test]
+fn test_namesakes_in_other_schemas() {
+    let in_schema = |mut relation: Relation, schema: &str| {
+        relation.schema = schema.into();
+        relation
+    };
+    let base = catalog();
+    let users = base.get("public", "users").unwrap().clone();
+    let orders_v = view(
+        "orders",
+        &["id", "user_id", "total"],
+        " SELECT users.id, users.id AS user_id, users.ssn AS total FROM public.users;",
+    );
+    let mut other_last4 = functions()[0].clone();
+    other_last4.oid = 100;
+    other_last4.schema = "other".into();
+    other_last4.source = "SELECT ssn FROM public.users WHERE name = value".into();
+    let accounts = |schema: &str| {
+        Relation::new(
+            schema,
+            "accounts",
+            RelationKind::Table,
+            vec![column("id", "bigint"), column("token", "text")],
+        )
+    };
+    let catalog = catalog_with(
+        vec![
+            // Same columns, masked the same way: policies without a schema.
+            in_schema(users, "tenant"),
+            Relation::new(
+                "other",
+                "archive",
+                RelationKind::Table,
+                vec![column("id", "bigint")],
+            ),
+            in_schema(orders_v, "other"),
+            accounts("public"),
+            accounts("secret"),
+        ],
+        vec![other_last4],
+    );
+    let config = format!(
+        "{CONFIG}\n[[masked_columns]]\nschema = \"secret\"\nname = \"accounts\"\ncolumn = \"token\"\npolicy = \"ssn\"\n"
+    );
+    let analyze = |sql: &str| analyze_in(&catalog, &config, "anonymous", sql);
+
+    for sql in [
+        "SELECT ssn FROM archive",
+        "SELECT (SELECT ssn FROM archive LIMIT 1) FROM users",
+        "SELECT * FROM orders",
+        "UPDATE orders SET total = 1",
+        "SELECT token FROM accounts",
+        "COPY accounts TO STDOUT",
+    ] {
+        match analyze(sql) {
+            Outcome::Blocked { reason } => assert!(reason.contains("qualify"), "{sql}: {reason}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    match analyze("SELECT last4('x')") {
+        Outcome::Blocked { reason } => assert!(reason.contains("namesakes"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+
+    for sql in [
+        "SELECT ssn FROM public.archive",
+        "SELECT * FROM public.orders",
+        "SELECT token FROM public.accounts",
+        "SELECT public.last4('x')",
+    ] {
+        assert!(
+            matches!(analyze(sql), Outcome::Unchanged { .. }),
+            "{sql}: {:?}",
+            analyze(sql)
+        );
+    }
+    assert!(matches!(
+        analyze("SELECT ssn FROM users"),
+        Outcome::Rewritten { sql, .. } if sql.contains("'XXX-XX-'")
     ));
-    let mut other = Catalog::new(vec!["$user".into(), "public".into()], relations);
-    other.full = true;
-    other.set_system_functions(include_str!("test_builtin_functions.txt").lines());
-    other.add_functions(functions());
-    other
 }
 
 /// Postgres resolves names to temporary relations first, and the plugin
@@ -1614,72 +1705,69 @@ fn test_merge_anywhere() {
 
 #[test]
 fn test_search_path_change() {
+    // Statements after DDL that may change name resolution are blocked in
+    // the same query.
+    for later in [
+        "SELECT ssn FROM users",
+        "SELECT * FROM orders",
+        "TABLE orders",
+        "SELECT last4('x')",
+        // Bodies resolve names with the new path, even if the call is qualified.
+        "SELECT public.count_users()",
+        // Postgres analyzes prepared statements again with the new path.
+        "EXECUTE p(1)",
+        "EXPLAIN EXECUTE p(1)",
+        "SELECT 'a' === 'b'",
+        "COPY orders TO STDOUT",
+        "TRUNCATE orders",
+        "CREATE TABLE t (id int)",
+        "ALTER TABLE orders ADD COLUMN x int",
+        "SELECT ssn FROM user_ssns",
+    ] {
+        for first in [
+            "ALTER TABLE archive ADD COLUMN note text",
+            "DROP TABLE archive",
+            "CREATE TABLE t2 AS SELECT 1",
+            "SELECT set_config('role', 'x', false)",
+        ] {
+            let sql = format!("{first}; {later}");
+            let blocked = blocked("anonymous", &sql);
+            assert!(blocked.contains("name resolution"), "{sql}: {blocked}");
+        }
+    }
+
+    // PgDog only follows a change of search_path or the role sent as a
+    // query of its own, starting with the command.
+    for sql in [
+        "SET search_path TO other; SELECT ssn FROM users",
+        "SET search_path TO other; SELECT 1",
+        "SELECT ssn FROM users; SET search_path TO other",
+        "SELECT id FROM orders; SET search_path TO other",
+        "SET LOCAL search_path TO other; SELECT 1 FROM orders",
+        "SET \"Search_Path\" TO other; SELECT 1 FROM orders",
+        "SET SCHEMA 'other'; SELECT 1 FROM orders",
+        "RESET search_path; SELECT 1",
+        "SET ROLE someone; TABLE orders",
+        "SET SESSION AUTHORIZATION someone; SELECT 1",
+        "DISCARD ALL; SELECT * FROM orders",
+        "RESET ALL; SELECT * FROM orders",
+        "SELECT 1; RESET ALL",
+        "BEGIN; SET LOCAL search_path TO other; COMMIT",
+        "; SET search_path TO other",
+        "/* hint */ SET search_path TO other",
+        "-- hint\nSET search_path TO other",
+    ] {
+        let blocked = blocked("anonymous", sql);
+        assert!(blocked.contains("query of their own"), "{sql}: {blocked}");
+    }
+    let padded = format!("{}SET search_path TO other", " ".repeat(1200));
+    assert!(blocked("anonymous", &padded).contains("query of their own"));
+
     for (sql, reason) in [
-        (
-            "SET search_path TO other; SELECT ssn FROM users",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO public; SELECT ssn FROM users",
-            "name resolution",
-        ),
+        ("SELECT reroute()", "changes name resolution"),
         (
             "SELECT set_config('search_path', 'other', false); SELECT id FROM orders",
             "set_config",
-        ),
-        (
-            "SELECT set_config('search_path', 'public', false); SELECT ssn FROM users",
-            "set_config",
-        ),
-        ("DISCARD ALL; SELECT * FROM orders", "name resolution"),
-        ("RESET ALL; SELECT * FROM orders", "name resolution"),
-        (
-            "SET LOCAL search_path TO other; SELECT 1 FROM orders",
-            "name resolution",
-        ),
-        (
-            "SET \"Search_Path\" TO other; SELECT 1 FROM orders",
-            "name resolution",
-        ),
-        (
-            "SET SCHEMA 'other'; SELECT 1 FROM orders",
-            "name resolution",
-        ),
-        ("SET ROLE someone; TABLE orders", "name resolution"),
-        (
-            "SET search_path TO other; SELECT last4('x')",
-            "name resolution",
-        ),
-        // Bodies resolve names with the new path, even if the call is qualified.
-        (
-            "SET search_path TO other; SELECT public.count_users()",
-            "name resolution",
-        ),
-        // Postgres analyzes prepared statements again with the new path.
-        ("SET search_path TO other; EXECUTE p(1)", "name resolution"),
-        (
-            "SET search_path TO other; EXPLAIN EXECUTE p(1)",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO other; SELECT 'a' === 'b'",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO other; COPY orders TO STDOUT",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO other; CREATE TABLE t (id int)",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO other; ALTER TABLE orders ADD COLUMN x int",
-            "name resolution",
-        ),
-        (
-            "SET search_path TO other; SELECT ssn FROM user_ssns",
-            "name resolution",
         ),
         (
             "SELECT set_config('search_path', 'other', false) FROM orders",
@@ -1694,23 +1782,6 @@ fn test_search_path_change() {
             "SELECT * FROM set_config('search_path', 'x', false)",
             "set_config",
         ),
-        (
-            "SELECT set_config('role', 'x', false); SELECT id FROM orders",
-            "name resolution",
-        ),
-        (
-            "DROP TABLE archive; SELECT ssn FROM users",
-            "name resolution",
-        ),
-        (
-            "ALTER TABLE archive ADD COLUMN note text; SELECT ssn FROM users",
-            "name resolution",
-        ),
-        (
-            "CREATE TABLE t AS SELECT 1; SELECT id FROM orders",
-            "name resolution",
-        ),
-        ("SELECT reroute()", "changes name resolution"),
         // PgDog doesn't follow it while its query parser is off.
         (
             "SELECT set_config('search_path', 'other', false)",
@@ -1726,20 +1797,23 @@ fn test_search_path_change() {
     }
 
     for sql in [
-        "RESET search_path; SELECT 1",
-        "SET search_path TO other; SELECT 1",
-        "SET ROLE someone; SELECT now()",
+        "SET search_path TO other",
+        "  set LOCAL search_path TO other",
+        "RESET search_path",
+        "SET ROLE someone",
+        "RESET ALL",
+        "DISCARD ALL",
         "SELECT set_config('app.tenant', '42', false)",
         "SELECT set_config('app.tenant', '42', false); SELECT id FROM orders",
         "CREATE TABLE t2 (id int); SELECT 1",
         "SET statement_timeout TO 1000; SELECT id FROM orders",
-        "SELECT id FROM orders; SET search_path TO other",
+        "DISCARD TEMP; SELECT id FROM orders",
     ] {
         unchanged("anonymous", sql);
     }
 
     for sql in [
-        "SELECT ssn FROM users; SET search_path TO other",
+        "SET statement_timeout TO 1000; SELECT ssn FROM users",
         "BEGIN; SELECT ssn FROM users; COMMIT",
     ] {
         assert!(rewritten("anonymous", sql).contains("'XXX-XX-'"), "{sql}");

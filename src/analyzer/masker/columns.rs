@@ -11,7 +11,9 @@ use pg_raw_parse::{
     transform::{self, Assignable, Transform},
 };
 
-use super::{DerivedPolicy, MaskTarget, Masker, OutputRef, TargetKind, address, fields, ident};
+use super::{
+    DerivedPolicy, MaskTarget, Masker, OutputRef, TargetKind, Verdict, address, fields, ident,
+};
 use crate::analyzer::Context;
 use crate::analyzer::scope::{
     ItemKind, Resolution, ResolvedColumn, WholeRowOf, find_item, resolve, resolve_column,
@@ -20,6 +22,10 @@ use crate::analyzer::shape::is_placeholder;
 use crate::analyzer::taint::Taint;
 use crate::catalog::Relation;
 use crate::mask::{SearchOp, VALUE, castable};
+
+/// A column's policy and argument columns, and the masked policies it's
+/// computed from.
+type ColumnMasking<'c> = (Option<(usize, &'c [String])>, Vec<usize>);
 
 /// Raw searches of a mask without a SQL part.
 static NO_RAW_SEARCH: LazyLock<HashSet<SearchOp>> = LazyLock::new(HashSet::new);
@@ -85,6 +91,39 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     .derived(schema, name, &column.name)
                     .is_some_and(|policies| policies.iter().any(|p| masks[*p].is_masked()))
         })
+    }
+
+    /// How a relation column is masked for this user: its policy and the
+    /// columns bound to its arguments, and the masked policies it's computed
+    /// from.
+    fn column_masking(&self, relation: &Relation, column: &str) -> ColumnMasking<'c> {
+        let (assignments, masks) = (self.ctx.assignments, &self.ctx.profile.masks);
+        let (schema, name) = (&relation.schema, &relation.name);
+        let policy = assignments
+            .column(schema, name, column)
+            .filter(|assignment| masks[assignment.policy].is_masked())
+            .map(|assignment| (assignment.policy, assignment.arguments.as_slice()));
+        let derived = assignments
+            .derived(schema, name, column)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|policy| masks[*policy].is_masked())
+            .collect();
+        (policy, derived)
+    }
+
+    /// Does reading `b` instead of `a` read the same columns, masked the
+    /// same way, for this user? Views read as they are (`Safe`) only.
+    pub(super) fn reads_like(&mut self, a: &'c Relation, b: &'c Relation) -> bool {
+        std::ptr::eq(a, b)
+            || (a.columns.len() == b.columns.len()
+                && a.columns.iter().zip(&b.columns).all(|(x, y)| {
+                    x.name == y.name
+                        && self.column_masking(a, &x.name) == self.column_masking(b, &y.name)
+                })
+                && self.view_verdict(a) == Verdict::Safe
+                && self.view_verdict(b) == Verdict::Safe)
     }
 
     pub(super) fn is_masked_relation(&self, relation: &Relation) -> bool {

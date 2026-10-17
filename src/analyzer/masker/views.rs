@@ -88,10 +88,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if schema.is_none() && find_cte(&self.frames, name).is_some() {
             return None;
         }
-        let relation = self
-            .ctx
-            .catalog
-            .resolve(schema, name, &self.ctx.search_path)?;
+        let relation = self.resolve_relation(schema, name)?;
         if relation.kind != RelationKind::View || self.view_verdict(relation) != Verdict::Inline {
             return None;
         }
@@ -138,11 +135,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let Some(name) = range_var.relname() else {
             return;
         };
-        let Some(relation) =
-            self.ctx
-                .catalog
-                .resolve(range_var.schemaname(), name, &self.ctx.search_path)
-        else {
+        let Some(relation) = self.resolve_relation(range_var.schemaname(), name) else {
             return;
         };
         if !matches!(

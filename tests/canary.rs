@@ -2400,11 +2400,16 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     (
         "S13",
         "SELECT ssn FROM users; SET search_path TO masking_canary_proxy",
-        Expect::Runs,
+        Expect::Blocked,
     ),
     (
         "S14",
         "SET search_path TO masking_canary_proxy; SELECT 1",
+        Expect::Blocked,
+    ),
+    (
+        "S14",
+        "SET search_path TO masking_canary_proxy",
         Expect::Runs,
     ),
     ("S15", "SELECT 1;; SELECT ssn FROM users", Expect::Runs),
