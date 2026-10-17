@@ -235,6 +235,15 @@ pub(crate) fn catalog() -> Catalog {
         " SELECT users.ssn, count(*) AS n FROM public.users GROUP BY users.ssn;",
     );
     counts.kind = RelationKind::MaterializedView;
+    // A boolean computed from a masked column, in a view that isn't inlined.
+    let mut flags = relation(
+        "ssn_flags",
+        RelationKind::MaterializedView,
+        vec![column("id", "bigint"), column("starts_9", "boolean")],
+    );
+    flags.definition = Some(
+        " SELECT users.id, ((users.ssn)::text ~~ '9%'::text) AS starts_9 FROM public.users;".into(),
+    );
 
     let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
@@ -273,6 +282,7 @@ pub(crate) fn catalog() -> Catalog {
             ),
             barrier,
             counts,
+            flags,
         ],
     );
     catalog.full = true;
@@ -715,6 +725,25 @@ fn test_views_as_tables() {
     assert!(blocked("anonymous", "SELECT loud FROM ssn_barrier").contains("computed from masked"));
     blocked("anonymous", "SELECT * FROM ssn_barrier");
     unchanged("admin", "SELECT loud FROM ssn_barrier");
+
+    // Derived columns are blocked as whole conditions too: filtering on them
+    // reads the masked values they're computed from.
+    for sql in [
+        "SELECT id FROM ssn_flags WHERE starts_9",
+        "SELECT id FROM ssn_flags f WHERE (f.starts_9)",
+        "SELECT count(*) FROM ssn_flags GROUP BY starts_9 HAVING starts_9",
+        "DELETE FROM orders USING ssn_flags f WHERE f.starts_9",
+        "UPDATE orders SET total = 0 FROM ssn_flags f WHERE f.starts_9",
+        "SELECT id FROM ssn_barrier WHERE loud",
+        "SELECT id FROM ssn_flags WHERE starts_9 = true",
+    ] {
+        assert!(
+            blocked("anonymous", sql).contains("computed from masked"),
+            "{sql}"
+        );
+    }
+    unchanged("admin", "SELECT id FROM ssn_flags WHERE starts_9");
+    unchanged("anonymous", "SELECT id FROM users WHERE opted_in");
 
     // Materialized views hold their own data.
     let sql = rewritten("anonymous", "SELECT ssn, n FROM ssn_counts");

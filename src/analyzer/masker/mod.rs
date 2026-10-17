@@ -54,6 +54,8 @@ const MAX_DEPTH: usize = 16;
 /// set through the field's setter instead.
 macro_rules! clause {
     ($masker:expr, $node:expr, $get:ident, $get_mut:ident, $set:ident) => {{
+        // The root isn't visited by `transform_node`, only its children.
+        $masker.guard_bare($node.$get());
         match $masker.root_replacement($node.$get()) {
             Some(mut replacement) => {
                 $masker.mask_replacement(&mut replacement);
@@ -519,17 +521,47 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         Some(expr)
     }
 
-    /// Masked columns used directly as a condition can't be replaced in place.
+    /// Masked columns used directly as a clause, e.g. `WHERE flag`, can't be
+    /// replaced in place. Columns computed from masked columns can't be
+    /// masked at all.
     fn guard_bare(&mut self, node: Node<'_>) {
         if let Node::ColumnRef(column) = node {
             let (names, star) = fields(column);
-            if !star && let Some(target) = self.column_target(&names) {
+            if star {
+                return;
+            }
+            if let Some(target) = self.column_target(&names) {
                 self.block(format!(
                     "masked column {} can't be used directly as a condition",
                     target.label
                 ));
+            } else {
+                self.guard_derived(&names);
             }
         }
+    }
+
+    /// Block a column computed from columns masked for this user, e.g. a
+    /// column of a materialized view. Returns whether it blocked.
+    fn guard_derived(&mut self, names: &[&str]) -> bool {
+        if let Some(resolved) = resolve_column(&self.frames, names)
+            && let Some(policies) = self.ctx.assignments.derived(
+                &resolved.relation.schema,
+                &resolved.relation.name,
+                resolved.column,
+            )
+            && policies
+                .iter()
+                .any(|policy| self.ctx.profile.masks[*policy].is_masked())
+        {
+            self.block(format!(
+                "column {}.{} is computed from masked columns and can't be masked; assign it a policy",
+                resolved.relation.qualified_name(),
+                resolved.column
+            ));
+            return true;
+        }
+        false
     }
 
     /// Record raw-search references in a comparison.
@@ -809,21 +841,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             };
         }
 
-        if let Some(resolved) = resolve_column(&self.frames, &names)
-            && let Some(policies) = self.ctx.assignments.derived(
-                &resolved.relation.schema,
-                &resolved.relation.name,
-                resolved.column,
-            )
-            && policies
-                .iter()
-                .any(|policy| self.ctx.profile.masks[*policy].is_masked())
-        {
-            self.block(format!(
-                "column {}.{} is computed from masked columns and can't be masked; assign it a policy",
-                resolved.relation.qualified_name(),
-                resolved.column
-            ));
+        if self.guard_derived(&names) {
             return None;
         }
 
@@ -1299,7 +1317,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             masker.transform_res_target_list(node.target_list_mut());
             masker.transform_list(node.distinct_clause_mut());
 
-            masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
                 clause!(
                     masker,
@@ -1311,7 +1328,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             });
 
             masker.transform_list(node.group_clause_mut());
-            masker.guard_bare(node.having_clause());
             clause!(
                 masker,
                 node,
@@ -1321,8 +1337,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             );
             masker.transform_list(node.window_clause_mut());
             masker.transform_sort_by_list(node.sort_clause_mut());
-            masker.guard_bare(node.limit_offset());
-            masker.guard_bare(node.limit_count());
             clause!(
                 masker,
                 node,
@@ -1368,7 +1382,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             masker.add_target(node.relation());
             masker.transform_from_list(node.from_clause_mut());
             masker.transform_res_target_list(node.target_list_mut());
-            masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
                 clause!(
                     masker,
@@ -1389,7 +1402,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             }
             masker.add_target(node.relation());
             masker.transform_from_list(node.using_clause_mut());
-            masker.guard_bare(node.where_clause());
             masker.with_predicate(true, |masker| {
                 clause!(
                     masker,
