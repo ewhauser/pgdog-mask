@@ -31,6 +31,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let key = (relation.schema.clone(), relation.name.clone());
         if let Some(info) = self.memo.borrow().views.get(&key).cloned() {
             self.touched |= info.touched;
+            self.state.writes |= info.redacts;
             return info.verdict;
         }
 
@@ -60,6 +61,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
         self.memo.borrow_mut().views.insert(key, info.clone());
         self.touched |= info.touched;
+        // A view calling a function that writes.
+        self.state.writes |= info.redacts;
         info.verdict
     }
 

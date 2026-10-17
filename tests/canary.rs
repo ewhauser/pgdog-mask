@@ -1046,7 +1046,49 @@ async fn setup_proxy(client: &Client) {
                 AS $$ BEGIN RETURN 'x'; END $$;
              CREATE OPERATOR === (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = same);
              CREATE OPERATOR @@@ (LEFTARG = BIGINT, RIGHTARG = BIGINT, FUNCTION = ssn_eq);
-             CREATE OPERATOR ~~~ (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = noisy_eq);"
+             CREATE OPERATOR ~~~ (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = noisy_eq);
+
+             -- Tables without proxy-masked columns whose triggers, checks
+             -- and defaults raise proxy-masked values in MESSAGE.
+             CREATE TABLE audit_log (id BIGINT, target BIGINT);
+             CREATE FUNCTION audit_log_raise() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                RAISE EXCEPTION 'audit for %: %', NEW.target, (SELECT ssn FROM users WHERE id = NEW.target);
+             END $$;
+             CREATE TRIGGER audit_log_raise BEFORE INSERT ON audit_log
+                FOR EACH ROW EXECUTE FUNCTION audit_log_raise();
+             CREATE FUNCTION check_target(t BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+             BEGIN
+                RAISE EXCEPTION 'check saw %', (SELECT ssn FROM users WHERE id = t);
+             END $$;
+             CREATE TABLE checked (id BIGINT, target BIGINT CHECK (check_target(target)));
+             CREATE FUNCTION default_ssn() RETURNS TEXT LANGUAGE plpgsql AS $$
+             BEGIN
+                RAISE EXCEPTION 'default saw %', (SELECT ssn FROM users WHERE id = 2);
+             END $$;
+             CREATE TABLE defaulted (id BIGINT, x TEXT DEFAULT default_ssn());
+             CREATE TABLE notes (id BIGINT);
+             INSERT INTO notes VALUES (1), (2);
+             CREATE FUNCTION notes_gone() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                RAISE NOTICE 'note gone for %', (SELECT ssn FROM users WHERE id = OLD.id);
+                RETURN OLD;
+             END $$;
+             CREATE TRIGGER notes_gone AFTER DELETE ON notes
+                FOR EACH ROW EXECUTE FUNCTION notes_gone();
+             -- Fires at COMMIT.
+             CREATE FUNCTION deferred_ssn() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                RAISE EXCEPTION 'deferred saw %', NEW.ssn;
+             END $$;
+             CREATE CONSTRAINT TRIGGER deferred_ssn AFTER UPDATE OF name ON users
+                DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+                WHEN (NEW.name = 'deferred') EXECUTE FUNCTION deferred_ssn();
+             -- A function and views writing users, whose trigger raises ssn.
+             CREATE FUNCTION bump_name(uid BIGINT) RETURNS BIGINT LANGUAGE sql
+                AS $$ UPDATE users SET name = name WHERE id = uid RETURNING id $$;
+             CREATE VIEW bump_v AS SELECT bump_name(1) AS b;
+             CREATE VIEW user_names_v AS SELECT id, name FROM users;"
         ))
         .await
         .expect("setup");
@@ -2589,6 +2631,45 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         "BEGIN; UPDATE users SET name = name WHERE id = 1; ROLLBACK",
         Expect::Runs,
     ),
+    // So do triggers, checks and defaults of other tables, and writes in
+    // function and view bodies or through views.
+    (
+        "K21",
+        "INSERT INTO audit_log VALUES (1, 2)",
+        Expect::Fails("P0001"),
+    ),
+    (
+        "K21",
+        "INSERT INTO audit_log SELECT 1, id FROM users WHERE name = 'bob'",
+        Expect::Fails("P0001"),
+    ),
+    (
+        "K21",
+        "INSERT INTO checked VALUES (1, 2)",
+        Expect::Fails("P0001"),
+    ),
+    (
+        "K21",
+        "INSERT INTO defaulted (id) VALUES (1)",
+        Expect::Fails("P0001"),
+    ),
+    (
+        "K21",
+        "BEGIN; DELETE FROM notes WHERE id = 2; ROLLBACK",
+        Expect::Runs,
+    ),
+    (
+        "K21",
+        "BEGIN; UPDATE users SET name = 'deferred' WHERE id = 2; COMMIT",
+        Expect::Fails("P0001"),
+    ),
+    ("P24", "BEGIN; SELECT bump_name(1); ROLLBACK", Expect::Runs),
+    ("P24", "BEGIN; SELECT * FROM bump_v; ROLLBACK", Expect::Runs),
+    (
+        "Q16",
+        "BEGIN; UPDATE user_names_v SET name = name WHERE id = 1; ROLLBACK",
+        Expect::Runs,
+    ),
 ];
 
 /// Write the proxy mask's key to a file, and the config reading it.
@@ -2651,7 +2732,26 @@ async fn test_no_canary_leaks_proxy() {
         .map(|(sql, _)| ("", *sql, Expect::NoLeak))
         .chain(PROXY_CORPUS.iter().copied())
         .collect();
-    let failures = check_corpus(&conn, &ctx, &corpus).await;
+    let mut failures = check_corpus(&conn, &ctx, &corpus).await;
+
+    // A deferred trigger fires at COMMIT, sent as a query of its own.
+    for sql in ["BEGIN", "UPDATE users SET name = 'deferred' WHERE id = 2"] {
+        conn.client.batch_execute(sql).await.expect(sql);
+    }
+    let Outcome::Unchanged { results, .. } = analyze("COMMIT", &ctx) else {
+        panic!("COMMIT is sent as it is");
+    };
+    let view = View::Masked {
+        results: &results,
+        proxies: &policies.proxies,
+    };
+    let out = run(&conn, "COMMIT", view).await;
+    let text = match &out {
+        Ok(out) | Err(out) => out,
+    };
+    if leaked(text).is_some() || !text.contains(STATEMENT_REDACTED) {
+        failures.push(format!("COMMIT\n  got: {text}"));
+    }
 
     conn.client
         .batch_execute(&format!("DROP SCHEMA {PROXY_SCHEMA} CASCADE"))

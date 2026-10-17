@@ -27,9 +27,11 @@ pub(super) struct StatementState {
     pub reads_proxies: bool,
     /// Names a relation with proxy-masked columns.
     pub touches_proxies: bool,
-    /// Writes or maintains a relation with proxy-masked columns: triggers,
-    /// constraints and policies see real values.
-    pub writes_proxies: bool,
+    /// Writes, maintains, alters or commits, or runs a function or view body
+    /// that does: triggers, constraints, defaults, rules, policies and index
+    /// expressions run on real values, of any relation, and may quote them
+    /// in messages.
+    pub writes: bool,
     /// Join of every non-Clean taint used other than as a whole output column.
     pub computes: Taint,
     /// A sink that received `Unknown`: blocks if the statement turns out to be
@@ -556,7 +558,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
 
         self.results.redact_errors |= !computes.is_clean()
-            || state.writes_proxies
+            || (state.writes && self.ctx.profile.proxies)
             || (state.runs_earlier && self.ctx.profile.proxies);
         self.reads_proxies |= state.reads_proxies;
         // Only the statements after it resolve names differently.

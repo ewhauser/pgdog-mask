@@ -259,6 +259,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.note(Taint::Computed, false);
             self.state.reads_proxies = true;
         }
+        // Its triggers and constraints run on real values.
+        if candidates
+            .iter()
+            .any(|function| self.body_info(function, |info| info.redacts))
+        {
+            self.state.writes = true;
+        }
         if let Some(function) = candidates
             .iter()
             .find(|function| self.folds_proxies(function))
@@ -471,12 +478,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let active = format!("function {}", function.oid);
 
         let info = if self.function_allowlisted(function) {
-            BodyInfo {
-                verdict: Verdict::Safe,
-                touched: false,
-                reads_proxies: false,
-                folds_proxies: false,
-            }
+            BodyInfo::TRUSTED
         } else if self.memo.borrow().active.contains(&active) {
             BodyInfo::blocked(format!("function {label}() is recursive"))
         } else if function.kind != "function" {

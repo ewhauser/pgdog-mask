@@ -150,15 +150,25 @@ struct BodyInfo {
     /// Calls an IMMUTABLE function that reads proxy-masked columns, which
     /// the planner may run in advance.
     folds_proxies: bool,
+    /// Its errors need redaction: it writes, or computes on values of
+    /// proxy-masked columns.
+    redacts: bool,
 }
 
 impl BodyInfo {
+    /// A body used as it is, without analysis.
+    const TRUSTED: Self = Self {
+        verdict: Verdict::Safe,
+        touched: false,
+        reads_proxies: false,
+        folds_proxies: false,
+        redacts: false,
+    };
+
     fn blocked(reason: impl Into<String>) -> Self {
         Self {
             verdict: Verdict::Blocked(reason.into()),
-            touched: false,
-            reads_proxies: false,
-            folds_proxies: false,
+            ..Self::TRUSTED
         }
     }
 }
@@ -429,6 +439,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             touched: nested.touched,
             reads_proxies: nested.reads_proxies,
             folds_proxies: nested.folds_proxies,
+            redacts: nested.results.redact_errors,
         }
     }
 
@@ -477,6 +488,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             // `set_config('role', ...)` calls also set it, in `call_target`.
             changes_resolution: rules::changes_resolution(node),
             stores_expressions: rules::stores_expressions(node),
+            writes: rules::writes(node),
             returns_rows: super::returns_rows(node),
             select_into: matches!(query, Node::SelectStmt(select) if rules::into_clause(select).is_some()),
             ..StatementState::default()
@@ -729,18 +741,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Add a DML target relation to the current frame. Returns its item's
-    /// position.
+    /// position. A write anywhere in the statement (a data-modifying CTE, a
+    /// function body), to any relation, runs triggers and constraints.
     fn add_target(&mut self, relation: Option<&nodes::RangeVar>) -> Option<usize> {
         let range_var = relation?;
+        self.state.writes = true;
         self.check_view_write(range_var);
         let position = self.frames.last()?.items.len();
         self.add_range_var(range_var);
-        let item = self.frames.last()?.items.get(position)?;
-        if let ItemKind::Relation { relation, .. } = item.kind
-            && self.has_proxy_masks(relation)
-        {
-            self.state.writes_proxies = true;
-        }
         Some(position)
     }
 

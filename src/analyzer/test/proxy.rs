@@ -1314,7 +1314,7 @@ fn returning() -> Vec<Case> {
         case(
             "J13",
             "UPDATE orders SET total = 0 WHERE id = 1 RETURNING id",
-            allow(),
+            Same(vec![], true),
         ),
     ]
 }
@@ -1420,7 +1420,31 @@ fn writes() -> Vec<Case> {
             "UPDATE users SET (name, opted_in) = (SELECT ssn, true FROM users_2024 LIMIT 1)",
             Block("UPDATE"),
         ),
-        case("K21", "INSERT INTO audit DEFAULT VALUES", allow()),
+        // Triggers, constraints and defaults of any table may read
+        // proxy-masked columns and quote them in messages.
+        case(
+            "K21",
+            "INSERT INTO audit DEFAULT VALUES",
+            Same(vec![], true),
+        ),
+        case(
+            "K21",
+            "INSERT INTO audit VALUES (1, 'x')",
+            Same(vec![], true),
+        ),
+        case(
+            "K21",
+            "INSERT INTO audit SELECT id, name FROM users WHERE name = 'bob'",
+            Same(vec![], true),
+        ),
+        case("K21", "DELETE FROM orders WHERE id = 2", Same(vec![], true)),
+        case("K21", "COPY audit FROM STDIN", Same(vec![], true)),
+        // Deferred constraint triggers fire at COMMIT.
+        case("K21", "COMMIT", Same(vec![], true)),
+        case("K21", "END", Same(vec![], true)),
+        case("K21", "PREPARE TRANSACTION 'x'", Same(vec![], true)),
+        case("K21", "BEGIN", allow()),
+        case("K21", "ROLLBACK", allow()),
         // The subscript is part of the SET target.
         case(
             "K22",
@@ -1809,6 +1833,23 @@ fn functions() -> Vec<Case> {
         ),
         case("P21", "SELECT * FROM ssns()", Block("can't place masks")),
         case("P22", "SELECT count_users()", allow()),
+        // A body that writes runs triggers and constraints on real values.
+        case("P24", "SELECT bump_name(1)", Same(vec![], true)),
+        case(
+            "P24",
+            "SELECT bump_name(id) FROM orders",
+            Same(vec![], true),
+        ),
+        case("P24", "SELECT * FROM bump_name(1)", Same(vec![], true)),
+        case("P24", "SELECT wrap_bump(1)", Same(vec![], true)),
+        case("P24", "SELECT wipe_users()", Same(vec![], true)),
+        case("P24", "SELECT * FROM bump_v", Same(vec![], true)),
+        case("P24", "SELECT b FROM bump_v", Same(vec![], true)),
+        case(
+            "P24",
+            "SELECT id FROM orders WHERE bump_name(id) > 0",
+            Same(vec![], true),
+        ),
     ]
 }
 
@@ -1949,7 +1990,35 @@ fn views() -> Vec<Case> {
             Block("only be read in a FROM list"),
         ),
         // Table-like: masked by lineage.
-        case("Q15", "SELECT ssn FROM user_ssns", Same(vec![pt(0)], false)).config(tables),
+        case("Q15", "SELECT ssn FROM user_ssns", Same(vec![pt(0)], false)).config(tables.clone()),
+        // A write through a view writes its relations, and runs their
+        // triggers and constraints.
+        case(
+            "Q16",
+            "UPDATE user_names_v SET name = $1 WHERE id = $2",
+            Same(vec![], true),
+        ),
+        case(
+            "Q16",
+            "DELETE FROM user_names_v WHERE id = $1",
+            Same(vec![], true),
+        ),
+        case(
+            "Q16",
+            "INSERT INTO user_names_v (id, name) VALUES (1, 'x')",
+            Same(vec![], true),
+        ),
+        case(
+            "Q16",
+            "WITH w AS (DELETE FROM user_names_v WHERE id = $1 RETURNING id) SELECT id FROM w",
+            Same(vec![], true),
+        ),
+        case(
+            "Q16",
+            "UPDATE user_names_v SET name = 'x' WHERE id = 1",
+            Same(vec![], true),
+        )
+        .config(tables),
     ]
 }
 
@@ -2011,7 +2080,7 @@ fn explain() -> Vec<Case> {
         case(
             "R11",
             "EXPLAIN INSERT INTO audit (note) SELECT ssn FROM users",
-            allow(),
+            Same(vec![], true),
         ),
         case(
             "R11+",
@@ -2100,7 +2169,7 @@ fn multi_statement() -> Vec<Case> {
         case(
             "S2",
             "BEGIN; SELECT id, ssn FROM users WHERE id = 1; COMMIT",
-            Same(vec![at(1, p(1))], false),
+            Same(vec![at(1, p(1))], true),
         ),
         case(
             "S3",
@@ -2390,10 +2459,15 @@ fn existing_blocks() -> Vec<Case> {
             "CREATE INDEX ON audit ((public.user_ssn(id)))",
             Block(DDL),
         ),
-        case("W13", "CREATE TABLE t (x text DEFAULT 'a')", allow()),
-        // Maintains a proxy relation.
+        // DDL and maintenance of any relation run event triggers, CHECK and
+        // index expression functions, which may read proxy-masked columns.
+        case(
+            "W13",
+            "CREATE TABLE t (x text DEFAULT 'a')",
+            Same(vec![], true),
+        ),
         case("W14", "VACUUM ANALYZE users", Same(vec![], true)),
-        case("W16", "ANALYZE orders", allow()),
+        case("W16", "ANALYZE orders", Same(vec![], true)),
     ];
     cases.extend(
         ["LOCK TABLE users", "TRUNCATE users", "VACUUM"]

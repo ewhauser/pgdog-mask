@@ -16,24 +16,16 @@ const STALE_CATALOG: &str = "names would resolve differently in Postgres than in
 const EXECUTE_UNKNOWN: &str = "EXECUTE of a statement prepared outside this query can't be checked for masked users; send the PREPARE in the same query";
 
 impl<'c, 'mem> Masker<'c, 'mem> {
-    /// TRUNCATE, VACUUM, ANALYZE and LOCK of relations with proxy-masked
-    /// columns run their triggers and index expressions on real values.
+    /// TRUNCATE, VACUUM, ANALYZE and LOCK: the relations they name.
     pub(super) fn check_maintenance(&mut self, node: Node<'_>) {
         let range_vars: Vec<&nodes::RangeVar> = match node {
             Node::TruncateStmt(truncate) => range_vars(truncate.relations()),
             Node::LockStmt(lock) => range_vars(lock.relations()),
-            Node::VacuumStmt(vacuum) => {
-                let relations: Vec<_> = vacuum
-                    .rels()
-                    .iter()
-                    .filter_map(|relation| relation.relation())
-                    .collect();
-                // Without a list, every table: those with proxy masks too.
-                if relations.is_empty() && self.ctx.profile.proxies {
-                    self.state.writes_proxies = true;
-                }
-                relations
-            }
+            Node::VacuumStmt(vacuum) => vacuum
+                .rels()
+                .iter()
+                .filter_map(|relation| relation.relation())
+                .collect(),
             _ => return,
         };
         // Postgres resolves the names with the new path.
@@ -44,7 +36,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         for range_var in range_vars {
             if self.resolves_to_proxy_relation(range_var) {
                 self.state.touches_proxies = true;
-                self.state.writes_proxies = true;
             }
         }
     }
@@ -243,13 +234,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return;
         }
         if node.is_from {
-            // Triggers and constraints of the table see real values.
             if node
                 .relation()
                 .is_some_and(|range_var| self.resolves_to_proxy_relation(range_var))
             {
                 self.state.touches_proxies = true;
-                self.state.writes_proxies = true;
             }
             return;
         }

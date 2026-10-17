@@ -1,7 +1,7 @@
 //! Fail-closed rules for masked users.
 use pg_raw_parse::{
     Node, nodes,
-    raw::{DiscardMode, SetOperation, VariableSetKind},
+    raw::{DiscardMode, SetOperation, TransactionStmtKind, VariableSetKind},
 };
 
 /// Built-in functions that run SQL or read data out of band.
@@ -308,6 +308,37 @@ pub(super) fn temporary(range_var: &nodes::RangeVar) -> bool {
             let schema = schema.to_ascii_lowercase();
             schema == "pg_temp" || schema.starts_with("pg_temp_")
         })
+}
+
+/// Does a statement write, maintain, alter or commit? Triggers, constraints,
+/// defaults, rules, policies, index expressions and event triggers it runs
+/// see real values, and may quote them in messages: deferred constraint
+/// triggers fire at COMMIT. Everything else only reads.
+pub(super) fn writes(node: Node<'_>) -> bool {
+    match node {
+        Node::ExplainStmt(explain) => explain_executes(explain) && writes(explain.query()),
+        Node::SelectStmt(select) => into_clause(select).is_some(),
+        Node::CopyStmt(copy) => copy.is_from,
+        Node::TransactionStmt(transaction) => matches!(
+            transaction.kind,
+            TransactionStmtKind::TRANS_STMT_COMMIT
+                | TransactionStmtKind::TRANS_STMT_PREPARE
+                | TransactionStmtKind::TRANS_STMT_COMMIT_PREPARED
+        ),
+        Node::VariableShowStmt(_)
+        | Node::VariableSetStmt(_)
+        | Node::DeclareCursorStmt(_)
+        | Node::FetchStmt(_)
+        | Node::ClosePortalStmt(_)
+        | Node::DeallocateStmt(_)
+        | Node::ListenStmt(_)
+        | Node::UnlistenStmt(_)
+        | Node::NotifyStmt(_)
+        | Node::DiscardStmt(_)
+        | Node::PrepareStmt(_)
+        | Node::ExecuteStmt(_) => false,
+        _ => true,
+    }
 }
 
 /// DDL whose expressions are stored, or evaluated over rows: defaults,

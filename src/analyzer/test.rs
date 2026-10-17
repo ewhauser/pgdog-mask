@@ -315,6 +315,28 @@ pub(crate) fn functions() -> Vec<Function> {
             "text",
             "SELECT public.imm_ssn(uid)",
         ),
+        // Write a table whose triggers may quote proxy-masked values.
+        sql_function(
+            27,
+            "bump_name",
+            &[("uid", "bigint")],
+            "bigint",
+            "UPDATE public.users SET name = 'x' WHERE id = uid RETURNING id",
+        ),
+        sql_function(
+            28,
+            "wrap_bump",
+            &[("uid", "bigint")],
+            "bigint",
+            "SELECT public.bump_name(uid)",
+        ),
+        sql_function(
+            29,
+            "wipe_users",
+            &[],
+            "integer",
+            "TRUNCATE public.users; SELECT 1",
+        ),
     ]
 }
 
@@ -433,6 +455,11 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
                 "tags",
                 RelationKind::Table,
                 vec![column("id", "bigint"), column("labels", "text[]")],
+            ),
+            view(
+                "bump_v",
+                &["b"],
+                " SELECT public.bump_name((1)::bigint) AS b;",
             ),
         ]
         .into_iter()
