@@ -601,7 +601,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     kind: kind.clone(),
                     qualified_only: true,
                     pending: None,
-                    function: false,
+                    unknown_width: false,
                 });
             }
         }
@@ -782,6 +782,91 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         taint
     }
 
+    /// `(...) AS j (cols)`: the join's `items` of this level are only
+    /// reachable through `j`. Its columns are the merged ones, then each
+    /// item's others, renamed by `cols`. Positions are unknown when merged
+    /// columns may come first in an order this can't tell (`reordered`: a
+    /// NATURAL join, or a merging join inside), or when a merged name may be
+    /// an item's column whose name isn't certain.
+    fn alias_join(
+        &mut self,
+        items: std::ops::Range<usize>,
+        refname: String,
+        aliases: &[String],
+        using: &[String],
+        reordered: bool,
+    ) {
+        let Some(inner) = self
+            .frames
+            .last()
+            .and_then(|frame| frame.items.get(items.clone()))
+        else {
+            return;
+        };
+        let inner: Vec<&Item<'c>> = inner.iter().filter(|item| !item.qualified_only).collect();
+        let uncertain = !using.is_empty()
+            && inner.iter().any(|item| {
+                matches!(&item.kind, ItemKind::Derived(outputs)
+                    if outputs.rest.is_some() || outputs.columns.iter().any(|c| c.name.is_none()))
+            });
+        let mut outputs = Outputs::default();
+        if reordered || uncertain {
+            let bound = inner
+                .iter()
+                .map(|item| match &item.kind {
+                    ItemKind::Relation { .. } => Taint::Clean,
+                    ItemKind::Derived(outputs) => outputs.bound(),
+                })
+                .fold(Taint::Clean, Taint::union);
+            outputs.open(bound);
+        } else {
+            for name in using {
+                outputs.push(OutputColumn {
+                    name: Some(name.clone()),
+                    taint: self.merged_taint(items.clone(), std::slice::from_ref(name), false),
+                });
+            }
+            let merged = |name: &Option<String>| name.as_ref().is_some_and(|n| using.contains(n));
+            for item in &inner {
+                match &item.kind {
+                    ItemKind::Relation { names, .. } => {
+                        for name in names.iter().map(|name| Some(name.clone())) {
+                            if !merged(&name) {
+                                outputs.push(OutputColumn {
+                                    name,
+                                    taint: Taint::Clean,
+                                });
+                            }
+                        }
+                    }
+                    ItemKind::Derived(derived) => {
+                        for column in &derived.columns {
+                            if !merged(&column.name) {
+                                outputs.push(column.clone());
+                            }
+                        }
+                        if let Some(rest) = derived.rest {
+                            outputs.open(rest);
+                        }
+                    }
+                }
+            }
+        }
+        // Catalog relations' and functions' widths can't be trusted for `j.*`.
+        let unknown_width = inner
+            .iter()
+            .any(|item| item.unknown_width || matches!(item.kind, ItemKind::Relation { .. }));
+        let pending = inner.iter().find_map(|item| item.pending.clone());
+
+        let mut item = Item::derived(refname, outputs.renamed(aliases));
+        item.unknown_width = unknown_width;
+        item.pending = pending;
+        if let Some(frame) = self.frames.last_mut() {
+            frame.items.truncate(items.start);
+            frame.items.push(item);
+        }
+    }
+
     /// Push an item for a table function (XMLTABLE, JSON_TABLE) whose columns
     /// are defined in the call: names, and whether they're FOR ORDINALITY.
     /// Every other column is computed from the arguments.
@@ -950,7 +1035,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                         rest: Some(taint),
                     },
                 );
-                item.function = true;
+                item.unknown_width = true;
                 if let Some(frame) = self.frames.last_mut() {
                     frame.items.push(item);
                 }
@@ -1073,17 +1158,33 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     }
 
     fn transform_join_expr<'mutref>(&mut self, mut node: nodes::JoinExprMut<'mem, 'mutref>) {
-        let merging = node.is_natural || !node.using_clause().is_empty();
-        let aliased = node.alias().is_some() || node.join_using_alias().is_some();
+        let natural = node.is_natural;
         let using: Vec<String> = node
             .using_clause()
             .iter()
             .filter_map(|name| name.sval().map(str::to_owned))
             .collect();
-        let natural = node.is_natural;
+        let merging = natural || !using.is_empty();
+        // `(...) AS j (cols)` hides the join's items behind `j`. `USING (...)
+        // AS x` adds `x`, which names only the merged columns.
+        let alias = node.alias().map(|alias| {
+            (
+                alias.aliasname().unwrap_or("").to_owned(),
+                names(alias.colnames()),
+            )
+        });
+        let using_alias = node
+            .join_using_alias()
+            .and_then(|alias| alias.aliasname())
+            .map(str::to_owned);
         let before = self.frames.last().map_or(0, |frame| frame.items.len());
+        let outer_merging = self
+            .frames
+            .last_mut()
+            .is_some_and(|frame| std::mem::take(&mut frame.merging_join));
         child!(self, node, larg_mut, set_larg);
         child!(self, node, rarg_mut, set_rarg);
+        let nested_merging = self.frames.last().is_some_and(|frame| frame.merging_join);
 
         // The ON clause only sees the join's own items, and outer query levels.
         let after = self.frames.last().map_or(0, |frame| frame.items.len());
@@ -1094,20 +1195,47 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         self.with_predicate(true, |masker| child!(masker, node, quals_mut, set_quals));
         if let Some(frame) = self.frames.last_mut() {
             frame.visible = saved.flatten();
-            frame.merging_join |= merging;
+            // An alias keeps the merged columns, and their order, inside it.
+            frame.merging_join = outer_merging || (alias.is_none() && (nested_merging || merging));
         }
 
         // Merged columns compare, and combine, both sides' values.
         let merged = self.merged_taint(before..after, &using, natural);
         self.note(merged, false);
 
-        if aliased
-            && let Some(frame) = self.frames.last()
+        if alias.is_none() && using_alias.is_none() {
+            return;
+        }
+        if let Some(frame) = self.frames.last()
             && frame.items[before.min(frame.items.len())..]
                 .iter()
                 .any(|item| self.item_is_masked(item))
         {
             self.block("aliased joins over masked columns are not supported");
+            return;
+        }
+        if let Some(refname) = using_alias {
+            let mut outputs = Outputs::default();
+            for name in &using {
+                outputs.push(OutputColumn {
+                    name: Some(name.clone()),
+                    taint: self.merged_taint(before..after, std::slice::from_ref(name), false),
+                });
+            }
+            let mut item = Item::derived(refname, outputs);
+            item.qualified_only = true;
+            if let Some(frame) = self.frames.last_mut() {
+                frame.items.push(item);
+            }
+        }
+        if let Some((refname, aliases)) = alias {
+            self.alias_join(
+                before..after,
+                refname,
+                &aliases,
+                &using,
+                natural || nested_merging,
+            );
         }
     }
 

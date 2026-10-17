@@ -786,6 +786,99 @@ fn values_lateral_joins() -> Vec<Case> {
             Same(vec![n(0)], false),
         )
         .config(unresolved),
+        // An aliased join hides its items behind the alias, whose column list
+        // renames its columns by position.
+        case(
+            "E18",
+            "SELECT l.v FROM orders o2, LATERAL (SELECT total AS v FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total)) l",
+            Same(vec![p(0)], false),
+        ),
+        case(
+            "E18",
+            "SELECT x.* FROM orders o2, LATERAL (SELECT total FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total)) x",
+            Same(vec![p(0)], false),
+        ),
+        case(
+            "E18",
+            "SELECT (SELECT total FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total) LIMIT 1) FROM orders",
+            Same(vec![n(0)], true),
+        ),
+        // `u` inside the join is hidden: u.ssn is the outer users'.
+        case(
+            "E19",
+            "SELECT l.v FROM users u, LATERAL (SELECT u.ssn AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+            Same(vec![p(0)], false),
+        ),
+        case(
+            "E19",
+            "SELECT (SELECT u.ssn FROM (orders u CROSS JOIN orders o) AS j LIMIT 1) FROM users u",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "E19",
+            "SELECT (SELECT u.ssn FROM (orders u JOIN orders o ON true) AS j LIMIT 1) FROM users u",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "E19",
+            "SELECT l.v FROM users u, LATERAL (SELECT u.email AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+            Rewritten(vec!["repeat("], vec![], false),
+        ),
+        case(
+            "E19",
+            "SELECT l.v FROM users u, LATERAL (SELECT u.ssn AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+            Rewritten(vec!["NULL::varchar AS v"], vec![], false),
+        )
+        .user("analyst"),
+        case(
+            "E20",
+            "SELECT l.v FROM (SELECT ssn FROM users) s, LATERAL (SELECT s.ssn AS v FROM ((SELECT 'clean'::varchar AS ssn) s CROSS JOIN orders o) AS j) l",
+            Same(vec![p(0)], false),
+        ),
+        // USING (...) AS x names the merged columns; it hides nothing.
+        case(
+            "E21",
+            "SELECT l.v FROM (SELECT 'c'::varchar AS ssn) x, LATERAL (SELECT x.ssn AS v FROM (SELECT ssn FROM users) a JOIN (SELECT ssn FROM users) b USING (ssn) AS x) l",
+            Same(vec![p(0)], true),
+        ),
+        case(
+            "E22",
+            "SELECT j.x FROM ((SELECT ssn AS x FROM users) s JOIN orders o ON true) AS j",
+            Same(vec![p(0)], false),
+        ),
+        // `*` over an aliased join of catalog relations: `j.*`, whose width
+        // the catalog can't be trusted for.
+        case(
+            "E23",
+            "SELECT * FROM (orders a JOIN orders b ON true) j, users u",
+            Block("unknown width"),
+        ),
+        case(
+            "E23",
+            "SELECT j.*, upper(u.ssn) FROM (orders a JOIN orders b ON true) j, users u",
+            Block("unknown width"),
+        ),
+        case(
+            "E23",
+            "SELECT * FROM ((SELECT ssn AS x FROM users) s JOIN orders o ON true) AS j",
+            Block("unknown width"),
+        ),
+        case(
+            "E23",
+            "SELECT 1 WHERE EXISTS (SELECT * FROM (orders a JOIN orders b ON true) j)",
+            allow(),
+        ),
+        case(
+            "E23",
+            "SELECT * FROM (SELECT * FROM (orders a JOIN orders b ON true) j) s",
+            allow(),
+        ),
+        case(
+            "E23",
+            "SELECT * FROM (orders a JOIN orders b ON true) j, users u",
+            Rewritten(vec!["SELECT j.*, u.id AS id"], vec![], false),
+        )
+        .user("analyst"),
     ]
 }
 

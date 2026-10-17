@@ -18,7 +18,7 @@ use crate::analyzer::{ResultColumn, ResultMask};
 use crate::catalog::Relation;
 
 /// Why a statement whose result columns can't be told apart is blocked.
-const CANT_PLACE: &str = "can't place masks on the results: a * of unknown width (a function, a catalog relation, (row).* or a join with USING/NATURAL) precedes or covers columns computed from proxy-masked columns; list the columns";
+const CANT_PLACE: &str = "can't place masks on the results: a * of unknown width (a function, a catalog relation, an aliased join over one, (row).* or a join with USING/NATURAL) precedes or covers columns computed from proxy-masked columns; list the columns";
 
 /// What the statement being analyzed does with proxy-masked columns.
 #[derive(Debug, Default)]
@@ -276,7 +276,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 refname,
                 taint: Taint::Clean,
             },
-            ItemKind::Derived(outputs) if item.function => Part::Unknown {
+            ItemKind::Derived(outputs) if item.unknown_width => Part::Unknown {
                 refname,
                 taint: outputs.bound(),
             },

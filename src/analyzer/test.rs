@@ -1440,6 +1440,29 @@ fn test_scope_join_on() {
     assert_eq!(sql.matches("'XXX-XX-'").count(), 1, "{sql}");
 }
 
+/// An aliased join hides its items behind the alias: Postgres reads `u.ssn`
+/// below from the outer `users`.
+#[test]
+fn test_scope_aliased_join() {
+    for sql in [
+        "SELECT l.v FROM users u, LATERAL (SELECT u.ssn AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        "SELECT (SELECT u.ssn FROM (orders u CROSS JOIN orders o) AS j LIMIT 1) FROM users u",
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM (orders u CROSS JOIN orders o) AS j WHERE u.ssn LIKE 'x%')",
+    ] {
+        assert!(rewritten("anonymous", sql).contains("'XXX-XX-'"), "{sql}");
+    }
+    // `*` covers it as `j.*`: `a` and `b` aren't visible.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT * FROM (orders a JOIN orders b ON true) j, users u",
+    );
+    assert!(sql.starts_with("SELECT j.*, u.id AS id"), "{sql}");
+    unchanged(
+        "anonymous",
+        "SELECT j.total FROM (orders a CROSS JOIN (SELECT 1 AS k) b) AS j",
+    );
+}
+
 #[test]
 fn test_scope_update_from_subquery() {
     // The subquery resolves its own FROM; the target is invisible to it.

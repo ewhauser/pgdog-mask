@@ -634,6 +634,27 @@ const CORPUS: &[(&str, Expect)] = &[
         "SELECT (SELECT email FROM contacts LIMIT 1) FROM users",
         Expect::Runs,
     ),
+    // An aliased join hides its items: u.ssn is the outer users'.
+    (
+        "SELECT l.v FROM users u, LATERAL (SELECT u.ssn AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "SELECT (SELECT u.ssn FROM (orders u CROSS JOIN orders o) AS j LIMIT 1) FROM users u",
+        Expect::Runs,
+    ),
+    (
+        "SELECT l.v FROM users u, LATERAL (SELECT u.email AS v FROM (orders u JOIN orders o ON true) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "SELECT l.v FROM users u, LATERAL (SELECT u.salary AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "SELECT * FROM (orders a JOIN orders b ON true) j, users u",
+        Expect::Runs,
+    ),
     (
         "SELECT x.email FROM users u, LATERAL (SELECT email FROM contacts) x",
         Expect::Runs,
@@ -773,6 +794,8 @@ async fn test_no_canary_leaks() {
         "SELECT id FROM user_ssns WHERE ssn LIKE 'CANARY%'",
         "SELECT id FROM users WHERE get_ssn(id) LIKE 'CANARY%'",
         "SELECT id FROM users WHERE id === 'CANARYSSN-1111'",
+        // `u` inside the aliased join is hidden: u.ssn is the outer users'.
+        "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM (orders u CROSS JOIN orders o) AS j WHERE u.ssn LIKE 'CANARY%')",
     ] {
         let outcome = analyze(sql, &ctx);
         let Outcome::Rewritten { sql: rewritten, .. } = outcome else {
@@ -1382,6 +1405,76 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     (
         "E16",
         "SELECT c.relname, u.ssn FROM pg_class c, users u",
+        Expect::Runs,
+    ),
+    (
+        "E18",
+        "SELECT l.v FROM orders o2, LATERAL (SELECT total AS v FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total)) l",
+        Expect::Runs,
+    ),
+    (
+        "E18",
+        "SELECT x.* FROM orders o2, LATERAL (SELECT total FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total)) x",
+        Expect::Runs,
+    ),
+    (
+        "E18",
+        "SELECT (SELECT total FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total) LIMIT 1) FROM orders",
+        Expect::Runs,
+    ),
+    (
+        "E19",
+        "SELECT l.v FROM users u, LATERAL (SELECT u.ssn AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "E19",
+        "SELECT (SELECT u.ssn FROM (orders u CROSS JOIN orders o) AS j LIMIT 1) FROM users u",
+        Expect::Runs,
+    ),
+    (
+        "E19",
+        "SELECT l.v FROM users u, LATERAL (SELECT u.email AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "E19",
+        "SELECT l.v FROM users u, LATERAL (SELECT u.salary AS v FROM (orders u CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "E20",
+        "SELECT l.v FROM (SELECT ssn FROM users) s, LATERAL (SELECT s.ssn AS v FROM ((SELECT 'clean'::varchar AS ssn) s CROSS JOIN orders o) AS j) l",
+        Expect::Runs,
+    ),
+    (
+        "E20",
+        "SELECT (SELECT s.ssn FROM ((SELECT 'clean'::varchar AS ssn) s CROSS JOIN orders o) AS j LIMIT 1) FROM (SELECT ssn FROM users) s",
+        Expect::Runs,
+    ),
+    (
+        "E21",
+        "SELECT l.v FROM (SELECT 'c'::varchar AS ssn) x, LATERAL (SELECT x.ssn AS v FROM (SELECT ssn FROM users) a JOIN (SELECT ssn FROM users) b USING (ssn) AS x) l",
+        Expect::Runs,
+    ),
+    (
+        "E22",
+        "SELECT j.x FROM ((SELECT ssn AS x FROM users) s JOIN orders o ON true) AS j",
+        Expect::Runs,
+    ),
+    (
+        "E23",
+        "SELECT * FROM (orders a JOIN orders b ON true) j, users u",
+        Expect::Blocked,
+    ),
+    (
+        "E23",
+        "SELECT 1 WHERE EXISTS (SELECT * FROM (orders a JOIN orders b ON true) j)",
+        Expect::Runs,
+    ),
+    (
+        "E23",
+        "SELECT * FROM (SELECT * FROM (orders a JOIN orders b ON true) j) s",
         Expect::Runs,
     ),
     // Grouping, DISTINCT, ordering.

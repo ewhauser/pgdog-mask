@@ -23,9 +23,10 @@ pub(super) struct Item<'c> {
     /// The recursive CTE this item reads while that CTE is still being
     /// analyzed.
     pub pending: Option<String>,
-    /// A function in FROM: `*` over it has unknown width, even when its
-    /// column names are known.
-    pub function: bool,
+    /// `*` over it has unknown width, even when its column names are known:
+    /// a function in FROM, whose result type can change, or an aliased join
+    /// over catalog relations, whose catalog may be stale.
+    pub unknown_width: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +61,7 @@ impl<'c> Item<'c> {
             kind: ItemKind::Relation { relation, names },
             qualified_only: false,
             pending: None,
-            function: false,
+            unknown_width: false,
         }
     }
 
@@ -70,7 +71,7 @@ impl<'c> Item<'c> {
             kind: ItemKind::Derived(outputs),
             qualified_only: false,
             pending: None,
-            function: false,
+            unknown_width: false,
         }
     }
 
