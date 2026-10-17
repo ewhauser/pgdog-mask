@@ -176,6 +176,43 @@ pub(super) fn check_statement(node: Node<'_>) -> Result<(), String> {
     }
 }
 
+/// Can the deparser print this statement? Its COPY printer reads option
+/// arguments without checking them, and crashes the process on a missing or
+/// mistyped one, e.g. `COPY t TO STDOUT WITH (delimiter)`. Postgres rejects
+/// those options anyway. The deparser prints rewritten statements, and
+/// normalized ones in logs.
+pub(crate) fn deparsable(node: Node<'_>) -> bool {
+    let Node::CopyStmt(copy) = node else {
+        return true;
+    };
+    let strings = |list: &pg_raw_parse::list::NodeList| {
+        list.iter().all(|node| matches!(node, Node::String(_)))
+    };
+    copy.options().iter().all(|option| {
+        let arg = option.arg();
+        match option.defname() {
+            None => false,
+            Some("format") => matches!(arg.as_str(), Some("binary" | "csv" | "text")),
+            Some("delimiter" | "null" | "quote" | "escape" | "encoding") => {
+                matches!(arg, Node::String(_))
+            }
+            Some("force_quote" | "force_not_null" | "force_null") => match arg {
+                Node::A_Star(_) => true,
+                Node::NodeList(columns) => strings(columns),
+                _ => false,
+            },
+            Some("freeze" | "header") => matches!(
+                arg,
+                Node::None | Node::String(_) | Node::Integer(_) | Node::Boolean(_)
+            ),
+            Some(_) => match arg {
+                Node::NodeList(values) => strings(values),
+                _ => true,
+            },
+        }
+    })
+}
+
 /// Does an EXPLAIN run its statement? `ANALYZE` with no value, or any value
 /// but a clearly false one, runs it. Postgres rejects values other than
 /// true, false, on, off, 1 and 0.

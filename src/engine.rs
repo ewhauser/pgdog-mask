@@ -13,7 +13,7 @@ use pgdog_plugin::{
 };
 use tracing::{Level, debug, enabled, error, info, warn};
 
-use crate::analyzer::{self, Context, Outcome, ResultMask, analyze, shape};
+use crate::analyzer::{self, Context, Outcome, ResultMask, analyze, deparsable, shape};
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies, Profile, ProxyInstance};
@@ -811,6 +811,12 @@ fn normalized(sql: &str) -> String {
     if sql.is_empty() {
         return String::new();
     }
+    // Normalizing deparses the statement, which some invalid ones crash.
+    match pg_raw_parse::parse(sql) {
+        Ok(parsed) if parsed.iter().all(|stmt| deparsable(stmt.stmt())) => (),
+        Ok(_) => return "<statement with invalid COPY options>".to_owned(),
+        Err(_) => return "<statement could not be parsed>".to_owned(),
+    }
     match pg_raw_parse::normalize::normalize_str(sql) {
         Ok(normalized) => normalized.as_str().to_owned(),
         Err(_) => "<statement could not be parsed>".to_owned(),
@@ -908,6 +914,35 @@ mod test {
         assert!(!logged.contains("123-45-6789"), "{logged}");
         assert!(!logged.contains("42"), "{logged}");
         assert!(logged.contains("ssn = $1"), "{logged}");
+    }
+
+    /// Decisions are logged with the statement normalized, which deparses
+    /// it: COPY options the deparser can't print would crash the process.
+    #[test]
+    fn test_invalid_copy_options_never_deparsed() {
+        let statements = [
+            "COPY users TO STDOUT WITH (delimiter)",
+            "COPY orders FROM STDIN WITH (delimiter)",
+            "COPY orders TO '/tmp/x' WITH (format)",
+            "SELECT ssn FROM users; COPY orders TO STDOUT WITH (null)",
+        ];
+        for sql in statements {
+            assert_eq!(normalized(sql), "<statement with invalid COPY options>");
+        }
+
+        let shadow = CONFIG.replacen("[general]", "[general]\nmode = \"shadow\"", 1);
+        let proxy = || engine_with(PROXY_CONFIG, proxy_registry(), catalog());
+        for (engine, user, denied) in [
+            (engine(CONFIG), "anonymous", true),
+            (engine(CONFIG), "bob", true),
+            (engine(&shadow), "anonymous", false),
+            (proxy(), "engineer", true),
+        ] {
+            for sql in statements {
+                let verdict = engine.statement(&session(user), sql);
+                assert_eq!(matches!(verdict, Verdict::Deny(_)), denied, "{user}: {sql}");
+            }
+        }
     }
 
     #[test]

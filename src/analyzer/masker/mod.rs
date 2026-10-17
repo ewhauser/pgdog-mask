@@ -486,6 +486,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.block(reason);
             return;
         }
+        if !rules::deparsable(node) {
+            self.block("a COPY option is missing its value or has one of the wrong type");
+            return;
+        }
         self.check_shadowing(node);
         self.check_ddl(node);
         self.check_maintenance(node);

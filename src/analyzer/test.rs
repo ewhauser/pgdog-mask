@@ -743,6 +743,50 @@ fn test_copy() {
     blocked("anonymous", "COPY users TO '/tmp/users.csv'");
 }
 
+/// COPY options the deparser can't print would crash the process, whether
+/// the statement is rewritten or only logged. Postgres rejects them anyway.
+#[test]
+fn test_copy_options_deparser_can_print() {
+    for sql in [
+        "COPY users TO STDOUT WITH (FORMAT)",
+        "COPY users TO STDOUT WITH (format 1)",
+        "COPY users TO STDOUT WITH (format *)",
+        "COPY users TO STDOUT WITH (delimiter)",
+        "COPY users TO STDOUT WITH (delimiter 1)",
+        "COPY users TO STDOUT WITH (delimiter (a))",
+        "COPY users TO STDOUT WITH (null)",
+        "COPY users TO STDOUT WITH (quote 1)",
+        "COPY users TO STDOUT WITH (escape)",
+        "COPY users TO STDOUT WITH (encoding 1)",
+        "COPY users TO STDOUT WITH (force_quote)",
+        "COPY users TO STDOUT WITH (format csv, force_not_null 1)",
+        "COPY users TO STDOUT WITH (force_null)",
+        "COPY users TO STDOUT (delimiter)",
+        "/* hint */ COPY users TO STDOUT WITH (delimiter)",
+        "COPY (SELECT ssn FROM users) TO STDOUT WITH (delimiter)",
+        // Unchanged statements are deparsed when another one is rewritten.
+        "SELECT ssn FROM users; COPY orders FROM STDIN WITH (delimiter)",
+        "COPY orders TO STDOUT WITH (null)",
+    ] {
+        for user in ["anonymous", "support"] {
+            let reason = blocked(user, sql);
+            assert!(reason.contains("COPY option"), "{sql}: {reason}");
+        }
+    }
+
+    // Valid options are kept.
+    let sql = rewritten(
+        "anonymous",
+        "COPY users TO STDOUT WITH (format csv, force_quote *, delimiter ',', null '', header)",
+    );
+    assert!(sql.contains("FORCE_QUOTE *"), "{sql}");
+    let sql = rewritten(
+        "anonymous",
+        "COPY users (id, ssn) TO STDOUT CSV FORCE QUOTE id",
+    );
+    assert!(sql.ends_with("TO STDOUT CSV FORCE QUOTE id"), "{sql}");
+}
+
 #[test]
 fn test_wrapped_statements() {
     for sql in [

@@ -15,6 +15,7 @@ use pg_raw_parse::{Node, make};
 use crate::catalog::Catalog;
 use crate::profile::{Assignments, Policies, Profile};
 use masker::Masker;
+pub(crate) use rules::deparsable;
 
 /// Everything the analyzer needs to know about the user and the database.
 pub struct Context<'a> {
