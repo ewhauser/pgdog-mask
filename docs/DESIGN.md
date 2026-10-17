@@ -2,7 +2,9 @@
 
 > This project ([pgdog-mask](../README.md)) is the plugin. The PgDog changes it needs (plugin API 0.7, §8) are on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog), branch `masking/plugin-api`. Paths like `pgdog/src/...` refer to that repository.
 
-Status: P1 and P2 implemented · Scope: `pgdog-plugin` API extensions + this plugin
+Status: P0, P1 and P3 implemented, P2 mostly (§14.2) · Scope: `pgdog-plugin` API extensions + this plugin
+
+> **This is a design record, not a reference.** It describes the plan the project started from, with notes on what was built ("As built"). Where the two differ, the [documentation](https://ewhauser.github.io/pgdog-mask/) describes current behavior. Features marked **not implemented** were planned and don't exist, in particular: the `pgdog-mask` CLI (`explain`, `validate`, `lint`), validating mask templates against a live database, and rejecting masked sharding keys or tenant columns.
 
 ## 1. Summary
 
@@ -51,7 +53,7 @@ A rewrite only has to resolve **leaf column references**. It does not have to tr
 
 Proxy-side work stays for two narrower jobs, each with its own typed hook:
 
-1. **Proxy-only masks** (column masks). Keyed HMAC, tokenization against a vault and FPE need a secret that must not appear in SQL text, where `pg_stat_statements`, logs and `EXPLAIN` would expose it. These masks are only allowed when the masked column appears as a plain passthrough in the top-level projection, cast to text. Any other reference to the same column still gets the policy's SQL fallback mask through the rewrite.
+1. **Proxy-only masks** (column masks). Keyed HMAC, tokenization against a vault and FPE need a secret that must not appear in SQL text, where `pg_stat_statements`, logs and `EXPLAIN` would expose it. These masks are only allowed when the masked column appears as a plain passthrough in the top-level projection. Any other reference to the same column still gets the policy's SQL fallback mask through the rewrite.
 2. **Error and notice redaction.** For example, a `CHECK` violation `DETAIL: Failing row contains (5, 123-45-6789, …)` exposes the stored values of other masked columns in the row. Redaction applies to every error and notice a masked user gets, not only those of statements touching masked relations: triggers and functions can raise errors about other tables.
 
 An earlier version of the API passed raw protocol messages to a generic transform hook. It was replaced (§8): plugins would have had to parse the wire protocol and manage handle lifetimes, and PgDog to expose them, for two jobs that need neither.
@@ -62,15 +64,15 @@ An earlier version of the API passed raw protocol messages to a generic transfor
 
 | Snowflake | PgDog masking |
 |---|---|
-| `CREATE MASKING POLICY p AS (val T) RETURNS T -> CASE WHEN CURRENT_ROLE() IN (...) THEN val ELSE ... END` | `[[policies]]` with ordered `cases` (role conditions) and a `default`. Conditions are evaluated in the proxy. Mask bodies are SQL expressions or built-ins. |
-| `ALTER TABLE … MODIFY COLUMN c SET MASKING POLICY p` | `[[columns]]` assignment |
-| Conditional masking (`USING (val, other_col)`) | `using = { name = "other_col" }` in the assignment. The extra column is referenced from the same range table entry. |
+| `CREATE MASKING POLICY p AS (val T) RETURNS T -> CASE WHEN CURRENT_ROLE() IN (...) THEN val ELSE ... END` | `[[policies]]` with a default `mask` and ordered `[[policies.rules]]` that pick a mask by masking role. Rules are evaluated in the proxy. Masks are SQL expressions, built-ins or proxy masks. |
+| `ALTER TABLE … MODIFY COLUMN c SET MASKING POLICY p` | `[[masked_columns]]` assignment |
+| Conditional masking (`USING (val, other_col)`) | `arguments` on the policy, bound to columns by `arguments` in each `[[masked_columns]]` assignment. The extra column is referenced from the same range table entry. |
 | Tag-based masking | `[[tags]]` → policy. Columns are tagged in TOML, by regex classifier, or in the database through column comments or security labels (§7.4) |
 | Searching a masked column | opt-in per rule: `search = "raw"` (§6.8). Snowflake has no equivalent |
 | Policy return type = input type | enforced at load time; masks are wrapped in an explicit cast to the column type |
 | Applies through views | views that reference masked columns are inlined with masking applied (§6.6) |
 | `CURRENT_ROLE()` / `IS_ROLE_IN_SESSION()` | masking roles resolved from PgDog's authenticated identity (§5) |
-| `SYSTEM$GET_TAG`, policy references views | `pgdog-mask explain` CLI + shadow-mode logs + admin stats |
+| `SYSTEM$GET_TAG`, policy references views | shadow-mode logs. A `pgdog-mask explain` CLI and admin stats were planned and are **not implemented** |
 
 The deliberate difference is how the condition is evaluated. Snowflake evaluates `CURRENT_ROLE()` inside SQL. PgDog evaluates role conditions **in the proxy at plan time** and constant-folds them. Unmasked identities therefore get the original SQL byte-for-byte, and masked identities get only the mask expression, never a `CASE` that includes the raw branch.
 
@@ -112,6 +114,8 @@ Why these two points:
 
 ### 4.1 Crate layout
 
+The planned layout. **As built**, pgdog-mask is a single crate with modules (§14.2), and the CLI is **not implemented**.
+
 ```
 
   masking-core/     # pure library: policy model, identity → profile, analyzer, rewriter, proxy masks.
@@ -137,6 +141,8 @@ Why these two points:
 
 The principle: a client-controlled value may make masking stricter, never weaker.
 
+**As built**, only the authenticated PgDog user and the database select masking roles (`[[users]]`). PgDog passes the other sources to the plugin in `Session` (§8.2), but the plugin doesn't use them: certificate, address and client-value conditions are **not implemented**.
+
 **Masking identity is fixed for the session and comes from the authenticated PgDog user. `SET ROLE` does not change it.** PgDog's tracked `role` parameter is not authenticated. `QueryEngine::set` (`query_engine/set.rs`) writes it into the `ParameterStore` before Postgres validates it. When no backend is connected, PgDog answers `SET` with a fake `CommandComplete` and never asks Postgres. In transaction pooling, the value is replayed onto server connections later. Deriving masking from it would let any client claim an exempt role.
 
 Masking roles are therefore a PgDog-level concept, just as Snowflake roles are Snowflake's and not the source system's. A workload that needs different masking connects as a different PgDog user. Several PgDog users can share one `server_user`, so this costs no extra Postgres roles. A fixed identity also removes a class of stale-plan bugs: SQL-level `PREPARE`, `WITH HOLD` cursors and protocol prepared statements can never outlive the profile they were rewritten for.
@@ -145,7 +151,7 @@ If role switching is ever needed, it should be validated against a `pg_auth_memb
 
 ### 5.2 Profiles
 
-At session start, and on policy or identity change, the plugin resolves the identity to masking roles (`[[identities]]` rules, §7). It then evaluates every policy's `cases` to produce a **profile**: a map `policy → selected mask`, which is `none` for exempt policies. The profile has a stable 64-bit hash (`profile_tag`).
+At session start, and on policy or identity change, the plugin resolves the identity to masking roles (`[[users]]`, §7). It then evaluates every policy's rules to produce a **profile**: a map `policy → selected mask`, which is `none` for exempt policies. The profile has a stable 64-bit hash (`profile_tag`).
 
 - A profile where every policy resolves to `none` is the **exempt fast path**: the hook returns `Continue` immediately.
 - Thousands of users typically collapse into a handful of profiles. Profiles are the cache discriminator for rewritten SQL. Prepared statements with the same rewrite share one server-side statement, so cache hit rates stay high.
@@ -202,15 +208,15 @@ The rewriter is a `pg_raw_parse::transform::Transform` implementation. It follow
 | Whole-row ref `t` (in `row_to_json(t)`, `t::text`, `SELECT t`, `to_jsonb(t.*)`) | `ROW(t.id, (<mask>)::text, …)::schema.table`; the composite cast keeps field names |
 | `COPY t TO …` / `COPY t (cols) TO …` | `COPY (SELECT <masked cols> FROM t) TO …` |
 | `COPY (query) TO …` | rewrite the inner query |
-| `INSERT … SELECT`, `CREATE TABLE AS`, `SELECT INTO`, `MERGE … USING` | rewrite the source query (masked data is written, as in Snowflake) |
+| `INSERT … SELECT`, `CREATE TABLE AS`, `SELECT INTO` | rewrite the source query (masked data is written, as in Snowflake). `MERGE` is blocked for masked users (§14.2) |
 | `UPDATE … SET a = <expr>`, `RETURNING`, `DELETE … RETURNING`, `ON CONFLICT DO UPDATE SET … = t.col` | rewrite expressions and `RETURNING`; **target** columns are untouched; `EXCLUDED.*` is the client's own input and is not masked |
 | `DECLARE c CURSOR FOR …`, SQL `PREPARE p AS …`, `EXPLAIN [ANALYZE] …` | rewrite the inner statement |
 | `GROUP BY`, `DISTINCT ON`, window `PARTITION BY`/`ORDER BY`, `ORDER BY` | rewrite consistently; identical rewritten expressions keep `GROUP BY` validity, including functional-dependency cases |
-| Conditional mask (`using`) | reference the `using` column through the same range alias as the masked column |
+| Conditional mask (`arguments`) | reference the argument columns through the same range alias as the masked column |
 
 Two implementation details:
 
-- **Mask expressions are ASTs, not strings.** Each policy's SQL body is parsed once at load time as `SELECT <expr>`. The placeholder `ColumnRef`s (`val` and the names in `using`) are recorded. At rewrite time the template is copied into the statement's arena and the placeholders are substituted with the reference node. There is no string concatenation, so there is no injection surface. Templates are validated against a live database at load (§7.3).
+- **Mask expressions are ASTs, not strings.** Each policy's SQL body is parsed once at load time as `SELECT <expr>`. The placeholder `ColumnRef`s (`val` and the policy's `arguments`) are recorded. At rewrite time the template is copied into the statement's arena and the placeholders are substituted with the reference node. There is no string concatenation, so there is no injection surface. Templates are parsed and checked at load (§7.3); validating them against a live database is **not implemented**.
 - **Deparse once.** The full statement list is deparsed with `pg_raw_parse::deparse_stmts`. Multi-statement simple queries are handled as a unit. That closes the bypass where PgDog sends multi-statement SQL as-is on a single shard and skips plugins (`parser/query/mod.rs:353`, `cache/ast.rs:83`).
 
 ### 6.4 Type and name preservation
@@ -225,7 +231,7 @@ A policy whose mask cannot produce the input type fails to load. Examples are a 
 
 ### 6.5 Fail-closed rules for restricted profiles
 
-These apply only to profiles that mask at least one column referenced by the statement's relations. Some rules, marked "always", apply to any non-exempt profile. Each rule is configurable in `[settings]`; the defaults are shown.
+These apply only to profiles that mask at least one column referenced by the statement's relations. Some rules, marked "always", apply to any non-exempt profile. The plan made each rule configurable. **As built**, only unresolvable relations are, with `on_unresolved` in `[general]`; the others always apply.
 
 | Situation | Default | Why |
 |---|---|---|
@@ -236,7 +242,7 @@ These apply only to profiles that mask at least one column referenced by the sta
 | `pg_stats`, `pg_statistic`, `pg_stat_statements` referencing masked tables | block | `most_common_vals` and query literals leak values |
 | `CREATE TEMP TABLE` shadowing a masked relation name | block | resolution ambiguity |
 | Replication commands (`START_REPLICATION`, `CREATE_REPLICATION_SLOT`), `COPY … TO PROGRAM/file` | block (always) | out-of-band data paths |
-| Masked column is a sharding key or multi-tenant column | rejected at policy load | masking would break routing and tenant isolation (§10) |
+| Masked column is a sharding key or multi-tenant column | planned: rejected at policy load. **Not implemented**: the plugin doesn't see PgDog's sharding configuration | masking would break routing and tenant isolation (§10) |
 
 A block returns `ErrorResponse` with SQLSTATE `42501` (insufficient_privilege) and a message naming the policy, but never the value.
 
@@ -289,7 +295,7 @@ As built in P2:
 - **Extensions.** Functions owned by an extension are user-defined functions in a non-SQL language, so they're blocked unless the extension is in `extension_allowlist` or the function is in `udf_allowlist`. The §6.5 denylist (`dblink*`, `query_to_xml`, …) applies even to allowlisted functions.
 - **Operators** outside `pg_catalog` that could match by name are treated as calls to their functions. Without operand types every same-named operator in the `search_path` is a candidate, so an extension operator such as `citext`'s `=` blocks every `=` for masked users until its extension is allowlisted.
 
-Trigger functions run server-side as a consequence of writes. For example, an audit trigger may copy a raw row into a table the restricted user can read. They are not analyzed. `pgdog-mask lint` flags tables written by triggers on masked tables that restricted users can `SELECT`.
+Trigger functions run server-side as a consequence of writes. For example, an audit trigger may copy a raw row into a table the restricted user can read. They are not analyzed. A `pgdog-mask lint` check for tables written by triggers on masked tables that restricted users can `SELECT` was planned and is **not implemented**.
 
 ### 6.8 Searching on masked columns (`search = "raw"`)
 
@@ -297,9 +303,9 @@ Some applications need masked users to *find* rows by a sensitive value while st
 
 **Semantics.** A reference to the column is left unmasked only when both conditions hold. Everywhere else it is masked as usual.
 
-1. **Position.** The reference is in a `WHERE` clause, or a `JOIN … ON/USING` qualification, of `SELECT`, `UPDATE`, `DELETE` or `MERGE`. This includes sublinks inside those clauses. Projections, `RETURNING`, `GROUP BY`, `HAVING`, `ORDER BY`, window clauses, and CTE or derived-table projections are never raw.
+1. **Position.** The reference is in a `WHERE` clause, or a `JOIN … ON/USING` qualification, of `SELECT`, `UPDATE` or `DELETE`. (`MERGE` is blocked for masked users.) This includes sublinks inside those clauses. Projections, `RETURNING`, `GROUP BY`, `HAVING`, `ORDER BY`, window clauses, and CTE or derived-table projections are never raw.
 2. **Shape.** The predicate is `col <op> operand`, where:
-   - `<op>` is in the rule's `search_operators`. The default is the equality family: `=`, `<>`, `IN`, `NOT IN`, `= ANY`, `IS [NOT] DISTINCT FROM`, `IS [NOT] NULL`.
+   - `<op>` is enabled by the rule's `search_operators`. The default is the equality family: `=`, `<>`/`!=`, `IN`, `NOT IN`, `= ANY`, `IS [NOT] DISTINCT FROM`, `IS [NOT] NULL`. Each `search_operators` value enables a family of operators, not a single one: `=` also enables `<>`, `<` enables every comparison and `BETWEEN`, and `like` enables `ILIKE` and the negated forms.
    - `operand` is a parameter, a constant, a list or array of those, or another column reference (a join key).
    - `col` may be wrapped in an allowlisted normalizer: `lower`, `upper`, `btrim`, `ltrim`, `rtrim`. The operand may be wrapped the same way.
 
@@ -310,9 +316,9 @@ Some applications need masked users to *find* rows by a sensitive value while st
 
 Casts, arithmetic, `CASE`, and arbitrary function calls around the column are therefore always masked.
 
-Range operators (`<`, `>`, `BETWEEN`) and pattern operators (`LIKE`, `ILIKE`, `~`) are available via `search_operators`, with a load-time warning. They turn the oracle into efficient extraction: binary search, or character-by-character prefix probing, recovers a value in a few dozen queries. Low-entropy columns such as dates of birth are brute-forceable even with equality alone. `lint` warns when `search = "raw"` is set on one.
+Range operators (`<`, `>`, `BETWEEN`) and pattern operators (`LIKE`, `ILIKE`) are available via `search_operators`. Regular-expression operators (`~`) aren't. They turn the oracle into efficient extraction: binary search, or character-by-character prefix probing, recovers a value in a few dozen queries. Low-entropy columns such as dates of birth are brute-forceable even with equality alone. The plan called for a load-time warning on range and pattern operators and a `lint` warning on low-entropy columns; both are **not implemented**.
 
-**Audit.** Every statement that uses a raw search emits an audit log line with the user, policy, column, and statement fingerprint. Parameter values are never logged.
+**Logging.** The plan called for an audit line for every statement that uses a raw search, with the user, policy, column, and statement fingerprint. **As built**, a raw search is logged at `info` with the user and the columns when the statement is analyzed; cached decisions, statements that differ only in literals, prepared statement executions and other users with the same profile don't log again (§12). It's not a complete audit. Parameter values are never logged.
 
 **Side benefit.** Raw predicates stay sargable, so indexes on the sensitive column keep working for these lookups (§9).
 
@@ -416,8 +422,9 @@ expression = "CASE WHEN opted_in THEN val ELSE NULL END"
 [[policies]]
 name = "customer_id_token"
 data_type = "text"
-mask = "hmac_sha256"          # proxy mask (§7.2)
-key_env = "PGDOG_MASK_KEY"
+mask = "proxy"                # proxy mask (§7.2)
+proxy = "hmac_sha256"
+options = { key_env = "PGDOG_MASK_KEY" }
 fallback = "null"             # SQL mask used everywhere except passthrough projections
 
 # Column assignments. Omitting `name` applies to every table in the schema
@@ -451,7 +458,7 @@ policy = "dob"
 name = "pii.email"
 policy = "email"
 
-# Auto-tagging by column name. Matches are reported by `pgdog-mask lint`.
+# Auto-tagging by column name.
 [[classifiers]]
 database = "prod"
 column_regex = "^(e_?mail|email_address)$"
@@ -465,12 +472,12 @@ All built-ins compile to SQL templates. `none` is the identity. Parameters are f
 | `mask` | Types | Keys | Expression (sketch) |
 |---|---|---|---|
 | `null` | any | | `NULL::T` |
-| `constant` | any | `value` | typed literal |
+| `constant` | any | `value` (a TOML string) | the string literal, cast to the column type |
 | `default` | any | | type-appropriate placeholder: `'****'`, `0`, `'1970-01-01'`, `false`, nil UUID, `'{}'::jsonb` |
 | `partial` | text | `keep_prefix`, `keep_suffix`, `fill` | `left(val,p) \|\| repeat(fill, greatest(length(val)-p-s,0)) \|\| right(val,s)` |
 | `email` | text | | `regexp_replace(val, '^[^@]*', '****')` |
-| `hash` | text, bytea | | `encode(sha256(convert_to(val,'UTF8')),'hex')`; unkeyed, so `lint` warns about dictionary attacks on low-entropy data |
-| `round` | numeric | `digits` | `round(val, digits)` |
+| `hash` | text, bytea | | `encode(sha256(convert_to(val,'UTF8')),'hex')`; unkeyed, so low-entropy values can be found by hashing guesses (a planned `lint` warning is **not implemented**) |
+| `round` | numeric | `digits` | `round(val::numeric, digits)` |
 | `truncate` | date, timestamp | `unit` | `date_trunc(unit, val)::T` |
 | `sql` | as declared | `expression` | user expression over `val` and `arguments` |
 | `proxy` | as the proxy mask accepts | `proxy`, `options`, `fallback` | computed in code on result rows (§7.2) |
@@ -500,11 +507,16 @@ Built-in: `hmac_sha256` (hex HMAC, options `key_env`/`key_file`, `length`) and `
 
 ### 7.3 Load-time validation
 
-1. TOML schema validation and policy/type compatibility.
-2. Every SQL template is parsed. Templates may reference only `val` and declared `arguments`, and may call only allowlisted (immutable or stable, built-in) functions.
-3. **Live validation**: each template is prepared against the database as `SELECT (<template>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, to catch type errors before traffic does. `pgdog-mask validate` runs the same check in CI.
-4. Assignments are checked against the catalog. A column that doesn't exist warns. Sharding keys and tenant columns are rejected.
-5. Rules with `search = "raw"` warn when they enable range or pattern operators, or when they target a low-entropy type (`date`, `boolean`, small enums).
+**As built**, the configuration is checked when it loads:
+
+1. TOML schema validation: unknown keys are errors, except inside a proxy mask's `options` table, which each mask reads itself. Policy/type compatibility is checked, and proxy masks are built from their options, so a missing key is an error.
+2. Every SQL template is parsed. Templates may reference only `val` and declared `arguments`, and can't contain subqueries. Function calls in templates aren't restricted.
+
+Planned and **not implemented**:
+
+- **Live validation**: preparing each template against the database as `SELECT (<template>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, to catch type errors before traffic does, and `pgdog-mask validate` to run the same check in CI. A template with a type error loads, and fails when a statement uses it.
+- Checking assignments against the catalog: warning about columns that don't exist, and rejecting sharding keys and tenant columns.
+- Warnings for rules with `search = "raw"` that enable range or pattern operators, or target a low-entropy type (`date`, `boolean`, small enums).
 
 If validation fails at startup, `config()` returns `false`. PgDog skips the plugin and, because the plugin is configured with `required = true`, **refuses to start** (§8.2). If validation fails on reload, the plugin keeps the last good policy set.
 
@@ -522,7 +534,7 @@ Policy logic never lives in the database. If it did, anyone with `ALTER` on a ta
 Column *tags* can live in the database, which has a real benefit. The migration that adds a PHI column can tag it in the same transaction, so tagging can't drift from the schema. This is how Snowflake's catalog-resident tags work. `tag_source` selects the source:
 
 - **`config`** (default): TOML only.
-- **`comment`**: tags are read from column comments using a reserved prefix, e.g. `COMMENT ON COLUMN users.ssn IS 'Social security number. pgdog:tag=pii.ssn'`. The prefix is parsed from anywhere in the comment, so existing documentation text is preserved. This works on every Postgres, including managed services. Some ORMs and migration tools rewrite comments, and `lint` flags tags that disappear between reloads.
+- **`comment`**: tags are read from column comments using a reserved prefix, e.g. `COMMENT ON COLUMN users.ssn IS 'Social security number. pgdog:tag=pii.ssn'`. The prefix is parsed from anywhere in the comment, so existing documentation text is preserved. This works on every Postgres, including managed services. Some ORMs and migration tools rewrite comments; the plugin logs a warning when a tag disappears.
 - **`security_label`**: tags are read from `pg_seclabels` for `security_label_provider`, via `SECURITY LABEL FOR pgdog ON COLUMN users.ssn IS 'pii.ssn'`. This is the semantically correct Postgres feature, but it **requires a label provider loaded through `shared_preload_libraries`**. Without one, vanilla Postgres rejects `SECURITY LABEL` outright. Many managed services don't allow custom providers; `postgresql_anonymizer` registers one where it is installed.
 
 Database tags are **additive only**. A TOML binding can't be removed or downgraded by the database. On each schema reload the plugin diffs database-sourced tags and logs removals at `warn`, because removing a tag unmasks a column.
@@ -530,7 +542,7 @@ Database tags are **additive only**. A TOML binding can't be removed or downgrad
 As built in P2:
 - **Precedence**: `[[masked_columns]]`, then database tags, then `[[classifiers]]`. Each later source only fills columns the earlier ones left unmasked.
 - **Comments** may carry several tags, repeated (`pgdog:tag=a pgdog:tag=b`) or comma-separated (`pgdog:tag=a,b`). **Security labels** are a tag or a comma-separated list. Labels from other providers are ignored.
-- A database tag with no `[[tags]]` entry can't be masked, since policies only live in TOML. It's logged at `warn` on every schema load.
+- A column whose database tags have no `[[tags]]` entry, or map to different policies, fails closed: it reads as `NULL` for masked users, and the plugin logs an error on every schema load.
 - **Classifiers** match `column_regex` against the whole column name, in tables, partitions and materialized views, optionally narrowed by `database`, `schema` and `name`. The regex is validated when the config loads.
 
 ---
@@ -545,7 +557,7 @@ The core patch is on `masking/plugin-api` as `pgdog-plugin` **0.7.0**. PgDog's [
 |---|---|---|
 | `ROUTE` | `route` | no |
 | `STATEMENT` | `statement(&Session, sql) -> Verdict`, `function_call(&Session, oid) -> Access`, `generation()` | yes |
-| `MASK` | `mask_rows(&MaskBatch, &mut MaskOutput)` | P3 (proxy masks) |
+| `MASK` | `mask_rows(&MaskBatch, &mut MaskOutput)` | yes (proxy masks, P3) |
 | `ERRORS` | `redact_error(&Session, &ErrorFields) -> Redaction` | yes |
 | `CATALOG` | `catalog_parts()`, `catalog(database, &Catalog)` | yes, all parts |
 
@@ -555,13 +567,13 @@ Only one loaded plugin can have `STATEMENT`. `required = true` in `[[plugins]]` 
 
 Hooks get a `Session`: the authenticated user and database, the verified TLS identity, and `search_path`. `application_name` and the client address are in `Session::client`, marked untrusted; the plugin doesn't use them.
 
-`statement` runs for every `Query` and `Parse`, before PgDog parses, rewrites or routes. It returns `Allow`, `Rewrite { sql, columns }` or `Deny`. Verdicts must be deterministic until `generation()` changes. PgDog relies on that for prepared statements: they're checked when prepared, and at `Bind` only if the generation or `search_path` changed, in which case PgDog re-prepares under the client's statement name if the SQL changed. The plugin bumps its generation when it loads new settings or receives a new catalog. A rewrite of a `Parse` must keep its highest `$n`.
+`statement` runs for every `Query` and `Parse`, before PgDog parses, rewrites or routes. It returns `Allow`, `Rewrite { sql, columns }` or `Deny`. Verdicts must be deterministic until `generation()` changes. PgDog relies on that for prepared statements: they're checked when prepared, and at `Bind` only if the generation or `search_path` changed. If the SQL changed, PgDog re-prepares it under the client's statement name when it can. It can't for the unnamed statement, when its `prepared_statements` setting doesn't handle extended-protocol statements, or when it hasn't registered the name: the `Bind` then fails with `26000` and the client must prepare the statement again. The plugin bumps its generation when it loads new settings or receives a new catalog. A rewrite of a `Parse` must keep its highest `$n`.
 
 Fast-path function calls carry no SQL, so `function_call` denies them for masked users.
 
 ### 8.3 Column masks
 
-A rewrite can name text output columns to mask in the proxy (`ColumnMask`: result set, column, `MaskId`, blocking). PgDog calls `mask_rows` with batches of the rows it already received (up to 256 rows or 1 MiB), column by column, and checks the column types on `RowDescription`. Masking failures close the session. P3 uses this for HMAC, FPE and vault tokenization; vault masks are declared blocking and run on PgDog's blocking pool.
+A rewrite can name output columns to mask in the proxy (`ColumnMask`: result set, column, `MaskId`, blocking). PgDog calls `mask_rows` with batches of the rows it already received (up to 256 rows or 1 MiB), column by column, and checks the column types on `RowDescription`. Masking failures close the session. P3 uses this for HMAC, FPE and vault tokenization; vault masks are declared blocking and run on PgDog's blocking pool.
 
 ### 8.4 Error redaction
 
@@ -588,7 +600,8 @@ A rewrite can name text output columns to mask in the proxy (`ColumnMask`: resul
 
 Caches:
 
-- **Plugin decision cache**: key `(sql, search_path, profile, settings_epoch, schema_epoch)`, value `Continue | Rewrite(sql) | Block`. Concurrency via sharded `moka`/`DashMap`; route hooks run on async worker threads, so lookups must never block.
+- **Plugin decision cache**: key `(sql, search_path, profile, settings_epoch, schema_epoch)`, plus the user when the `search_path` contains `$user`; value `Continue | Rewrite(sql) | Block`. **As built**, sharded hash maps behind read-write locks; route hooks run on async worker threads, so lookups must stay short.
+- **Shape cache**: statements that differ only in literal values share one analysis of their shape, rendered with each statement's literals.
 - **Profiles**: keyed by identity hash and `policy_epoch`.
 - **Prepared statements**: one server-side statement per (statement × distinct rewrite), shared across all sessions with that profile through PgDog's global cache and prepared lazily per server connection.
 
@@ -600,13 +613,13 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 
 | Feature | Behavior |
 |---|---|
-| Sharding | Masking runs before routing, so shard keys are extracted from the masked SQL. Masking a sharding key is rejected at load, because the key would be unextractable and broadcast. Cross-shard sort, aggregate and `DISTINCT` operate on masked values, which is consistent with single-node semantics. |
-| Multi-tenant mode | The tenant column can't be masked (load error). |
+| Sharding | Masking runs before routing, so shard keys are extracted from the masked SQL. A masked sharding key can't be extracted, so those statements are broadcast or fail. The plan was to reject masked sharding keys at load; that's **not implemented**, because the plugin doesn't see PgDog's sharding configuration. Don't mask sharding keys. Cross-shard sort, aggregate and `DISTINCT` operate on masked values, which is consistent with single-node semantics. |
+| Multi-tenant mode | The tenant column must not be masked. Planned as a load error; **not implemented**. |
 | Rewrite engine (auto id, `unique_id()`, ND functions, subqueries, sharding-key updates) | Runs on the masked SQL. Masked expressions are ordinary SQL, so no interaction. |
-| Prepared statements (`prepared_statements = extended/full`) | One server-side statement per distinct rewrite (§8.2), re-checked at `Bind` only after the plugin's settings or catalog changed. Statement names stay stable for the client. With `prepared_statements = disabled`, a statement whose rewrite changes must be prepared again by the client. |
+| Prepared statements (`prepared_statements = extended/full`) | One server-side statement per distinct rewrite (§8.2), re-checked at `Bind` only after the plugin's settings or catalog, or the session's `search_path`, changed. Statement names stay stable for the client. The unnamed statement, statements PgDog hasn't registered, and every statement with `prepared_statements = disabled` must be prepared again by the client when their rewrite changes (`26000`). |
 | Read/write splitting, load balancing | Unaffected. |
 | Mirroring | The mirror receives the masked request, since masking runs before `backend.mirror`. Responses are discarded. |
-| Dry run / query log | Logs show the original SQL. Shadow mode adds the masked SQL and the decision. |
+| Dry run / query log | Logs show the original SQL. Shadow mode adds the decision, with the original statement normalized. |
 | Session vs transaction pooling | Identity is per client, not per server connection, so both work. |
 | Admin database | Not masked; admin connections have no cluster route. |
 
@@ -619,7 +632,7 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 **Assumptions the deployment must enforce:**
 
 1. Clients cannot reach Postgres directly.
-2. The Postgres role PgDog uses for restricted identities (`server_user`) should not own the tables and should not be able to create functions or views. That is defense in depth if the analyzer has a bug. `pgdog-mask lint` checks for this.
+2. The Postgres role PgDog uses for restricted identities (`server_user`) should not own the tables and should not be able to create functions or views. That is defense in depth if the analyzer has a bug. A `pgdog-mask lint` check for this was planned and is **not implemented**.
 3. Policy configuration and HMAC keys are protected like credentials.
 
 **Known residual risks, documented for users:**
@@ -627,21 +640,29 @@ The real performance cost is in Postgres: `WHERE mask(ssn) = …` can't use an i
 - Inference from *unmasked* columns correlated with masked ones (e.g. zip code + birth date).
 - Timing side channels.
 - Statements by exempt identities that copy raw data into tables restricted identities can read. This is a data-governance issue, the same as in Snowflake.
-- Policies on columns whose values are also present elsewhere unmasked: denormalized copies, JSON blobs, audit tables. The classifiers and `lint` help here.
+- Policies on columns whose values are also present elsewhere unmasked: denormalized copies, JSON blobs, audit tables. Classifiers help here.
 
 ---
 
 ## 12. Observability and operations
 
-- **Shadow mode** (`mode = "shadow"`): full analysis, with no rewrite or block. Every decision that *would* apply is logged at `info` with the user, profile, policies hit, fingerprint, and the would-be SQL. This is the recommended rollout step.
-- **Decision log**: structured log line per `Rewrite`/`Block` (first occurrence per fingerprint + profile, then sampled), using the existing plugin logging init (`logging_init`).
-- **Metrics**: counters for continue/rewrite/block per policy, cache hit rate, analyzer latency histogram, proxy-mask latency. They are exposed through plugin logs initially; a generic plugin-metrics API is a follow-up.
-- **`pgdog-mask explain --user U [--application-name A] "SQL"`**: prints the profile, every resolved column reference with its policy, and the rewritten SQL, using a schema pulled from the target database. It is the same `masking-core` code, so its output matches production.
-- **`pgdog-mask lint`**: reports unassigned columns matching classifiers, unkeyed `hash` on low-cardinality types, masked columns that are sharding keys, and the privileges of `server_user`.
+**As built:**
+
+- **Shadow mode** (`mode = "shadow"`): full analysis, with no rewrite or block. Rewrites that would apply are logged at `info`, and blocks at `warn`, with the user, the masked columns and the normalized statement. This is the recommended rollout step. Statements that would only be masked by proxy masks don't change, so they aren't logged.
+- **Decision log**: blocks at `warn`, raw searches at `info`, and rewrites at `debug` in enforce mode. Each is logged when a statement is analyzed for a profile; cache hits aren't logged, so the log isn't a complete record of executions or of every user (see [Logs and maintenance](https://ewhauser.github.io/pgdog-mask/operate/logs/)).
+
+Planned and **not implemented**:
+
+- Structured decision lines, with the profile, policies hit and fingerprint, sampled after the first occurrence.
+- **Metrics**: counters for continue/rewrite/block per policy, cache hit rate, analyzer latency histogram, proxy-mask latency.
+- **`pgdog-mask explain --user U [--application-name A] "SQL"`**: print the profile, every resolved column reference with its policy, and the rewritten SQL, using a schema pulled from the target database.
+- **`pgdog-mask lint`**: report unassigned columns matching classifiers, unkeyed `hash` on low-cardinality types, masked columns that are sharding keys, and the privileges of `server_user`.
 
 ---
 
 ## 13. Testing strategy
+
+**As built**, items 1, 2 and 7 exist, along with an end-to-end suite through PgDog and a compatibility run of PgDog's Go driver tests with every user masked. Items 3–6 are the plan and aren't implemented as described.
 
 1. **`masking-core` unit tests**: a golden corpus of `(sql, profile) → expected rewritten SQL | block`. It covers every row of §6.3 and §6.5 and seeds from the ORM/job-queue query survey already in the repo (commit `59491209`, the subquery suite). Each case also asserts that the rewritten SQL parses and round-trips through `deparse`.
 2. **Canary leak tests (integration)**: seed masked columns with unique canary values (`'CANARY-SSN-7f3a…'`). Run the corpus and an adversarial suite through PgDog as a restricted identity. Assert that **no canary bytes appear anywhere in the client byte stream**: rows, `RowDescription`, errors, notices, COPY data. This tests the invariant directly instead of the implementation.
@@ -683,14 +704,14 @@ ewhauser/pgdog-mask      # this plugin, depending on pgdog-plugin at a pinned ma
 - **Tags from the database** with `tag_source = "comment" | "security_label"` and `security_label_provider`, additive only, with removals logged at `warn` on schema reload; **`[[classifiers]]`** tag columns by name (§7.4).
 - **Error and notice scrubbing** (§2, §8.4): the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` masked users get. `scrub_error_detail = false` turns it off. Exempt users keep `DETAIL`.
 - **Tests:** unit tests for lineage, tags, classifiers, view and function rewrites; the canary corpus covers views, functions, operators and `DETAIL` leaks (a `CHECK` violation's failing row, a trigger's notice) and loads its schema with PgDog's own catalog queries; e2e tests cover inlined views and functions, comment tags, classifiers and scrubbed errors through PgDog.
-- **Not done yet:** `lint`, live template validation (§7.3), and the `explain`/`validate` CLI.
+- **Not done yet:** `lint`, live template validation (§7.3), the `explain`/`validate` CLI, and rejecting masked sharding keys and tenant columns (§10).
 
 
 | Phase | Branch | Scope |
 |---|---|---|
 | **P0: API** ✅ | `masking/plugin-api` | 0.7.0: capabilities, `statement` verdicts with generations, `function_call`, batched `mask_rows`, `redact_error`, typed `catalog` with selectable parts, `reload`; `catch_unwind`, `required`, test plugins |
-| **P1: MVP** ✅ | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, `explain` CLI, canary suite |
-| **P2: hardening** (mostly ✅) | `masking/plugin` | SQL-function analysis and inlining ✅, view inlining ✅, partitions ✅ (P1), conditional masking ✅ (P1), tags and classifiers (`config`/`comment`/`security_label`) ✅, error/notice scrubbing ✅, `lint`, live template validation |
+| **P1: MVP** ✅ | `masking/plugin` | config, users and profiles, built-in SQL masks, resolver (SELECT/CTE/subquery/join/set ops/`*`/whole-row), DML `RETURNING`, `INSERT…SELECT`, COPY, cursors, fail-closed rules, `search = "raw"`, shadow mode, canary suite. The planned `explain` CLI is **not implemented** |
+| **P2: hardening** (mostly ✅) | `masking/plugin` | SQL-function analysis and inlining ✅, view inlining ✅, partitions ✅ (P1), conditional masking ✅ (P1), tags and classifiers (`config`/`comment`/`security_label`) ✅, error/notice scrubbing ✅; `lint` and live template validation **not implemented** |
 | **P3: proxy masks** ✅ | this repository | typed column masks in the API, `hmac_sha256` and `ff1`, the `ProxyMask` library API and `masking_plugin!`, vault tokenization as an example of a custom mask |
 | **Later** | | row access policies (inject `WHERE` predicates through the same statement hook), JSON-path masking (`jsonb_set`-based templates) |
 
@@ -701,12 +722,12 @@ ewhauser/pgdog-mask      # this plugin, depending on pgdog-plugin at a pinned ma
 ### Decided
 
 1. **Config format.** TOML in PgDog's own style (§7): `[[array_tables]]`, flat keys, `database`/`schema`/`name`/`column`. Policies always live in TOML. Column tags may also come from the database, through comments or security labels, additively (§7.4).
-2. **Searching masked columns.** Supported as an opt-in per policy rule (`search = "raw"`). It is restricted to direct comparison shapes so that it only allows an oracle, never direct exfiltration, and it is audited (§6.8).
+2. **Searching masked columns.** Supported as an opt-in per policy rule (`search = "raw"`). It is restricted to direct comparison shapes so that it only allows an oracle, never direct exfiltration. Raw searches are logged when they're analyzed, which isn't a complete audit (§6.8).
 3. **Identity changes mid-session.** Not supported. Masking identity comes from the authenticated PgDog user and is fixed for the session. `SET ROLE` is ignored because PgDog acknowledges it before Postgres validates it (§5.1).
 4. **SQL-language functions.** Their bodies are analyzed, and inlined with masks applied when they touch masked columns. Procedural-language functions are allowlist-only (§6.7).
 5. **Upstreaming.** The plugin API does not ship first. It is a narrow patch on its own branch, with the plugin on a branch built on top of it (§14.1).
 
 ### Open
 
-1. **Rate limiting raw searches.** Equality-only search on low-entropy columns is still brute-forceable. Is audit logging enough, or does the plugin need per-user rate limits on raw-search statements?
+1. **Rate limiting raw searches.** Equality-only search on low-entropy columns is still brute-forceable. The plugin logs raw searches when it analyzes them, not every execution (§12). Does it need a complete audit log, or per-user rate limits on raw-search statements?
 2. **Database-sourced tag removal.** Removing a database tag unmasks a column after the next schema reload. Should that require an explicit `allow_tag_removal` acknowledgement in TOML instead of only logging a warning?

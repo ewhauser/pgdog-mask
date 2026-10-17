@@ -3,7 +3,7 @@ title: Roll out with shadow mode
 description: Run the full analysis on production traffic and log what would change, before you enforce masking.
 ---
 
-Masking changes results and blocks statements the plugin can't prove safe. Before enforcing it on existing applications, run it in **shadow mode**: every statement is analyzed as in enforcement, but sent unchanged, and the decisions are logged.
+Masking changes results and blocks statements the plugin can't prove safe. Before enforcing it on existing applications, run it in **shadow mode**: statements are analyzed as in enforcement, but sent unchanged, and the decisions are logged.
 
 ```toml
 [general]
@@ -27,6 +27,12 @@ Statements are logged normalized, with literals replaced by placeholders, so sea
   ```
 
 - Searches on raw values, for rules with `search = "raw"`, at `info`.
+
+Each statement is logged when it's analyzed: the first time it's seen for a masking profile, not every time it runs. Statements that differ only in literal values share one message, and prepared statements are logged when they're prepared. Shadow-mode logs show which kinds of statements would change, not how often. See [what the logs cover](../../operate/logs/#analysis-logs-not-an-audit-trail).
+
+:::note[Proxy masks aren't logged]
+A statement that would only be masked by [proxy masks](../../configure/proxy-masks/), in its results, logs nothing in shadow mode, because the statement itself wouldn't change. To see proxy masks working, test them with `mode = "enforce"` outside production.
+:::
 
 ## Roll out
 

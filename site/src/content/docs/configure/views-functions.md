@@ -27,10 +27,34 @@ Writes through views that read masked columns are blocked, and views without a d
 SQL-language functions are analyzed:
 
 - A function that reads no masked columns is called as is.
-- One that does is **inlined** with masks applied, if it's a single `SELECT`, `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, has no `SET` options, and isn't polymorphic or variadic. Set-returning functions are inlined in `FROM`.
+- One that does is **inlined** with masks applied, if both the function and the call allow it (below).
 - Otherwise the statement is blocked.
 
 User-defined operators are treated as calls to their functions.
+
+### When a function can be inlined
+
+The function must:
+
+- have a body that's a single `SELECT`, not selecting `*`;
+- be `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, with no `SET` options;
+- not be polymorphic, `VARIADIC` or recursive;
+- be the only function the call could resolve to: if several overloads match the name and number of arguments, and one reads masked columns, the call is blocked.
+
+The call must be a plain call:
+
+| Call | Inlined? |
+| --- | --- |
+| `SELECT get_ssn(id) FROM users` | yes |
+| `SELECT * FROM user_ssns_for(42)`, a set-returning function in `FROM` | yes |
+| `SELECT get_ssn(42)` when the function has a second argument with a default | no: calls relying on argument defaults are blocked |
+| `SELECT get_ssn(uid => 42)` | no: named arguments |
+| `SELECT user_ssns_for(42)`, a set-returning function in the select list | no: set-returning functions are only inlined in `FROM` |
+| `SELECT * FROM ROWS FROM (user_ssns_for(42))`, `… WITH ORDINALITY`, or with a column definition list | no |
+| `SELECT f(VARIADIC arr)`, or `f(x) OVER (…)`, `f(DISTINCT x)`, `f(x) FILTER (…)`, `f(x ORDER BY y)` | no: `VARIADIC`, window or aggregate syntax |
+| A scalar call to a function returning `record`, or with `OUT` parameters | no: it doesn't return a single value |
+
+Pass every argument explicitly, by position, to keep a call inlinable. Blocked calls fail with SQLSTATE `42501` and a message naming the function and the reason.
 
 ## Code the plugin can't analyze
 

@@ -31,6 +31,9 @@ The script:
 6. writes `results/<timestamp>.csv` (every run), `.env` (the environment) and
    `.md` (the report), and prints the report.
 
+`results/` is ignored by git. Runs the documentation quotes are copied to
+`published/`, so its figures can be traced to a report and a revision.
+
 ### Settings
 
 | Variable | Default | |

@@ -44,16 +44,16 @@ A proxy mask applies to a column **output by a single top-level `SELECT`**, as a
 | `COPY`, `INSERT … SELECT`, `SELECT INTO`, `RETURNING` | the fallback |
 | several statements in one query | the fallback |
 
-So filtering, ordering, grouping and aggregates never see real values, exactly as with SQL masks. A rule with [`search = "raw"`](../raw-search/) can still search on the real value.
+So filtering, ordering, grouping and aggregates work on the fallback, not on real values, as with SQL masks. A rule with [`search = "raw"`](../raw-search/) can still search on the real value.
 
 ## Built-in proxy masks
 
 | `proxy` | Types | Options | Result |
 | --- | --- | --- | --- |
-| `hmac_sha256` | text types | `key_env` or `key_file`; `length` (1–64) | Hex HMAC-SHA256 of the value, optionally truncated to `length` digits. The same value always gives the same result, so clients can still join, group and count. |
+| `hmac_sha256` | text types | `key_env` or `key_file`; `length` (1–64) | Hex HMAC-SHA256 of the value, optionally truncated to `length` digits. The same value always gives the same result under the same key, so clients can join, group and count the tokens they receive. SQL can't: `GROUP BY`, joins and conditions on the column get the fallback. |
 | `ff1` | text types | `key_env` or `key_file`: a hex AES key of 16, 24 or 32 bytes; `alphabet`: `digits` (default), `alphanumeric`, or the characters themselves; `tweak` | NIST FF1 format-preserving encryption. Characters in the alphabet are encrypted in place and others kept, so `4111-1111-1111-1111` stays `NNNN-NNNN-NNNN-NNNN`. Values with too few alphabet characters for FF1 (fewer than 6 digits) are replaced with `*`. |
 
-Keys come from the environment variable named by `key_env`, or the file named by `key_file`; they never appear in the configuration file. A mask that can't be built, for example because its key is missing, is a configuration error.
+Keys come from the environment variable named by `key_env`, or the file named by `key_file`, so they don't appear in the configuration file. They're read each time the configuration loads; see [rotating keys](../../operate/logs/#rotate-proxy-mask-keys). A mask that can't be built, for example because its key is missing, is a configuration error.
 
 ## Your own masks
 
@@ -62,6 +62,6 @@ Proxy masks are Rust code registered by name. To add your own, build the plugin 
 ## Behavior
 
 - **Types and formats.** A proxy mask returns a value of the column's type. Values are decoded from, and encoded back into, whatever format the client requested, text or binary.
-- **Batches.** The plugin masks rows in batches of up to 256 rows that have already arrived from Postgres, so it never waits for more rows before sending the ones it has.
+- **Batches.** The plugin masks rows in batches of up to 256 rows that have already arrived from Postgres, so it doesn't wait for more rows before sending the ones it has.
 - **Failures.** If a proxy mask fails, the query is canceled and the client's connection is closed with a `FATAL` error, since some rows may already have been sent.
 - **Cost.** Every masked value goes through the plugin. Prefer SQL masks where a keyed or coded mask isn't needed.

@@ -3,13 +3,13 @@ title: How masking works
 description: Who gets masked, and the two ways pgdog-mask masks a column, SQL masks and proxy masks.
 ---
 
-pgdog-mask runs inside [PgDog](https://github.com/pgdogdev/pgdog), the Postgres connection pooler. Applications connect to PgDog as before. For each statement a client sends, PgDog asks the plugin what to do before PgDog parses, routes or shards it.
+pgdog-mask runs inside [PgDog](https://github.com/pgdogdev/pgdog), the Postgres connection pooler. Applications connect to PgDog as before. For each statement a client sends, PgDog asks the plugin what to do before PgDog parses, routes or shards it: send it unchanged, send a rewritten statement, or refuse it.
 
 ## Who gets masked
 
 Every PgDog user has a set of masking **roles**, from the plugin's configuration (users not listed have none). Every **policy** has a default mask and rules that pick a different mask for some roles. The masks that apply to one user form their **profile**.
 
-A user whose profile masks nothing is **exempt**: their statements go through untouched, at the cost of one lookup. Everyone else is **masked**.
+A user whose profile masks nothing is **exempt**: their statements go through unchanged, at the cost of one lookup. Everyone else is **masked**. A masked user's statement that touches no masked column is also sent unchanged.
 
 The identity is the PgDog user the client authenticated as, fixed for the session. `SET ROLE` and client-supplied values such as `application_name` don't change it. See [Users and roles](../../configure/users/).
 
@@ -24,13 +24,13 @@ Each policy masks its columns in one of two ways, chosen by its `mask` setting:
 | --- | --- | --- |
 | Configured with | `mask = "partial"`, `"email"`, `"round"`, `"sql"`, … | `mask = "proxy"` |
 | Computed by | Postgres, as part of the rewritten statement | the plugin, on the rows Postgres returns |
-| Covers | every reference to the column | plain output columns of a single `SELECT` |
+| Covers | references to the column anywhere in the statement, except [raw searches](../../configure/raw-search/) | plain output columns of a single `SELECT` |
 | Good for | hiding, redacting, rounding, truncating, your own SQL | keyed hashes, format-preserving encryption, vault tokens, your own Rust code |
 | Cost | none in the plugin per row | every masked value passes through the plugin |
 
 ## SQL masks: masking in the statement
 
-For a masked user, the plugin parses the statement, resolves every column reference to the table column it reads, and **replaces each reference to a masked column with the policy's mask expression**. It does this wherever the reference appears: the select list, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, window clauses, `RETURNING`, subqueries, CTEs, `INSERT … SELECT` and `COPY`. `SELECT *` over a table with masked columns is expanded so each column can be masked.
+For a masked user, the plugin parses the statement, resolves each column reference to the table column it reads, and **replaces each reference to a masked column with the policy's mask expression**. It does this wherever the reference appears: the select list, `WHERE`, `JOIN`, `GROUP BY`, `ORDER BY`, window clauses, `RETURNING`, subqueries, CTEs, `INSERT … SELECT` and `COPY`. `SELECT *` over a table with masked columns is expanded so each column can be masked.
 
 ```sql
 -- sent by a masked user
@@ -73,7 +73,7 @@ Masked values keep the column's type, in the text or binary format the client as
 Whichever way a column is masked, the plugin analyzes the statement first, and the same protections apply:
 
 - **Views and SQL functions** that read masked columns are inlined with masks applied, so they can't be used to read around a policy. See [Views and functions](../../configure/views-functions/).
-- **Anything the plugin can't prove safe is blocked** with SQLSTATE `42501`: procedural functions it can't analyze, statistics views, DDL on masked tables, and more. See [What masked users can’t do](../../reference/limitations/).
-- **Errors.** Postgres errors can quote row values, like a check constraint's `Failing row contains (...)`. The plugin removes `DETAIL` from every error and notice masked users get. See [Error details](../../configure/errors/).
-- **Prepared statements** are checked when they're prepared, and again only after the configuration or the catalog changes. PgDog re-prepares them transparently when their masked SQL changes.
-- **Caching.** Decisions are cached per statement and profile, and statements that differ only in literal values share one analysis. See [Performance](../../operate/performance/).
+- **Statements the plugin can't prove safe are blocked** with SQLSTATE `42501`: procedural functions it can't analyze, statistics views, DDL on masked tables, and more. See [What masked users can’t do](../../reference/limitations/).
+- **Errors.** Postgres errors can quote row values, like a check constraint's `Failing row contains (...)`. The plugin removes `DETAIL` from the errors and notices masked users get, unless `scrub_error_detail` is off. See [Error and notice redaction](../../configure/errors/).
+- **Prepared statements** are checked when they're prepared, and again at their next execution after the configuration, the catalog or the session's `search_path` changes. If their masked SQL changed, PgDog re-prepares named statements it tracks under the same name. The unnamed statement, and every statement when PgDog's `prepared_statements` is `disabled`, fail with `26000` instead, and the client must prepare them again. See [Reload configuration](../../operate/reload/#prepared-statements).
+- **Caching.** Decisions are cached per statement and profile, and statements that differ only in literal values share one analysis. Decisions are logged when they're made, not when they're reused; see [Logs and maintenance](../../operate/logs/). For costs, see [Performance](../../operate/performance/).

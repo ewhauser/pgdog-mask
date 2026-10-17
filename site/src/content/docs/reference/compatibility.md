@@ -17,8 +17,9 @@ PgDog only loads plugins built by the same Rust compiler, because plugins share 
 
 | | |
 | --- | --- |
-| Tested | Postgres 16, in CI. |
-| Required | Postgres 14 or later, to analyze SQL functions with `BEGIN ATOMIC` bodies. Older versions work, but those functions can't be analyzed. |
+| Tested | Postgres 16, in CI and in the [benchmark](../../operate/performance/). |
+| Supported | Postgres 14 and later. Earlier versions aren't tested. |
+| `BEGIN ATOMIC` functions | SQL functions with `BEGIN ATOMIC` bodies, which Postgres 14 introduced, are analyzed from the body Postgres stores. |
 | Security labels | `tag_source = "security_label"` needs a label provider loaded in Postgres. |
 
 ## Clients
