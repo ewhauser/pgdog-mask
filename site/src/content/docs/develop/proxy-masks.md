@@ -140,7 +140,6 @@ data_type = "bigint"
 mask = "proxy"
 proxy = "acme.offset"
 options = { offset = 5000 }
-fallback = "null"
 ```
 
 Prefix your masks' names, like `acme.`, so they can't collide with built-in masks added later.

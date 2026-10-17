@@ -63,4 +63,4 @@ arguments = ["marketing_opt_in"]    # users.marketing_opt_in is bound to opted_i
 
 ## Masks computed in code
 
-`mask = "proxy"` computes the mask in the plugin instead of in SQL, for keyed hashes, format-preserving encryption, vault tokens, or masks you write. See [Proxy masks](../proxy-masks/).
+`mask = "proxy"` computes the mask in the plugin instead of in SQL, for keyed hashes, format-preserving encryption, vault tokens, or masks you write. Proxy masks apply to results: Postgres runs the statement on real values, output columns that pass the column through get the proxy mask, and outputs computed from it return `NULL`. Since conditions and ordering use real values, give them to trusted roles in a rule, and keep a SQL mask as the default. See [Proxy masks](../proxy-masks/).

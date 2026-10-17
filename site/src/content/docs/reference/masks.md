@@ -34,12 +34,16 @@ value = "0"          # a string, not 0: becomes '0'::numeric
 
 ## Proxy masks
 
+Proxy masks mask output columns that pass the column through, in the results. Outputs computed from the column return `NULL`, and conditions, joins and ordering use real values. See [Proxy masks](../../configure/proxy-masks/).
+
 | Key | Description |
 | --- | --- |
-| `mask = "proxy"` | Compute the mask in the plugin. See [Proxy masks](../../configure/proxy-masks/). |
+| `mask = "proxy"` | Compute the mask in the plugin. |
 | `proxy` | Name of the proxy mask: `hmac_sha256`, `ff1`, or [one you registered](../../develop/proxy-masks/). |
 | `options` | Table passed to the proxy mask. |
-| `fallback` | SQL mask for references the proxy mask doesn't cover. Default `null`. Its keys (e.g. `keep_suffix`) go next to it. |
+| `fallback` | Removed: a configuration error. Proxy masks no longer rewrite other references to the column. |
+
+The SQL mask keys, `value`, `keep_prefix`, `keep_suffix`, `fill`, `digits`, `unit` and `expression`, don't apply to `mask = "proxy"`, and neither do `search = "raw"` and `search_operators`: proxy rules always search real values. Each is a configuration error on a proxy rule.
 
 ### `hmac_sha256`
 
