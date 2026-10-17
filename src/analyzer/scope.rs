@@ -37,9 +37,12 @@ pub(super) enum ItemKind<'c> {
         relation: &'c Relation,
         names: Vec<String>,
     },
-    /// A subquery, CTE, VALUES, function, table function, catalog or
-    /// unresolved relation, or `excluded`. Its output columns are never masked:
-    /// masks are applied where the data is read.
+    /// A subquery, CTE, VALUES, function, table function, aliased join,
+    /// catalog or unresolved relation, or `excluded`. References to its
+    /// columns are never rewritten: SQL masks apply where it reads masked
+    /// columns. Each column carries what it passes on from proxy-masked
+    /// columns, so a reference passing it through gets a proxy result mask,
+    /// and one computed from it NULL.
     Derived(Outputs),
 }
 

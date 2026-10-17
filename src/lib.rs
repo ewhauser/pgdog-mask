@@ -1,9 +1,17 @@
 //! Dynamic data masking for PgDog.
 //!
-//! Statements from masked users are rewritten so every reference to a masked
-//! column reads its mask instead, wherever it appears: projections, filters,
-//! joins, grouping, ordering, `RETURNING`, subqueries, CTEs and `COPY`. See
-//! `docs/DATA_MASKING.md`.
+//! A masked column has a SQL mask or a proxy mask for each user:
+//!
+//! - Statements are rewritten so every reference to a SQL-masked column
+//!   reads its mask instead, wherever it appears: projections, filters,
+//!   joins, grouping, ordering, `RETURNING`, subqueries, CTEs and `COPY`.
+//! - References to proxy-masked columns aren't rewritten: conditions run on
+//!   real values. PgDog masks the result columns that pass them through with
+//!   the proxy mask, and those computed from them are NULL. Statements that
+//!   would move their values where PgDog can't mask them are blocked, and
+//!   errors of statements computing on them are redacted.
+//!
+//! See `docs/DESIGN.md`.
 pub mod analyzer;
 pub mod catalog;
 pub mod config;
