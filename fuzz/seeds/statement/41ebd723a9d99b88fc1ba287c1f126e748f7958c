@@ -1,0 +1,1 @@
+ WITH c AS (SELECT users.ssn, users.name FROM public.users) SELECT c.ssn AS a, c.ssn AS b FROM c UNION ALL SELECT users.ssn, users.name FROM public.users;

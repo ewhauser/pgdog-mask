@@ -1,0 +1,1 @@
+SELECT ssn FROM masking_e2e.user_ssns ORDER BY id

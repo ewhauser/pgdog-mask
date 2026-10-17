@@ -1,0 +1,1 @@
+SELECT 'a' AS x, true, NULL, -1, 1.5, -2.5e3

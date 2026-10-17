@@ -1,0 +1,1 @@
+ SELECT users.ssn, count(*) AS n FROM public.users GROUP BY users.ssn;

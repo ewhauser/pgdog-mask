@@ -1,0 +1,1 @@
+SELECT (SELECT ssn FROM user_ssns LIMIT 1)

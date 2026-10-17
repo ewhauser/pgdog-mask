@@ -1,0 +1,16 @@
+# Every user is masked, so every statement the drivers send goes through the
+# analyzer. No test reads the masked column, so any failure that doesn't also
+# happen without the plugin is over-blocking or a broken rewrite.
+[general]
+# Tests create tables at runtime, after PgDog loaded the schema.
+on_unresolved = "allow"
+
+[[policies]]
+name = "canary"
+data_type = "text"
+mask = "null"
+
+[[masked_columns]]
+name = "masking_compat_canary"
+column = "secret"
+policy = "canary"

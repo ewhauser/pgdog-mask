@@ -1,0 +1,1 @@
+SELECT row_to_json(u), 1 FROM users u WHERE id = 7

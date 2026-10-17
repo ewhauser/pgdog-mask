@@ -1,0 +1,1 @@
+SELECT masking_canary.users.ssn FROM masking_canary.users

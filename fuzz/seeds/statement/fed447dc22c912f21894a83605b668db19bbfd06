@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE ssn = $1 AND upper(ssn) LIKE 'A%' GROUP BY id, ssn HAVING max(ssn) > '1' ORDER BY ssn

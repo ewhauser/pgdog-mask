@@ -1,0 +1,1 @@
+SELECT id FROM orders WHERE user_ssn(user_id) = $1

@@ -1,0 +1,1 @@
+SELECT s.a FROM (SELECT ssn AS a FROM users) s

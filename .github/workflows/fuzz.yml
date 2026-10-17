@@ -1,0 +1,93 @@
+name: Fuzz
+
+# Nightly fuzzing of the plugin's hooks; see fuzz/README.md. Each target's
+# corpus is cached between runs, so coverage builds up night after night.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to fuzz each target
+        default: "1800"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - statement
+          - statement_grammar
+          - mask_rows
+          - redact_error
+          - catalog
+          - config
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz needs nightly; the repository's own toolchain stays pinned.
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          FUZZ_RSS_LIMIT_MB: "8192"
+        run: bash fuzz/run.sh ${{ matrix.target }} ${{ inputs.seconds || '1800' }}
+
+      # Keep the corpus small: only inputs that add coverage.
+      - name: Minimize corpus
+        if: success()
+        run: bash fuzz/run.sh ${{ matrix.target }} --cmin
+
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: failure()
+        run: |
+          {
+            echo "## \`${{ matrix.target }}\` found a crash"
+            echo
+            echo "Download \`fuzz-artifacts-${{ matrix.target }}\` from this run, then reproduce it:"
+            echo
+            echo '```sh'
+            for crash in fuzz/artifacts/${{ matrix.target }}/*; do
+              [ -e "$crash" ] && echo "cargo +nightly fuzz run ${{ matrix.target }} $crash"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

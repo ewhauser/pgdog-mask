@@ -1,0 +1,1 @@
+SELECT ssn AS ssn FROM users WHERE

@@ -1,0 +1,1 @@
+BEGIN; UPDATE users SET name = name RETURNING *; ROLLBACK

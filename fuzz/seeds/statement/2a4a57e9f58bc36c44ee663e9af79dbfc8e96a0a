@@ -1,0 +1,1 @@
+INSERT INTO users (id, ssn) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET name = users.ssn || '!' RETURNING ssn, 1

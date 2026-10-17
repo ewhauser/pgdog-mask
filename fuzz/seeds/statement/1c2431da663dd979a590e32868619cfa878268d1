@@ -1,0 +1,1 @@
+SELECT ssn FROM users WHERE ssn = '123-45-6789'

@@ -1,0 +1,1 @@
+SELECT n FROM ssn_counts WHERE n > 1

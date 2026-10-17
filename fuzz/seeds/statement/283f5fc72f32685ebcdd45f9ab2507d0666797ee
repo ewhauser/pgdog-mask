@@ -1,0 +1,1 @@
+SELECT masking_e2e.get_ssn(2)

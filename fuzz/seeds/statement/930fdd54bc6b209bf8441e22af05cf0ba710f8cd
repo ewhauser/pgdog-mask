@@ -1,0 +1,1 @@
+UPDATE users SET ssn = $1 WHERE id = $2

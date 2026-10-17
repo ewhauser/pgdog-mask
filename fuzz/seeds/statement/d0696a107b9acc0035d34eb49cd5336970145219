@@ -1,0 +1,1 @@
+SELECT ssn, email FROM masking_e2e.users ORDER BY id

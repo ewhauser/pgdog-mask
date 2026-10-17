@@ -1,0 +1,1 @@
+ SELECT users.id AS key, users.ssn AS secret FROM public.users;

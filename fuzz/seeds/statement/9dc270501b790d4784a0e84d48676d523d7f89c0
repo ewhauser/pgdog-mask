@@ -1,0 +1,1 @@
+SELECT public.user_ssn(1)

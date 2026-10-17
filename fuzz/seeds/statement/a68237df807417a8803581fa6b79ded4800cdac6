@@ -1,0 +1,1 @@
+SELECT recursive_fn(1)

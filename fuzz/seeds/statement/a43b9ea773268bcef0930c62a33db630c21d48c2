@@ -1,0 +1,1 @@
+WITH RECURSIVE r AS (SELECT id, ssn FROM users UNION ALL SELECT id, ssn FROM r) SELECT ssn FROM r

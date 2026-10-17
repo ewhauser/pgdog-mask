@@ -1,0 +1,1 @@
+SELECT u.ssn FROM user_ssns u JOIN orders o ON o.user_id = u.id

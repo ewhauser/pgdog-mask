@@ -1,0 +1,1 @@
+ SELECT f.x FROM public.some_function() f(x);

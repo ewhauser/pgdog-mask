@@ -1,0 +1,1 @@
+ SELECT u.id, u.ssn, upper(u.ssn) AS masked, length(u.name) AS n FROM public.users u WHERE u.id > 0;

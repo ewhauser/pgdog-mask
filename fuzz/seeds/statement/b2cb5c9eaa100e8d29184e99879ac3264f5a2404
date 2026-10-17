@@ -1,0 +1,1 @@
+ SELECT s.secret, s.secret || s.key AS both, (SELECT 1) AS sub FROM (SELECT inner_v.key, inner_v.secret FROM public.inner_v) s;

@@ -1,0 +1,1 @@
+VALUES ((SELECT ssn FROM users LIMIT 1))

@@ -1,0 +1,1 @@
+SELECT a.ssn FROM all_ssns() a WHERE a.id = 2

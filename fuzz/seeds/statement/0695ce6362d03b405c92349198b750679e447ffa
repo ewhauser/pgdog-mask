@@ -1,0 +1,1 @@
+SELECT user_ssn_definer(1)

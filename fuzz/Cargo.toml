@@ -1,0 +1,67 @@
+[package]
+name = "pgdog-mask-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+# Built into a plugin here with `masking_plugin!`, like custom mask plugins
+# are, so the fuzzer's own proxy masks sit next to the built-in ones.
+pgdog-mask = { path = "..", default-features = false }
+# Must match the pg_raw_parse pgdog-mask uses.
+pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
+
+# Its own workspace, so the fuzzer's nightly-only build settings never touch
+# the plugin's.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "statement"
+path = "fuzz_targets/statement.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "statement_grammar"
+path = "fuzz_targets/statement_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mask_rows"
+path = "fuzz_targets/mask_rows.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_error"
+path = "fuzz_targets/redact_error.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "catalog"
+path = "fuzz_targets/catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false

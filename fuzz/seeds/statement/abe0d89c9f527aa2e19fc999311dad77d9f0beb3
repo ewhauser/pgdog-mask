@@ -1,0 +1,1 @@
+SELECT CASE WHEN u.opted_in THEN u.email ELSE NULL END::text AS email FROM users u

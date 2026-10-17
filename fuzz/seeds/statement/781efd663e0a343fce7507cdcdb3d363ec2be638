@@ -1,0 +1,1 @@
+UPDATE user_names SET name = 'forbidden' WHERE id = 1
