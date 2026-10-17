@@ -17,8 +17,18 @@ const pages = [
 	{
 		source: 'docs/DESIGN.md',
 		target: 'contribute/design.md',
-		title: 'Design',
-		description: 'How pgdog-mask and the PgDog plugin API it uses were designed, and why.',
+		title: 'Design notes',
+		description: 'How pgdog-mask and the PgDog plugin API it uses were designed, and why: the original plan, with notes on what was built.',
+		// A design record, not a reference: keep it out of search, so readers
+		// looking up behavior land on the guides.
+		search: false,
+		banner: [
+			':::caution[Design record]',
+			'This is the plan pgdog-mask was built from, with notes on what changed. It isn\'t a reference: some features it describes are **not implemented**, and it\'s left out of search. For current behavior, see the [guides](../../start/overview/) and the [reference](../../reference/configuration/).',
+			'',
+			`Generated from [\`docs/DESIGN.md\`](${repoUrl}/blob/main/docs/DESIGN.md). Edit it there.`,
+			':::',
+		],
 	},
 ];
 
@@ -54,11 +64,14 @@ for (const page of pages) {
 		`title: ${JSON.stringify(page.title)}`,
 		`description: ${JSON.stringify(page.description)}`,
 		`editUrl: ${JSON.stringify(`${repoUrl}/edit/main/${page.source}`)}`,
+		...(page.search === false ? ['pagefind: false'] : []),
 		'---',
 		'',
-		`:::note[Engineering document]`,
-		`This page is generated from [\`${page.source}\`](${repoUrl}/blob/main/${page.source}). Edit it there.`,
-		':::',
+		...(page.banner ?? [
+			`:::note[Engineering document]`,
+			`This page is generated from [\`${page.source}\`](${repoUrl}/blob/main/${page.source}). Edit it there.`,
+			':::',
+		]),
 		'',
 	].join('\n');
 

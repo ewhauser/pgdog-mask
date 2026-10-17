@@ -29,7 +29,9 @@ A workload that needs different masking connects as a different PgDog user. Seve
 
 ## Exempt users
 
-A user whose roles make every policy resolve to `mask = "none"` is exempt: their statements aren't analyzed at all. This is how administrators and trusted services see real values without any overhead.
+A user whose roles make every policy resolve to `mask = "none"` is exempt: their statements aren't analyzed at all. This is how administrators and trusted services see real values. It costs one profile lookup per statement, about 30 ns (see [Performance](../../operate/performance/#per-statement)).
+
+Exemption is per policy: a rule with `mask = "none"` only exempts the user from that policy. To exempt a role from everything, give it such a rule in every policy.
 
 ## Admin connections
 

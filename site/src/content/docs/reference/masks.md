@@ -11,16 +11,26 @@ A mask is set with `mask` and its keys, on a policy or a rule. Every SQL mask is
 | --- | --- | --- | --- |
 | `none` | any | | The real value: not masked. |
 | `null` | any | | `NULL`. |
-| `constant` | any | `value` | The literal `value`. |
+| `constant` | any | `value`, a TOML string | `value` as a string literal, cast to the column's type. |
 | `default` | any | | A placeholder for the type: `'****'` for text, `0` for numbers, `1970-01-01` for dates, `1970-01-01 00:00:00` for timestamps, `00:00:00` for times, `false`, the nil UUID, `'{}'` for JSON, empty `bytea`, `NULL` otherwise. |
 | `partial` | text | `keep_prefix` (default 0), `keep_suffix` (default 0), `fill` (default `*`) | Keeps the first and last characters and fills the rest: `left(val, p) \|\| repeat(fill, greatest(length(val) - p - s, 0)) \|\| right(val, s)`. |
 | `email` | text | | Masks the local part: `regexp_replace(val, '^[^@]*', '****')`, so `alice@example.com` becomes `****@example.com`. |
 | `hash` | text, `bytea` | | SHA-256, hex for text. Unkeyed, so low-entropy values can be found by hashing guesses; use the `hmac_sha256` proxy mask for a keyed hash. |
-| `round` | numeric | `digits` (default 0) | `round(val, digits)`. Negative `digits` round to tens, hundreds, and so on. |
+| `round` | numeric | `digits` (default 0) | `round(val::numeric, digits)`, cast back to the column's type. Negative `digits` round to tens, hundreds, and so on. |
 | `truncate` | date, timestamp | `unit` (default `year`) | `date_trunc(unit, val)`. |
 | `sql` | as declared | `expression` | Your expression over `val` and the policy's `arguments`. No subqueries or other columns. |
 
 "Text" includes `text`, `character varying`, `character`, `name` and `citext`. "Numeric" includes the integer, `numeric` and floating-point types.
+
+`constant`'s `value` is always a TOML string, whatever the column's type. Postgres converts it with the cast:
+
+```toml
+[[policies]]
+name = "salary"
+data_type = "numeric"
+mask = "constant"
+value = "0"          # a string, not 0: becomes '0'::numeric
+```
 
 ## Proxy masks
 

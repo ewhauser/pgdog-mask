@@ -1,10 +1,10 @@
 ---
 title: Dynamic data masking for PgDog
-description: Mask sensitive Postgres columns per user, in every statement, without changing your application or your database.
+description: Mask sensitive Postgres columns per user, in PgDog, without changing your application or your database.
 tableOfContents: false
 hero:
   title: Dynamic data masking for PgDog
-  tagline: Define masking policies once. pgdog-mask rewrites every statement a masked user sends, so Postgres only ever returns masked values to them.
+  tagline: Apply column masking policies by authenticated user. SQL masks rewrite column references before execution; proxy masks transform supported result columns before they reach the client.
   actions:
     - text: Install the plugin
       link: ./start/install/
@@ -32,8 +32,8 @@ pgdog-mask is a [PgDog](https://github.com/pgdogdev/pgdog) plugin modeled on Sno
 
 A column is masked in one of two ways:
 
-- **SQL masks**, in the statement. Every reference to the column, in the select list, `WHERE`, joins, `ORDER BY`, aggregates, subqueries, `RETURNING` or `COPY`, is replaced with the policy's mask before PgDog sends the statement on, so filters, sorting and aggregates can't be used to recover real values.
-- **Proxy masks**, in the results. The plugin computes the masked value in code, for keyed hashes, format-preserving encryption, vault tokens or your own Rust, and replaces the real value in the rows Postgres returns.
+- **SQL masks**, in the statement. References to the column, in the select list, `WHERE`, joins, `ORDER BY`, aggregates, subqueries, `RETURNING` or `COPY`, are replaced with the policy's mask before PgDog sends the statement on, so filters, sorting and aggregates work on masked values. Statements the plugin can't mask safely are blocked.
+- **Proxy masks**, in the results. Postgres returns the real value to PgDog, and the plugin replaces it with a value computed in code, for keyed hashes, format-preserving encryption, vault tokens or your own Rust. They cover plain output columns of a single `SELECT`; every other reference to the column gets an SQL mask.
 
 ```sql
 -- With an SQL mask on ssn, a support agent sends:
@@ -43,9 +43,9 @@ SELECT name, ('XXX-XX-' || right(ssn, 4))::text AS ssn
 FROM users WHERE ('XXX-XX-' || right(ssn, 4))::text LIKE '123%';
 ```
 
-See [how masking works](./start/overview/) for both.
+Statements that don't touch masked columns, and statements of users nothing is masked for, pass through unchanged. See [how masking works](./start/overview/) for both.
 
-1. [Install the plugin](./start/install/) and load it into PgDog.
+1. Check the [prerequisites](./start/prerequisites/), then [install the plugin](./start/install/) and load it into PgDog.
 2. [Mask your first column](./start/first-policy/) and check it as a masked user.
 3. [Roll out with shadow mode](./start/shadow-mode/) before you enforce.
 
@@ -55,8 +55,9 @@ See [how masking works](./start/overview/) for both.
 | --- | --- |
 | Give different users different masks | [Users and roles](./configure/users/) · [Policies and rules](./configure/policies/) |
 | Mask columns by name, tag or database comment | [Choose masked columns](./configure/columns/) |
-| Let support look rows up by a masked value | [Search on masked columns](./configure/raw-search/) |
+| Let support find rows by a column's real value, while still seeing it masked | [Search on masked columns](./configure/raw-search/) |
 | Mask with a secret key, FPE or a vault | [Proxy masks](./configure/proxy-masks/) |
 | Write a mask in Rust | [Write a proxy mask](./develop/proxy-masks/) |
 | Understand what's blocked and why | [What masked users can’t do](./reference/limitations/) · [Security model](./reference/security/) |
+| Know what the logs cover | [Logs and maintenance](./operate/logs/) |
 | Fix an error | [Troubleshoot](./operate/troubleshoot/) |

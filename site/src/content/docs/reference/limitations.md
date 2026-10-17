@@ -3,11 +3,11 @@ title: What masked users can’t do
 description: Statements blocked for masked users, and why.
 ---
 
-The plugin blocks what it can't prove safe. All of these fail with SQLSTATE `42501`, and each block is logged with its reason. Exempt users are never blocked.
+The plugin blocks what it can't prove safe. All of these fail with SQLSTATE `42501`, and blocks are logged with their reason when the statement is analyzed (see [Logs and maintenance](../../operate/logs/)). Exempt users are never blocked.
 
 ## Functions
 
-- Functions in procedural languages or C, functions of extensions, and SQL functions that read masked columns but [can't be inlined](../../configure/views-functions/#sql-functions), unless they're in `udf_allowlist` or their extension is in `extension_allowlist`.
+- Functions in procedural languages or C, functions of extensions, and SQL functions that read masked columns but [can't be inlined](../../configure/views-functions/#when-a-function-can-be-inlined), unless they're in `udf_allowlist` or their extension is in `extension_allowlist`. Inlining depends on the call as well as the function: calls relying on argument defaults, named arguments, set-returning calls outside `FROM`, and aggregate or window syntax are blocked.
 - Functions that aren't in the catalog. This includes functions created after PgDog last loaded the schema.
 - Built-ins that execute SQL or reach outside the statement, such as `query_to_xml`, `dblink*` and `lo_*`.
 - Fast-path function calls, which carry no SQL to analyze.

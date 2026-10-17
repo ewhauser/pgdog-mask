@@ -3,19 +3,19 @@ title: Configuration
 description: Every key of the plugin's configuration file.
 ---
 
-The configuration file is TOML in the style of PgDog's own files: top-level `[[array tables]]`, flat keys, and the same `database`/`schema`/`name`/`column` keys as PgDog's `[[sharded_tables]]`. Unknown keys are errors.
+The configuration file is TOML in the style of PgDog's own files: top-level `[[array tables]]`, flat keys, and the same `database`/`schema`/`name`/`column` keys as PgDog's `[[sharded_tables]]`. Unknown keys are errors, except inside a proxy mask's `options` table: pgdog-mask passes it to the mask as is, and each mask reads the options it knows. The built-in proxy masks ignore keys they don't use, so a misspelled option there isn't reported.
 
 ## `[general]`
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `mode` | `"enforce"` | `enforce`: rewrite and block statements. `shadow`: analyze and log what would happen, without changing statements. `off`: do nothing. See [shadow mode](../../start/shadow-mode/). |
+| `mode` | `"enforce"` | `enforce`: rewrite and block statements, mask results, and remove error details. `shadow`: analyze and log what would happen, without changing statements, results or errors. `off`: do nothing. See [shadow mode](../../start/shadow-mode/). |
 | `on_unresolved` | `"block"` | What to do when a masked user's statement references a relation that isn't in the catalog: `block` or `allow`. |
 | `udf_allowlist` | `[]` | Functions masked users may call without analysis, schema-qualified, e.g. `"public.normalize_phone"`. Listing one attests that it doesn't return masked data. |
 | `extension_allowlist` | `[]` | Extensions whose functions and operators masked users may call, e.g. `"citext"`. |
 | `view_allowlist` | `[]` | Views masked users may query without analysis. Listing one attests that it doesn't return masked data. |
 | `inline_views` | `true` | Inline views over masked columns with masks applied. `false` queries every view like a table. See [Views and functions](../../configure/views-functions/). |
-| `scrub_error_detail` | `true` | Remove `DETAIL` from the errors and notices masked users get. See [Error details](../../configure/errors/). |
+| `scrub_error_detail` | `true` | Remove `DETAIL` from the errors and notices masked users get, in `enforce` mode. See [Error and notice redaction](../../configure/errors/). |
 | `tag_source` | `"config"` | Where column tags come from besides this file: `config`, `comment` (`pgdog:tag=<name>` in column comments) or `security_label`. See [Tags in the database](../../configure/columns/#tags-in-the-database). |
 | `security_label_provider` | `"pgdog"` | Label provider read with `tag_source = "security_label"`. |
 | `cache_size` | `100000` | Number of analyzed statements to cache. |
@@ -49,7 +49,7 @@ A policy and its default mask. See [Policies and rules](../../configure/policies
 | `roles` | yes | The rule applies to users with any of these roles. |
 | `mask` | yes | The [mask](../masks/) for them, plus its keys. |
 | `search` | no | `"raw"` lets these roles [search on real values](../../configure/raw-search/). Default `"masked"`. |
-| `search_operators` | no | Operators allowed in raw searches. |
+| `search_operators` | no | Operator families allowed in raw searches. Replaces the default list; see [`search_operators`](../../configure/raw-search/#search_operators). |
 
 `search` and `search_operators` can also be set on the policy itself, for its default mask.
 
@@ -124,6 +124,12 @@ proxy = "ff1"
 options = { key_env = "CARD_FF1_KEY" }
 fallback = "partial"
 keep_suffix = 4
+
+# Without this rule, admin would get the card policy's default mask:
+# each policy is exempted separately.
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
 
 [[tags]]
 name = "pii.ssn"

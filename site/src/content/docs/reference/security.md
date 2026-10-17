@@ -3,11 +3,17 @@ title: Security model
 description: What pgdog-mask protects against, and what your deployment must enforce.
 ---
 
-## What it protects
+## What it's designed to protect
 
-A client connected through PgDog as a masked user, sending arbitrary SQL, can't read the values of masked columns: not directly, and not by inference through filters, ordering, aggregates, errors, side tables, statistics, functions, views, `COPY` or cursors. The plugin rewrites what it can mask and blocks what it can't prove safe.
+The goal: a client connected through PgDog as a masked user, sending arbitrary SQL, can't read the values of masked columns, not directly, and not by inference through filters, ordering, aggregates, errors, side tables, statistics, functions, views, `COPY` or cursors. The plugin rewrites what it can mask and blocks what it can't prove safe.
 
-Leaks are tested directly: the canary suite seeds masked columns with unique values, runs an adversarial corpus as a masked user against Postgres, and fails if a canary appears anywhere in rows, errors, notices or `COPY` output.
+That's the intended guarantee, and it holds only:
+
+- in `enforce` mode: `shadow` and `off` change nothing;
+- under the deployment assumptions below;
+- with the exceptions under [known limits](#known-limits), including raw search, which deliberately allows confirming guesses.
+
+Leaks are tested directly: the canary suite seeds masked columns with unique values, runs an adversarial corpus as a masked user against Postgres, and fails if a canary appears anywhere in rows, errors, notices or `COPY` output. Tests show the absence of the leaks they try, not of every leak: an analyzer bug could still let a statement through. That's why the deployment assumptions include defense in depth.
 
 ## What your deployment must enforce
 
@@ -15,11 +21,12 @@ Leaks are tested directly: the canary suite seeds masked columns with unique val
 2. **The Postgres role masked users run as doesn't own the masked tables, and can't create functions or views.** This is defense in depth, should the analyzer have a bug: a role that can't create code can't hide a leak in it.
 3. **Configuration and keys are protected like credentials.** Whoever can change the configuration can unmask any column. Keep proxy mask keys in environment variables or files readable only by PgDog.
 4. **Column comments and security labels are protected like configuration**, with `tag_source = "comment"` or `"security_label"`. Removing a tag unmasks its column. Masked users can't change them through PgDog, but table owners and migrations can.
-5. **PgDog runs with `required = true`** for the plugin, so it never serves traffic without masking.
+5. **PgDog runs with `required = true`** for the plugin, so it doesn't serve traffic without masking.
+6. **No masked column is a sharding key** or PgDog's tenant column. The plugin doesn't see PgDog's sharding configuration and can't check this. See [Choose masked columns](../../configure/columns/#dont-mask-sharding-keys).
 
 ## Identity
 
-Masking decisions use the PgDog user the client authenticated as. `SET ROLE` and client-supplied values such as `application_name` never change them. See [Users and roles](../../configure/users/#which-identity-counts).
+Masking decisions use the PgDog user the client authenticated as. `SET ROLE` and client-supplied values such as `application_name` don't change them. See [Users and roles](../../configure/users/#which-identity-counts).
 
 ## Known limits
 
@@ -28,3 +35,4 @@ Masking decisions use the PgDog user the client authenticated as. `SET ROLE` and
 - **Raw search** deliberately allows confirming guesses, for the roles you give it to. See [Search on masked columns](../../configure/raw-search/#what-youre-allowing).
 - **Copies of masked data** elsewhere, unmasked: denormalized columns, JSON documents, audit tables, or tables exempt users fill. Classifiers help find columns by name.
 - **Allowlisted code** (`udf_allowlist`, `extension_allowlist`, `view_allowlist`) runs without analysis. Only list code that can't return masked data.
+- **Auditing.** The plugin's logs record analysis decisions, not every execution, so they can't show every access to a masked column or every raw search. See [Logs and maintenance](../../operate/logs/#analysis-logs-not-an-audit-trail).

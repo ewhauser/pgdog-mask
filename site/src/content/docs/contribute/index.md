@@ -14,12 +14,15 @@ description: Build pgdog-mask, run its test suites, and work on this documentati
 | `tests` | Canary leak tests and end-to-end tests. |
 | `integration` | Scripts that build PgDog and run the plugin in it. |
 | `example/custom-mask` | A plugin with a custom proxy mask. |
-| `docs/DESIGN.md` | The [design](design/). |
+| `docs/DESIGN.md` | The [design notes](design/). |
 | `site` | This documentation. |
 
 ## Tests
 
-Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database. Override these with the usual `PG*` variables.
+Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database.
+
+- `cargo test`'s canary tests connect with `PGDOG_MASK_TEST_URL`, a libpq connection string. Its default is `host=127.0.0.1 user=pgdog password=pgdog dbname=pgdog`. They don't read the `PG*` variables.
+- The `integration/` scripts use the usual `PG*` variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`), with the same defaults.
 
 ```bash
 cargo test                       # unit tests and canary leak tests
@@ -48,6 +51,6 @@ pnpm dev     # http://localhost:4321/pgdog-mask/
 pnpm build   # also checks every internal link
 ```
 
-Pages are Markdown in `site/src/content/docs`; the sidebar is in `site/astro.config.mjs`. `pnpm sync`, run before `dev` and `build`, publishes `docs/DESIGN.md` as the [design](design/) page: edit it there.
+Pages are Markdown in `site/src/content/docs`; the sidebar is in `site/astro.config.mjs`. `pnpm sync`, run before `dev` and `build`, publishes `docs/DESIGN.md` as the [design notes](design/) page, which is left out of search: edit it there.
 
 The site deploys to GitHub Pages from `main`, through `.github/workflows/site.yml`.

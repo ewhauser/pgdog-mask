@@ -5,7 +5,7 @@ description: What masking costs, measured with pgbench, and how to run the bench
 
 ## Results
 
-Median transactions per second from `integration/bench/bench.sh`: 3 runs of 10 seconds per row, 16 clients, scale 20, on an Apple M3 Max with Postgres 16, PgDog and pgbench on the same machine. *vs PgDog* compares each pgdog-mask user with PgDog without the plugin.
+Median transactions per second from `integration/bench/bench.sh`: 3 runs of 10 seconds per row, 16 clients, scale 20, on an Apple M3 Max with Postgres 16, PgDog and pgbench on the same machine. *vs PgDog* compares each pgdog-mask user with PgDog without the plugin. Differences of a few percent are within run-to-run variation; each report gives the spread.
 
 | Workload | Protocol | Postgres direct | PgDog | exempt | masked | vs PgDog |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -18,10 +18,10 @@ Median transactions per second from `integration/bench/bench.sh`: 3 runs of 10 s
 | orm: `SELECT *` over 34 columns | simple | 62,212 | 41,573 | 41,296 | 31,535 | −24.1% |
 | | extended | 57,588 | 39,034 | 39,382 | 29,026 | −25.6% |
 | | prepared | 119,927 | 56,223 | 56,297 | 53,343 | −5.1% |
-| proxy: 20 rows, `hmac_sha256` | simple | 132,130 | 71,633 | 71,589 | 57,795 | −19.3% |
-| | prepared | 135,392 | 71,937 | 71,841 | 62,278 | −13.4% |
-| proxy_batch: 500 rows, `hmac_sha256` | simple | 48,235 | 24,469 | 23,840 | 6,650 | −72.8% |
-| | prepared | 52,827 | 26,007 | 25,441 | 6,722 | −74.2% |
+| proxy: 20 rows, `hmac_sha256` | simple | 151,432 | 75,648 | 75,701 | 75,284 | −0.5% |
+| | prepared | 148,489 | 75,367 | 76,224 | 75,451 | +0.1% |
+| proxy_batch: 500 rows, `hmac_sha256` | simple | 49,459 | 24,047 | 21,966 | 12,482 | −48.1% |
+| | prepared | 54,106 | 24,792 | 24,295 | 14,070 | −43.2% |
 
 Lookups by an indexed, masked column, with and without [raw search](../../configure/raw-search/):
 
@@ -31,18 +31,25 @@ Lookups by an indexed, masked column, with and without [raw search](../../config
 | extended | 136,125 | 73,325 | 72,581 | 320 | −99.6% | 73,915 | +0.8% |
 | prepared | 168,625 | 82,545 | 82,000 | 325 | −99.6% | 81,943 | −0.7% |
 
+Sources, with every protocol, latency percentiles and spread:
+
+- [`published/20261016-204855.md`](https://github.com/ewhauser/pgdog-mask/blob/main/integration/bench/published/20261016-204855.md): every row except `proxy` and `proxy_batch`. PgDog `b90f1926`. The report records pgdog-mask `484fd75-dirty`: it was run before the benchmark itself was committed, in `7476ab1`.
+- [`published/20261017-005209.md`](https://github.com/ewhauser/pgdog-mask/blob/main/integration/bench/published/20261017-005209.md): `proxy` and `proxy_batch`, after proxy masks were optimized in `615d8ab`. PgDog `b90f1926`. The report records pgdog-mask `6949462`, an earlier commit with the same tree as `615d8ab`.
+
+The two runs were made on the same machine with the same settings, a few hours apart; compare rows within a run.
+
 What they show:
 
 - **PgDog itself** roughly halves the throughput of these sub-millisecond queries compared with Postgres directly, with or without the plugin: that's the proxy hop. Masking costs are measured against PgDog.
-- **Exempt users** are within noise of PgDog everywhere.
+- **Exempt users** are within run-to-run variation of PgDog.
 - **SQL masks** cost 1–4% on point queries and joins.
-- **Wide `SELECT *`** costs about 25% over the simple and extended protocols, but 5% with prepared statements. The plugin's analysis is cached in all three; the difference is Postgres planning and evaluating the expanded, masked select list on every execution, which prepared statements avoid.
-- **Lookups by a masked column** can't use its index, and scan the table: 99.6% slower here, with 100,000 rows. With `search = "raw"`, the condition compares real values and runs as fast as without masking, while results stay masked. Choose raw search for columns users look rows up by, if your security model allows it.
-- **Proxy masks** cost per value: 13–19% for 20 rows, and about 73% for 500 rows, where every row's value goes through the plugin's HMAC. Use SQL masks unless you need a key or code.
+- **Wide `SELECT *`** costs about 25% over the simple and extended protocols, but 5% with prepared statements. The plugin's analysis is cached in all three, so the difference comes from Postgres executing the expanded, masked statement. Planning is a likely part of it: a prepared statement can reuse a plan, while the simple and extended runs plan every execution. The masked expressions are still evaluated on every execution, prepared or not, and Postgres may plan a prepared statement again for its parameters (see [`PREPARE`](https://www.postgresql.org/docs/current/sql-prepare.html)). The benchmark measures the difference; it doesn't isolate the cause.
+- **Lookups by a masked column** can't use its index, and scan the table: 99.6% lower throughput here, with 100,000 rows. With `search = "raw"`, the condition compares real values and ran within a few percent of PgDog, while results stay masked. Choose raw search for columns users look rows up by, if your security model allows it.
+- **Proxy masks** cost per value: within variation for 20 rows, and 39–48% lower throughput for 500 rows, where every row's value goes through the plugin's HMAC. Use SQL masks unless you need a key or code.
 
 ## Per statement
 
-Decisions are cached per statement and masking profile. Statements that differ only in their literal values share one analysis (their **shape**), so simple-protocol clients that inline values don't cause a new analysis per statement. Prepared statements are only analyzed when they're prepared.
+Decisions are cached per statement and masking profile. Statements that differ only in their literal values share one analysis (their **shape**), so simple-protocol clients that inline values don't cause a new analysis per statement. Prepared statements are analyzed when they're prepared, and again only after a reload, a schema change or a change of the session's `search_path`.
 
 `cargo bench --bench overhead` measures the plugin alone, without the network or Postgres:
 
