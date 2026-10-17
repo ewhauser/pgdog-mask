@@ -28,7 +28,7 @@ git clone https://github.com/ewhauser/pgdog-mask
 git clone https://github.com/ewhauser/pgdog
 ```
 
-pgdog-mask needs PgDog's plugin API 0.7, which is on the [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api) fork. pgdog-mask's `Cargo.toml` pins the exact commit.
+pgdog-mask needs PgDog's plugin API 0.8, which is on the [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api) fork. pgdog-mask's `Cargo.toml` pins the exact commit.
 
 ## 2. Build PgDog at the pinned commit
 

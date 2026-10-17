@@ -7,7 +7,7 @@ Views and functions could otherwise read masked columns on a masked user's behal
 
 ## Views
 
-A view whose definition reads masked columns is **inlined**: `FROM user_ssns` becomes `FROM (<its definition>) AS user_ssns`, masked like any subquery. Nested views are inlined recursively.
+A view whose definition reads masked columns, with SQL or proxy masks, is **inlined**: `FROM user_ssns` becomes `FROM (<its definition>) AS user_ssns`, masked like any subquery. Nested views are inlined recursively. Inlining doesn't change the plan, because Postgres expands views into subqueries the same way. A proxy-masked column the view passes through keeps its proxy mask, and columns the view computes from it return `NULL`.
 
 Some views are queried **like tables** instead:
 
@@ -16,7 +16,7 @@ Some views are queried **like tables** instead:
 - views with masked columns of their own (assigned in `[[masked_columns]]` or by tags);
 - every view, with `inline_views = false`.
 
-Columns of a table-like view that pass a masked column through unchanged get its mask. Columns computed from masked columns are blocked, unless you assign them a policy.
+Columns of a table-like view that pass a masked column through unchanged get its mask, SQL or proxy. Columns computed from masked columns are blocked, unless you assign them a policy. When every masked column one is computed from has a proxy mask for the user, it returns `NULL` instead, and conditions on it use real values.
 
 Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked.
 
@@ -27,14 +27,16 @@ Writes through views that read masked columns are blocked, and views without a d
 SQL-language functions are analyzed:
 
 - A function that reads no masked columns is called as is.
-- One that does is **inlined** with masks applied, if both the function and the call allow it (below).
-- Otherwise the statement is blocked.
+- One that reads SQL-masked columns is **inlined** with masks applied, if both the function and the call allow it (below). Otherwise the statement is blocked.
+- One that reads only proxy-masked columns is called as is, never inlined, since inlining could change the plan. Its result is `NULL`, and the statement's [errors are redacted](../errors/#per-statement-redaction). Volatility, `SECURITY DEFINER` and `SET` options don't matter for these.
+- A call that passes proxy-masked values as arguments, such as `last4(ssn)`, returns `NULL`. The plugin also checks the function's body, and blocks the call if an argument could reach a write or a side effect, such as an `INSERT` or `pg_notify`, directly or through another function. This check applies under plain `EXPLAIN` too: the planner can call an operator's function on values from the column's statistics.
+- A function whose body changes name resolution, with `SET search_path`, `SET ROLE`, `RESET ALL`, `DISCARD ALL`, or `set_config` of `search_path` or `role`, is blocked for every masked user. The change would outlive the call without the plugin seeing it. A function's own `SET search_path` option is fine: Postgres restores it when the function returns.
 
 User-defined operators are treated as calls to their functions.
 
 ### When a function can be inlined
 
-The function must:
+These conditions only concern functions whose body reads SQL-masked columns. The function must:
 
 - have a body that's a single `SELECT`, not selecting `*`;
 - be `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, with no `SET` options;
@@ -66,4 +68,4 @@ udf_allowlist = ["public.normalize_phone"]   # functions, schema-qualified
 extension_allowlist = ["citext"]             # all functions and operators of an extension
 ```
 
-Listing a function or extension attests that it doesn't return or leak masked data. The plugin calls it without analysis.
+Listing a function or extension attests that it doesn't return or leak masked data. The plugin calls it without analysis. Listed functions may also be called with proxy-masked values; their results return `NULL`.

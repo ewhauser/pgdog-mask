@@ -15,7 +15,7 @@ The configuration file is TOML in the style of PgDog's own files: top-level `[[a
 | `extension_allowlist` | `[]` | Extensions whose functions and operators masked users may call, e.g. `"citext"`. |
 | `view_allowlist` | `[]` | Views masked users may query without analysis. Listing one attests that it doesn't return masked data. |
 | `inline_views` | `true` | Inline views over masked columns with masks applied. `false` queries every view like a table. See [Views and functions](../../configure/views-functions/). |
-| `scrub_error_detail` | `true` | Remove `DETAIL` from the errors and notices masked users get, in `enforce` mode. See [Error and notice redaction](../../configure/errors/). |
+| `scrub_error_detail` | `true` | Remove `DETAIL` from the errors and notices masked users get, in `enforce` mode. Ignored for users with proxy masks, who always lose `DETAIL`. See [Error and notice redaction](../../configure/errors/). |
 | `tag_source` | `"config"` | Where column tags come from besides this file: `config`, `comment` (`pgdog:tag=<name>` in column comments) or `security_label`. See [Tags in the database](../../configure/columns/#tags-in-the-database). |
 | `security_label_provider` | `"pgdog"` | Label provider read with `tag_source = "security_label"`. |
 | `cache_size` | `100000` | Number of analyzed statements to cache. |
@@ -52,6 +52,13 @@ A policy and its default mask. See [Policies and rules](../../configure/policies
 | `search_operators` | no | Operator families allowed in raw searches. Replaces the default list; see [`search_operators`](../../configure/raw-search/#search_operators). |
 
 `search` and `search_operators` can also be set on the policy itself, for its default mask.
+
+A policy or rule with `mask = "proxy"` takes `proxy` and `options` (see [Masks](../masks/#proxy-masks)). The configuration is rejected for:
+
+- `search = "raw"` or `search_operators` with `mask = "proxy"`;
+- `value`, `keep_prefix`, `keep_suffix`, `fill`, `digits`, `unit` or `expression` with `mask = "proxy"`;
+- `proxy` or `options` without `mask = "proxy"`;
+- keys that were removed, on any policy or rule: see [Upgrade a deployment](../../operate/upgrade/#upgrading-to-results-only-proxy-masks).
 
 ## `[[masked_columns]]`
 
@@ -97,6 +104,10 @@ name = "support_app"
 roles = ["support"]
 
 [[users]]
+name = "oncall"
+roles = ["engineer"]
+
+[[users]]
 name = "admin"
 roles = ["pii_admin"]
 
@@ -119,10 +130,7 @@ search = "raw"
 [[policies]]
 name = "card"
 data_type = "character varying"
-mask = "proxy"
-proxy = "ff1"
-options = { key_env = "CARD_FF1_KEY" }
-fallback = "partial"
+mask = "partial"
 keep_suffix = 4
 
 # Without this rule, admin would get the card policy's default mask:
@@ -130,6 +138,13 @@ keep_suffix = 4
 [[policies.rules]]
 roles = ["pii_admin"]
 mask = "none"
+
+# Engineers run production SQL with the real plan, and get FF1 ciphertext.
+[[policies.rules]]
+roles = ["engineer"]
+mask = "proxy"
+proxy = "ff1"
+options = { key_env = "CARD_FF1_KEY" }
 
 [[tags]]
 name = "pii.ssn"

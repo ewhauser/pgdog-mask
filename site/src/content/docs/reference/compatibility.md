@@ -5,9 +5,15 @@ description: The PgDog, Rust and Postgres versions pgdog-mask works with.
 
 ## PgDog
 
-pgdog-mask needs PgDog's plugin API **0.7**: statement verdicts, column masks, error redaction and the typed catalog. It's only on the [`masking/plugin-api`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api) branch of the `ewhauser/pgdog` fork. It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form: the API, and pgdog-mask with it, may have to change.
+pgdog-mask needs PgDog's plugin API **0.8**: statement verdicts, column masks (including `NULL` masks), error redaction (for every error, and per statement) and the typed catalog. It's only on the [`masking/plugin-api`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api) branch of the `ewhauser/pgdog` fork. It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form: the API, and pgdog-mask with it, may have to change.
 
-`Cargo.toml` pins the exact commit, currently [`b90f1926`](https://github.com/ewhauser/pgdog/commit/b90f19265020a434d5cd5446e51abfda84865a17). Build PgDog from that commit. PgDog checks the plugin API version (major and minor) when it loads a plugin, and skips plugins built for another one.
+`Cargo.toml` pins the exact commit, currently `ebfa85d6`. Build PgDog from that commit. PgDog checks the plugin API version (major and minor) when it loads a plugin, and skips plugins built for another one.
+
+Besides the API, pgdog-mask relies on PgDog behavior at that commit:
+
+- results of a query with several statements are numbered by statement, including statements PgDog answers itself, such as `SET`;
+- with a statement plugin loaded, a `Bind` or `Describe` of a prepared statement the client didn't prepare through PgDog is refused with `26000`, so a client can't run another client's server-side statement without the plugin's decision;
+- `SET search_path`, and a query that's only a `SELECT set_config('search_path', '…', false)` with literal arguments, update the session's `search_path`, which the plugin analyzes statements with.
 
 ## Rust
 

@@ -4,7 +4,7 @@ description: Mask sensitive Postgres columns per user, in PgDog, without changin
 tableOfContents: false
 hero:
   title: Dynamic data masking for PgDog
-  tagline: Apply column masking policies by authenticated user. SQL masks rewrite column references before execution; proxy masks transform supported result columns before they reach the client.
+  tagline: Apply column masking policies by authenticated user. SQL masks rewrite column references before execution; proxy masks mask result columns in code, and outputs computed from them return NULL.
   actions:
     - text: Install the plugin
       link: ./start/install/
@@ -18,7 +18,7 @@ hero:
 ---
 
 :::caution[Requires a PgDog fork]
-pgdog-mask uses PgDog's plugin API 0.7, which is only on the
+pgdog-mask uses PgDog's plugin API 0.8, which is only on the
 [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api)
 fork. It has been proposed upstream in
 [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but
@@ -33,7 +33,7 @@ pgdog-mask is a [PgDog](https://github.com/pgdogdev/pgdog) plugin modeled on Sno
 A column is masked in one of two ways:
 
 - **SQL masks**, in the statement. References to the column, in the select list, `WHERE`, joins, `ORDER BY`, aggregates, subqueries, `RETURNING` or `COPY`, are replaced with the policy's mask before PgDog sends the statement on, so filters, sorting and aggregates work on masked values. Statements the plugin can't mask safely are blocked.
-- **Proxy masks**, in the results. Postgres returns the real value to PgDog, and the plugin replaces it with a value computed in code, for keyed hashes, format-preserving encryption, vault tokens or your own Rust. They cover plain output columns of a single `SELECT`; every other reference to the column gets an SQL mask.
+- **Proxy masks**, in the results. Postgres runs the statement unchanged, on real values, with the same plan, and the plugin replaces each output column that passes the column through with a value computed in code: keyed hashes, format-preserving encryption, vault tokens or your own Rust. Outputs computed from the column return `NULL`. Conditions and ordering use real values, so proxy masks are for trusted roles, such as engineers debugging production queries.
 
 ```sql
 -- With an SQL mask on ssn, a support agent sends:
