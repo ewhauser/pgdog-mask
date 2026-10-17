@@ -1788,7 +1788,7 @@ fn functions() -> Vec<Case> {
         case(
             "P2",
             "SELECT stash(ssn) FROM users",
-            Block("calling public.stash() would move values"),
+            Block("function public.stash() can pass a parameter to a write or a side effect"),
         ),
         case(
             "P3",
@@ -1883,23 +1883,23 @@ fn param_sinks() -> Vec<Case> {
         case(
             "P14",
             "SELECT notify_fn(ssn) FROM users",
-            Block("calling public.notify_fn() would move values"),
+            Block("function public.notify_fn() can pass a parameter to a write or a side effect"),
         ),
         case(
             "P14+",
             "SELECT id FROM users WHERE notify_fn(ssn) IS NULL",
-            Block("calling public.notify_fn()"),
+            Block("function public.notify_fn() can pass a parameter"),
         ),
         // Positional and qualified parameters.
         case(
             "P14+",
             "SELECT notify_p(ssn) FROM users",
-            Block("calling public.notify_p()"),
+            Block("function public.notify_p() can pass a parameter"),
         ),
         case(
             "P14+",
             "SELECT notify_q(upper(ssn)) FROM users",
-            Block("calling public.notify_q()"),
+            Block("function public.notify_q() can pass a parameter"),
         ),
         // Clean arguments don't reach the body's sink.
         case("P14+", "SELECT notify_fn(name) FROM users", allow()),
@@ -1907,7 +1907,7 @@ fn param_sinks() -> Vec<Case> {
         case(
             "P15",
             "SELECT wrap_stash(ssn) FROM users",
-            Block("calling public.wrap_stash()"),
+            Block("function public.wrap_stash() can pass a parameter"),
         ),
         case(
             "P16+",
@@ -1928,12 +1928,12 @@ fn param_sinks() -> Vec<Case> {
         case(
             "P20",
             "SELECT * FROM stash((SELECT ssn FROM users LIMIT 1)) s",
-            Block("calling public.stash()"),
+            Block("function public.stash() can pass a parameter"),
         ),
         case(
             "P23",
             "SELECT id FROM users WHERE ssn ~~~ 'x'",
-            Block("calling public.noisy_eq()"),
+            Block("function public.noisy_eq() can pass a parameter"),
         ),
         case(
             "P24",
@@ -2139,12 +2139,12 @@ fn explain() -> Vec<Case> {
         case(
             "R17",
             "EXPLAIN SELECT id FROM users WHERE ssn ~~~ 'x'",
-            Block("calling public.noisy_eq()"),
+            Block("function public.noisy_eq() can pass a parameter"),
         ),
         case(
             "R17+",
             "EXPLAIN SELECT notify_fn(ssn) FROM users",
-            Block("calling public.notify_fn()"),
+            Block("function public.notify_fn() can pass a parameter"),
         ),
         // The planner runs IMMUTABLE functions on constants, and the plan
         // shows the result.

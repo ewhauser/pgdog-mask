@@ -494,11 +494,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// parameters go, records that they can reach a sink instead: any
     /// non-Clean value may carry them.
     pub(super) fn sink_when_planned(&mut self, taint: Taint, what: &str) {
-        if let Some(params) = &mut self.params {
-            params.sinks |= !taint.is_clean();
-            return;
-        }
-        self.check_taint(taint, |masker| {
+        self.sink_with(taint, |masker| {
             let labels = &masker.state.proxy_labels;
             if labels.is_empty() {
                 format!("{what} would move values of proxy-masked columns where PgDog can't mask them")
@@ -509,6 +505,15 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 )
             }
         });
+    }
+
+    /// `sink_when_planned`, saying why with `reason`.
+    pub(super) fn sink_with(&mut self, taint: Taint, reason: impl FnOnce(&Self) -> String) {
+        if let Some(params) = &mut self.params {
+            params.sinks |= !taint.is_clean();
+            return;
+        }
+        self.check_taint(taint, reason);
     }
 
     /// The outputs of the query level that finished last would move where

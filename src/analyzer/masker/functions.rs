@@ -292,7 +292,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 .copied()
                 .find(|function| self.param_sinks(function))
         {
-            self.sink_when_planned(args, &format!("calling {}()", function.qualified_name()));
+            let name = function.qualified_name();
+            self.sink_with(args, |_| {
+                format!(
+                    "function {name}() can pass a parameter to a write or a side effect, so it can't be called with values of proxy-masked columns"
+                )
+            });
         }
     }
 
