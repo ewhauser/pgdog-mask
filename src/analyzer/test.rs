@@ -2,6 +2,8 @@ use super::*;
 use crate::catalog::{Column, Function, Operator, Relation, RelationKind};
 use crate::config::Config;
 
+pub(crate) mod proxy;
+
 pub(crate) const CONFIG: &str = r#"
 [general]
 udf_allowlist = ["public.safe_fn"]
@@ -389,6 +391,11 @@ pub(crate) fn catalog() -> Catalog {
                 "user_contacts",
                 &["id", "ssn", "email"],
                 " SELECT users.id, users.ssn, users.email FROM public.users;",
+            ),
+            relation(
+                "tags",
+                RelationKind::Table,
+                vec![column("id", "bigint"), column("labels", "text[]")],
             ),
         ],
     );
@@ -1114,15 +1121,16 @@ const SHAPE_CORPUS: &[&str] = &[
     "SELECT b FROM users AS x(a, b) WHERE x.a = 1",
 ];
 
+/// SQL as the deparser writes it, to compare rewrites.
+fn canonical(sql: &str) -> String {
+    let parsed = pg_raw_parse::parse(sql)
+        .unwrap_or_else(|err| panic!("rewrite doesn't parse: {err}\n{sql}"))
+        .into_inner();
+    pg_raw_parse::deparse_stmts(parsed.iter()).unwrap()
+}
+
 #[test]
 fn test_shape_path_matches_full_analysis() {
-    fn canonical(sql: &str) -> String {
-        let parsed = pg_raw_parse::parse(sql)
-            .unwrap_or_else(|err| panic!("rewrite doesn't parse: {err}\n{sql}"))
-            .into_inner();
-        pg_raw_parse::deparse_stmts(parsed.iter()).unwrap()
-    }
-
     let mut checked = 0;
     for user in ["anonymous", "support", "admin"] {
         for sql in SHAPE_CORPUS {
@@ -1150,14 +1158,14 @@ fn test_shape_path_matches_full_analysis() {
                         masked: ma,
                         raw: ra,
                         touches_masked: ta,
-                        proxies: pa,
+                        results: pa,
                     },
                     Outcome::Rewritten {
                         sql: b,
                         masked: mb,
                         raw: rb,
                         touches_masked: tb,
-                        proxies: pb,
+                        results: pb,
                     },
                 ) => {
                     assert_eq!(canonical(a), canonical(b), "{user}: {sql}");
@@ -1597,147 +1605,4 @@ fn test_table_functions_are_items() {
         "anonymous",
         "SELECT (SELECT ssn FROM JSON_TABLE('{}'::jsonb, '$' COLUMNS (ssn text PATH '$.a', NESTED PATH '$.b' COLUMNS (b int))) j) FROM users",
     );
-}
-
-/// The ssn policy with a proxy mask, and a partial SQL fallback.
-const PROXY_CONFIG: &str = r#"
-[[users]]
-name = "admin"
-roles = ["pii_admin"]
-
-[[policies]]
-name = "ssn"
-data_type = "character varying"
-mask = "proxy"
-proxy = "test.reverse"
-fallback = "partial"
-keep_suffix = 4
-
-[[policies.rules]]
-roles = ["pii_admin"]
-mask = "none"
-
-[[masked_columns]]
-name = "users"
-column = "ssn"
-policy = "ssn"
-"#;
-
-struct Reverse;
-
-impl crate::proxy::ProxyMask for Reverse {
-    fn accepts(&self, _data_type: &str) -> bool {
-        true
-    }
-
-    fn mask(
-        &self,
-        value: crate::proxy::Datum,
-    ) -> Result<crate::proxy::Datum, crate::proxy::MaskError> {
-        Ok(value)
-    }
-}
-
-fn analyze_proxy(user: &str, sql: &str) -> Outcome {
-    let mut registry = crate::proxy::Registry::default();
-    registry.register("test.reverse", |_: &crate::proxy::Options| Ok(Reverse));
-    let policies =
-        Policies::with_registry(Config::from_toml(PROXY_CONFIG).unwrap(), &registry).unwrap();
-    let catalog = catalog();
-    let assignments = Assignments::new(&policies, "db", &catalog);
-    let profile = policies.profile(user, "db");
-    let ctx = Context {
-        catalog: &catalog,
-        assignments: &assignments,
-        policies: &policies,
-        profile: &profile,
-        search_path: vec!["public".into()],
-    };
-    analyze(sql, &ctx)
-}
-
-/// Output positions of proxy-masked columns, and the SQL sent.
-fn proxied(sql: &str) -> (Vec<u16>, String) {
-    match analyze_proxy("anonymous", sql) {
-        Outcome::Unchanged { proxies, .. } => {
-            (proxies.iter().map(|p| p.column).collect(), sql.to_owned())
-        }
-        Outcome::Rewritten { proxies, sql, .. } => {
-            (proxies.iter().map(|p| p.column).collect(), sql)
-        }
-        Outcome::Blocked { reason } => panic!("{sql:?} blocked: {reason}"),
-    }
-}
-
-#[test]
-fn test_proxy_outputs() {
-    // Plain outputs are left raw for the proxy mask.
-    let (columns, sql) = proxied("SELECT id, ssn FROM users");
-    assert_eq!(columns, [1]);
-    assert_eq!(sql, "SELECT id, ssn FROM users");
-    let Outcome::Unchanged { proxies, .. } =
-        analyze_proxy("anonymous", "SELECT ssn AS s FROM users")
-    else {
-        panic!("unchanged");
-    };
-    assert_eq!(
-        proxies,
-        [ProxyColumn {
-            column: 0,
-            proxy: 0,
-            type_oid: 1043
-        }]
-    );
-
-    // Other references still get the fallback.
-    let (columns, sql) = proxied("SELECT ssn FROM users WHERE ssn = '123'");
-    assert_eq!(columns, [0]);
-    assert!(
-        sql.starts_with("SELECT ssn AS ssn FROM users WHERE"),
-        "{sql}"
-    );
-    assert!(sql.contains("repeat"), "{sql}");
-
-    // Stars over masked relations are expanded first.
-    let (columns, _) = proxied("SELECT * FROM users");
-    assert_eq!(columns, [2]);
-    let (columns, _) = proxied("SELECT u.* FROM users u JOIN orders o ON o.user_id = u.id");
-    assert_eq!(columns, [2]);
-}
-
-#[test]
-fn test_proxy_fallbacks() {
-    for sql in [
-        // Ordered, deduplicated or grouped by raw values.
-        "SELECT ssn FROM users ORDER BY ssn",
-        "SELECT ssn FROM users ORDER BY 1",
-        "SELECT DISTINCT ssn FROM users",
-        "SELECT ssn, count(*) FROM users GROUP BY ssn",
-        // Not a plain output column.
-        "SELECT upper(ssn) FROM users",
-        "SELECT ssn || '' FROM users",
-        // Not the top level.
-        "SELECT s.ssn FROM (SELECT ssn FROM users) s",
-        "WITH u AS (SELECT ssn FROM users) SELECT ssn FROM u",
-        "SELECT ssn FROM users UNION ALL SELECT ssn FROM users",
-        "SELECT (SELECT ssn FROM users LIMIT 1)",
-        // Positions after an unexpanded star are unknown.
-        "SELECT o.*, u.ssn FROM orders o JOIN users u ON o.user_id = u.id",
-        // Not a single SELECT.
-        "SELECT ssn FROM users; SELECT 1",
-        "COPY (SELECT ssn FROM users) TO STDOUT",
-        "INSERT INTO orders (id) SELECT id FROM users WHERE ssn = '1' RETURNING id",
-    ] {
-        let (columns, rewritten) = proxied(sql);
-        assert!(columns.is_empty(), "{sql}: {columns:?}");
-        if sql.contains("ssn") && !sql.starts_with("INSERT") {
-            assert!(rewritten.contains("repeat"), "{sql} → {rewritten}");
-        }
-    }
-
-    // Exempt users get raw values everywhere.
-    let Outcome::Unchanged { proxies, .. } = analyze_proxy("admin", "SELECT ssn FROM users") else {
-        panic!("unchanged");
-    };
-    assert!(proxies.is_empty());
 }

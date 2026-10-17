@@ -1,10 +1,11 @@
 //! Name resolution scopes.
+use std::collections::HashMap;
 use std::ops::Range;
 
 use pg_raw_parse::{Node, raw::SetOperation};
 
 use super::shape::is_placeholder;
-use super::taint::{OutputColumn, Outputs, Taint};
+use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::catalog::Relation;
 
 /// Columns every table has besides its own, which qualified names can read.
@@ -19,6 +20,12 @@ pub(super) struct Item<'c> {
     /// Only visible to qualified references, qualified stars and whole-row
     /// references: PG18 RETURNING `old` and `new`.
     pub qualified_only: bool,
+    /// The recursive CTE this item reads while that CTE is still being
+    /// analyzed.
+    pub pending: Option<String>,
+    /// A function in FROM: `*` over it has unknown width, even when its
+    /// column names are known.
+    pub function: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +59,8 @@ impl<'c> Item<'c> {
             refname,
             kind: ItemKind::Relation { relation, names },
             qualified_only: false,
+            pending: None,
+            function: false,
         }
     }
 
@@ -60,19 +69,19 @@ impl<'c> Item<'c> {
             refname,
             kind: ItemKind::Derived(outputs),
             qualified_only: false,
+            pending: None,
+            function: false,
         }
     }
 
-    /// Is the column visible in this item? `None` if unknown.
-    fn has_column(&self, name: &str) -> Option<bool> {
-        match &self.kind {
-            ItemKind::Relation { names, .. } => Some(names.iter().any(|n| n == name)),
-            ItemKind::Derived(outputs) => outputs.has_column(name),
-        }
+    /// Does this item belong to the recursive CTE being analyzed? Its
+    /// columns aren't known yet, and reading them isn't a taint source.
+    fn pending_in(&self, current_cte: Option<&str>) -> bool {
+        self.pending.is_some() && self.pending.as_deref() == current_cte
     }
 
     /// The relation column behind a visible column name.
-    fn relation_column(&self, name: &str) -> Option<(&'c Relation, &'c str)> {
+    pub fn relation_column(&self, name: &str) -> Option<(&'c Relation, &'c str)> {
         match &self.kind {
             ItemKind::Relation { relation, names } => names
                 .iter()
@@ -88,6 +97,8 @@ impl<'c> Item<'c> {
 pub(super) struct Cte {
     pub name: String,
     pub outputs: Outputs,
+    /// A recursive CTE still being analyzed: its outputs are placeholders.
+    pub pending: bool,
 }
 
 /// Names visible in one query level.
@@ -104,6 +115,8 @@ pub(super) struct Frame<'c> {
     /// Only these items of this level are visible: a JOIN's ON clause, or the
     /// FROM list of UPDATE and DELETE, which can't see the target.
     pub visible: Option<Range<usize>>,
+    /// Named windows of this level, and the taint of their definitions.
+    pub windows: HashMap<String, Taint>,
 }
 
 /// A relation column providing a name.
@@ -120,22 +133,68 @@ pub(super) struct ResolvedColumn<'c> {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum WholeRowOf<'c> {
     Relation(&'c Relation),
-    Derived(Taint),
+    Derived {
+        /// The most any of the item's columns carries.
+        taint: Taint,
+        /// The item is a recursive CTE still being analyzed.
+        pending: bool,
+    },
 }
 
 /// A column reference, resolved the way Postgres does.
 #[derive(Debug, Default)]
 pub(super) struct Resolution<'c> {
     /// Relation columns providing the name at the binding level, first one
-    /// first. `columns[0]` drives SQL masks.
+    /// first. `columns[0]` drives SQL masks; all of them contribute taint
+    /// (USING/NATURAL merges).
     pub columns: Vec<ResolvedColumn<'c>>,
+    /// Union of the taints of derived columns providing the name at the
+    /// binding level, and of the non-Clean columns with uncertain names at
+    /// levels passed on the way out; `None` if there are none.
+    pub derived: Option<Taint>,
     /// Some item certainly provides the name. If none does, the name may be a
     /// whole-row reference, a placeholder, a parameter, a column of an item
     /// with unknown columns, or an error.
     pub certain: bool,
+    /// Every contribution comes from the recursive CTE being analyzed, so
+    /// reading it isn't a taint source.
+    pub pending_only: bool,
     /// `q.N` / `s.q.N` where `q` is a visible item and `N` isn't certainly
     /// one of its columns.
     pub attribute_of: Option<WholeRowOf<'c>>,
+}
+
+/// Contributions to a resolution's derived taint.
+#[derive(Default)]
+struct Contributions {
+    taint: Option<Taint>,
+    /// Some contribution comes from the recursive CTE being analyzed.
+    pending: bool,
+    /// Some contribution comes from anything else.
+    other: bool,
+}
+
+impl Contributions {
+    fn add(&mut self, taint: Taint, pending: bool) {
+        self.taint = Some(self.taint.map_or(taint, |t| t.union(taint)));
+        if pending {
+            self.pending = true;
+        } else {
+            self.other = true;
+        }
+    }
+
+    fn merge(&mut self, other: Contributions) {
+        if let Some(taint) = other.taint {
+            self.taint = Some(self.taint.map_or(taint, |t| t.union(taint)));
+        }
+        self.pending |= other.pending;
+        self.other |= other.other;
+    }
+
+    fn pending_only(&self) -> bool {
+        self.pending && !self.other
+    }
 }
 
 /// Items of `frames[level]` visible from the innermost frame, with their
@@ -156,37 +215,73 @@ pub(super) fn visible_items<'c, 'f>(
     })
 }
 
-/// Resolve a column reference the way Postgres does: innermost query level first.
-pub(super) fn resolve<'c>(frames: &[Frame<'c>], fields: &[&str]) -> Resolution<'c> {
+/// Resolve a column reference the way Postgres does: innermost query level
+/// first. `current_cte` is the CTE being analyzed, whose pending columns
+/// aren't taint sources.
+pub(super) fn resolve<'c>(
+    frames: &[Frame<'c>],
+    fields: &[&str],
+    current_cte: Option<&str>,
+) -> Resolution<'c> {
     match fields {
         [name] => {
+            // Columns that may provide the name at levels passed on the way out.
+            let mut passed = Contributions::default();
             for level in (0..frames.len()).rev() {
-                let mut resolution = Resolution::default();
+                let mut columns = vec![];
+                let mut found = Contributions::default();
+                let mut possible = Contributions::default();
                 for (_, item) in
                     visible_items(frames, level).filter(|(_, item)| !item.qualified_only)
                 {
-                    if item.has_column(name) == Some(true) {
-                        resolution.certain = true;
-                        resolution.columns.extend(item.relation_column(name).map(
-                            |(relation, column)| ResolvedColumn {
-                                relation,
-                                column,
-                                refname: item.refname.clone(),
-                            },
-                        ));
+                    match &item.kind {
+                        ItemKind::Relation { .. } => {
+                            if let Some((relation, column)) = item.relation_column(name) {
+                                columns.push(ResolvedColumn {
+                                    relation,
+                                    column,
+                                    refname: item.refname.clone(),
+                                });
+                                found.other = true;
+                            }
+                        }
+                        ItemKind::Derived(outputs) => match outputs.lookup(name) {
+                            Lookup::Certain(taint) => {
+                                found.add(taint, item.pending_in(current_cte))
+                            }
+                            // Clean possibilities only over-mask if ignored.
+                            Lookup::Possible(taint) if !taint.is_clean() => {
+                                possible.add(taint, item.pending_in(current_cte))
+                            }
+                            Lookup::Possible(_) | Lookup::Absent => (),
+                        },
                     }
                 }
-                if resolution.certain {
-                    return resolution;
+                if !columns.is_empty() || found.taint.is_some() {
+                    // Items that only may provide the name at this level would
+                    // make Postgres report an ambiguity if they did.
+                    found.merge(passed);
+                    return Resolution {
+                        columns,
+                        derived: found.taint,
+                        certain: true,
+                        pending_only: found.pending_only(),
+                        attribute_of: None,
+                    };
                 }
                 // Not found at this level, or only possibly provided by an item
-                // with unknown columns. Postgres would look in outer levels next;
-                // so do we, conservatively.
+                // with uncertain columns. Postgres would look in outer levels
+                // next; so do we, conservatively.
+                passed.merge(possible);
             }
-            Resolution::default()
+            Resolution {
+                derived: passed.taint,
+                pending_only: passed.pending_only(),
+                ..Default::default()
+            }
         }
         [qualifier, name] => find_item(frames, qualifier)
-            .map(|item| item_column(item, name))
+            .map(|item| item_column(item, name, current_cte))
             .unwrap_or_default(),
         [.., schema, table, name] => (0..frames.len())
             .rev()
@@ -197,7 +292,7 @@ pub(super) fn resolve<'c>(frames: &[Frame<'c>], fields: &[&str]) -> Resolution<'
                             && relation.name == *table
                             && item.refname == *table =>
                     {
-                        Some(item_column(item, name))
+                        Some(item_column(item, name, current_cte))
                     }
                     _ => None,
                 })
@@ -208,7 +303,7 @@ pub(super) fn resolve<'c>(frames: &[Frame<'c>], fields: &[&str]) -> Resolution<'
 }
 
 /// A column of a known item, by name.
-fn item_column<'c>(item: &Item<'c>, name: &str) -> Resolution<'c> {
+fn item_column<'c>(item: &Item<'c>, name: &str, current_cte: Option<&str>) -> Resolution<'c> {
     if let Some((relation, column)) = item.relation_column(name) {
         return Resolution {
             columns: vec![ResolvedColumn {
@@ -217,23 +312,35 @@ fn item_column<'c>(item: &Item<'c>, name: &str) -> Resolution<'c> {
                 refname: item.refname.clone(),
             }],
             certain: true,
-            attribute_of: None,
+            ..Default::default()
         };
     }
-    let certain = Resolution {
-        certain: true,
-        ..Default::default()
-    };
+    let pending_only = item.pending_in(current_cte);
     match &item.kind {
-        ItemKind::Relation { .. } if SYSTEM_COLUMNS.contains(&name) => certain,
+        ItemKind::Relation { .. } if SYSTEM_COLUMNS.contains(&name) => Resolution {
+            certain: true,
+            ..Default::default()
+        },
         ItemKind::Relation { relation, .. } => Resolution {
             attribute_of: Some(WholeRowOf::Relation(relation)),
             ..Default::default()
         },
-        ItemKind::Derived(outputs) if outputs.has_column(name) == Some(true) => certain,
-        ItemKind::Derived(outputs) => Resolution {
-            attribute_of: Some(WholeRowOf::Derived(outputs.bound())),
-            ..Default::default()
+        ItemKind::Derived(outputs) => match outputs.lookup(name) {
+            Lookup::Certain(taint) => Resolution {
+                derived: Some(taint),
+                certain: true,
+                pending_only,
+                ..Default::default()
+            },
+            // A name the item may not have: Postgres would call `N(q)`.
+            Lookup::Possible(_) | Lookup::Absent => Resolution {
+                pending_only,
+                attribute_of: Some(WholeRowOf::Derived {
+                    taint: outputs.bound(),
+                    pending: item.pending.is_some(),
+                }),
+                ..Default::default()
+            },
         },
     }
 }
@@ -243,7 +350,7 @@ pub(super) fn resolve_column<'c>(
     frames: &[Frame<'c>],
     fields: &[&str],
 ) -> Option<ResolvedColumn<'c>> {
-    resolve(frames, fields).columns.into_iter().next()
+    resolve(frames, fields, None).columns.into_iter().next()
 }
 
 /// Find a visible FROM item by name, innermost query level first.

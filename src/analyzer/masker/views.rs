@@ -1,14 +1,15 @@
 //! Views over masked columns.
 //!
-//! A view whose definition reads masked columns is inlined: `FROM v` becomes
-//! `FROM (<definition>) AS v(columns)`, and the definition is then masked like
-//! any subquery. Views that would change meaning if inlined (`security_barrier`,
+//! A view whose definition reads masked columns (SQL or proxy) is inlined:
+//! `FROM v` becomes `FROM (<definition>) AS v(columns)`, and the definition is
+//! then masked like any subquery. Postgres expands views the same way, so this
+//! doesn't change plans. Views that would change meaning if inlined (`security_barrier`,
 //! `security_invoker`, materialized views, views with their own masked columns,
 //! or all views with `inline_views = false`) are queried like tables instead;
 //! their columns are masked by lineage (see `Assignments`).
 use pg_raw_parse::{Node, make::Unique, nodes};
 
-use super::{Masker, Verdict, find_cte, ident, names};
+use super::{BodyInfo, Masker, Verdict, find_cte, ident, names};
 use crate::catalog::{Relation, RelationKind};
 
 impl<'c, 'mem> Masker<'c, 'mem> {
@@ -28,43 +29,38 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
 
         let key = (relation.schema.clone(), relation.name.clone());
-        if let Some((verdict, touched)) = self.memo.borrow().views.get(&key).cloned() {
-            self.touched |= touched;
-            return verdict;
+        if let Some(info) = self.memo.borrow().views.get(&key).cloned() {
+            self.touched |= info.touched;
+            return info.verdict;
         }
 
         let label = relation.qualified_name();
         let active = format!("view {label}");
-        let (verdict, touched) = match relation.definition.as_deref() {
-            None => (
-                Verdict::Blocked(format!(
-                    "view {label} has no definition in the catalog, so it can't be checked for masked columns"
-                )),
-                false,
-            ),
-            Some(_) if self.memo.borrow().active.contains(&active) => (
-                Verdict::Blocked(format!("view {label} is recursive")),
-                false,
-            ),
+        let info = match relation.definition.as_deref() {
+            None => BodyInfo::blocked(format!(
+                "view {label} has no definition in the catalog, so it can't be checked for masked columns"
+            )),
+            Some(_) if self.memo.borrow().active.contains(&active) => {
+                BodyInfo::blocked(format!("view {label} is recursive"))
+            }
             Some(definition) => {
                 self.memo.borrow_mut().active.push(active);
                 // Definitions are schema-qualified, so no search_path is needed.
-                let (verdict, touched) = self.analyze_body(definition, vec![], |_| Ok(()));
+                let mut info = self.analyze_body(definition, vec![], |_| Ok(()));
                 self.memo.borrow_mut().active.pop();
-                let verdict = match verdict {
+                info.verdict = match info.verdict {
                     Verdict::Blocked(reason) => Verdict::Blocked(format!("view {label}: {reason}")),
+                    // Inlined, so what its columns carry is known.
+                    Verdict::Safe if info.reads_proxies => Verdict::Inline,
                     verdict => verdict,
                 };
-                (verdict, touched)
+                info
             }
         };
 
-        self.memo
-            .borrow_mut()
-            .views
-            .insert(key, (verdict.clone(), touched));
-        self.touched |= touched;
-        verdict
+        self.memo.borrow_mut().views.insert(key, info.clone());
+        self.touched |= info.touched;
+        info.verdict
     }
 
     fn view_allowlisted(&self, relation: &Relation) -> bool {

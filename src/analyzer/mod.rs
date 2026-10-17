@@ -1,5 +1,6 @@
-//! Statement analysis: resolve column references against masking policies
-//! and rewrite the statement to read masks instead of masked columns.
+//! Statement analysis: resolve column references against masking policies,
+//! rewrite the statement to read SQL masks instead of masked columns, and
+//! decide how PgDog masks the results for proxy masks.
 pub mod lineage;
 mod masker;
 mod rules;
@@ -9,7 +10,7 @@ mod taint;
 
 use std::collections::BTreeSet;
 
-use pg_raw_parse::make;
+use pg_raw_parse::{Node, make};
 
 use crate::catalog::Catalog;
 use crate::profile::{Assignments, Policies, Profile};
@@ -25,16 +26,34 @@ pub struct Context<'a> {
     pub search_path: Vec<String>,
 }
 
-/// An output column of the top-level SELECT masked by a proxy mask in the
-/// results, instead of in the statement.
+/// How PgDog masks a result column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProxyColumn {
-    /// Position in the result.
+pub enum ResultMask {
+    /// The column passes a proxy-masked column through: mask its values with
+    /// [`crate::profile::Policies::proxies`]`[proxy]`. The column has type
+    /// `type_oid`.
+    Proxy { proxy: usize, type_oid: u32 },
+    /// The column is computed from proxy-masked values: NULL.
+    Null,
+}
+
+/// A masked result column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResultColumn {
+    /// Position of the statement in the query, counting every statement.
+    pub result: u16,
+    /// Position of the column in the statement's result.
     pub column: u16,
-    /// Index of the proxy mask in [`crate::profile::Policies::proxies`].
-    pub proxy: usize,
-    /// Type OID of the column.
-    pub type_oid: u32,
+    pub mask: ResultMask,
+}
+
+/// What PgDog does with a query's results.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Results {
+    pub columns: Vec<ResultColumn>,
+    /// Errors may quote values of proxy-masked columns: keep only their
+    /// severity, SQLSTATE and position.
+    pub redact_errors: bool,
 }
 
 /// Analysis result.
@@ -47,8 +66,8 @@ pub enum Outcome {
         /// Reads or writes relations with masked columns, so errors can carry
         /// masked values.
         touches_masked: bool,
-        /// Output columns for proxy masks.
-        proxies: Vec<ProxyColumn>,
+        /// Result masks for proxy masks.
+        results: Results,
     },
     /// Send this SQL instead.
     Rewritten {
@@ -57,8 +76,8 @@ pub enum Outcome {
         masked: BTreeSet<String>,
         raw: BTreeSet<String>,
         touches_masked: bool,
-        /// Output columns for proxy masks.
-        proxies: Vec<ProxyColumn>,
+        /// Result masks for proxy masks.
+        results: Results,
     },
     /// The statement can't be run safely.
     Blocked { reason: String },
@@ -72,17 +91,15 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, ctx);
         let all: Vec<_> = stmts.as_ref().iter().collect();
-        // Proxy masks apply to the rows of a single SELECT.
-        if matches!(all.as_slice(), [stmt] if matches!(stmt.stmt(), pg_raw_parse::Node::SelectStmt(_)))
-        {
-            masker.allow_proxies();
-        }
         if matches!(all.as_slice(), [stmt] if rules::tracked_set_config(stmt.stmt())) {
             masker.track_set_config();
         }
-        // Each statement may change name resolution for the ones after it.
-        for stmt in stmts.as_mut() {
+        // Each statement gets the result masks of its position, and may
+        // change name resolution for the ones after it.
+        for (index, stmt) in stmts.as_mut().into_iter().enumerate() {
+            let rows = returns_rows(stmt.stmt());
             masker.statement(stmt);
+            masker.finish_statement(index, rows);
         }
         result = Some((
             masker.blocked,
@@ -90,7 +107,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             masker.masked,
             masker.raw,
             masker.touched,
-            masker.proxies,
+            masker.results,
         ));
         Ok::<_, pg_raw_parse::Error>(stmts)
     });
@@ -104,7 +121,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         }
     };
 
-    let Some((blocked, changed, masked, raw, touches_masked, proxies)) = result else {
+    let Some((blocked, changed, masked, raw, touches_masked, results)) = result else {
         return Outcome::Blocked {
             reason: "statement could not be analyzed".into(),
         };
@@ -118,7 +135,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         return Outcome::Unchanged {
             raw,
             touches_masked,
-            proxies,
+            results,
         };
     }
 
@@ -128,7 +145,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             masked,
             raw,
             touches_masked,
-            proxies,
+            results,
         },
         Err(err) => Outcome::Blocked {
             reason: format!("failed to build the masked statement: {err}"),
@@ -147,17 +164,33 @@ pub fn analyze_shape(sql: &str, ctx: &Context<'_>) -> Option<Outcome> {
             masked,
             raw,
             touches_masked,
-            proxies,
+            results,
         } => Outcome::Rewritten {
             sql: shape::Template::new(&shape_sql, literals.values.len())?
                 .render(&literals.values)?,
             masked,
             raw,
             touches_masked,
-            proxies,
+            results,
         },
         other => other,
     })
+}
+
+/// Does a statement return rows that get result masks: a SELECT without INTO
+/// (on a set operation, its leftmost leaf's), or INSERT, UPDATE or DELETE with
+/// RETURNING?
+pub(crate) fn returns_rows(node: Node<'_>) -> bool {
+    let returning = |clause: Option<&pg_raw_parse::nodes::ReturningClause>| {
+        clause.is_some_and(|clause| !clause.exprs().is_empty())
+    };
+    match node {
+        Node::SelectStmt(select) => rules::into_clause(select).is_none(),
+        Node::InsertStmt(insert) => returning(insert.returning_clause()),
+        Node::UpdateStmt(update) => returning(update.returning_clause()),
+        Node::DeleteStmt(delete) => returning(delete.returning_clause()),
+        _ => false,
+    }
 }
 
 /// Comments at the start of the statement, which carry PgDog routing hints

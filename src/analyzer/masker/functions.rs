@@ -1,9 +1,12 @@
 //! Function calls and operators.
 //!
 //! Built-in functions are allowed, except those that run SQL or read data out of
-//! band. A user-defined SQL function is analyzed: if its body reads no masked
-//! columns, the call is allowed as is. If it does, and the function can be
-//! inlined, the call is replaced by its body with masks applied:
+//! band, and those that store their arguments where they can be read back, when
+//! called with values of proxy-masked columns. A user-defined SQL function is
+//! analyzed: if its body reads no SQL-masked columns, the call is allowed as is
+//! (its result is NULL in results if the body reads proxy-masked columns). If
+//! it does, and the function can be inlined, the call is replaced by its body
+//! with masks applied:
 //!
 //! - a scalar call becomes
 //!   `(SELECT (<body value>)::<return type> FROM (SELECT <arg>::<type> AS <param>, ...) AS __pgdog_args)`;
@@ -22,7 +25,10 @@ use pg_raw_parse::{
     transform::{self},
 };
 
-use super::{Masker, RESOLUTION_CHANGED, Verdict, call_address, fields, ident, rules};
+use super::{
+    BodyInfo, Masker, RESOLUTION_CHANGED, Verdict, call_address, expr_address, fields, ident, rules,
+};
+use crate::analyzer::taint::Taint;
 use crate::catalog::{Function, RelationKind, parse_search_path};
 
 /// What to do with a call.
@@ -31,6 +37,50 @@ pub(in crate::analyzer) enum CallUse<'mem> {
     /// Replace the call with this node.
     Inline(Unique<'mem, Node<'mem>>),
     Block,
+}
+
+/// What's left to check about a call or operator once its arguments are
+/// transformed.
+#[derive(Debug, Clone)]
+pub(in crate::analyzer) struct CallCheck<'c> {
+    /// A built-in that stores its arguments where they can be read back.
+    side_effect: bool,
+    kind: CallKind<'c>,
+}
+
+#[derive(Debug, Clone)]
+enum CallKind<'c> {
+    /// Built-in or allowlisted: the result is computed from the arguments.
+    Trusted,
+    /// User-defined SQL functions left as calls, one per candidate overload.
+    Udf(Vec<&'c Function>),
+    /// Inlined or blocked: nothing more to check.
+    Done,
+}
+
+impl CallCheck<'_> {
+    const TRUSTED: Self = Self {
+        side_effect: false,
+        kind: CallKind::Trusted,
+    };
+    const DONE: Self = Self {
+        side_effect: false,
+        kind: CallKind::Done,
+    };
+
+    pub(super) fn needs_post_check(&self) -> bool {
+        self.side_effect || matches!(self.kind, CallKind::Udf(_))
+    }
+}
+
+/// What a function name resolves to, for this user.
+enum CallTarget<'c> {
+    /// Built-in, or allowlisted.
+    Trusted,
+    /// Its body reads SQL-masked columns: it must be inlined.
+    Inline(&'c Function),
+    /// User-defined SQL functions left as calls.
+    Udf(Vec<&'c Function>),
 }
 
 /// What a function name resolves to.
@@ -50,7 +100,7 @@ const SCALAR_PLACEHOLDER: &str = "__pgdog_scalar_placeholder";
 impl<'c, 'mem> Masker<'c, 'mem> {
     /// A function call in an expression.
     pub(super) fn call(&mut self, call: &nodes::FuncCall) -> CallUse<'mem> {
-        if self.checked_calls.contains(&call_address(call)) {
+        if self.checked_calls.contains_key(&call_address(call)) {
             return CallUse::Allow;
         }
         let function = match self.call_target(call) {
@@ -74,23 +124,48 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// A call in a position where it can't be replaced.
-    pub(super) fn check_call(&mut self, call: &nodes::FuncCall) {
+    pub(super) fn check_call(&mut self, call: &nodes::FuncCall) -> CallCheck<'c> {
         if let Ok(Some(function)) = self.call_target(call) {
             self.block(format!(
                 "function {}() reads masked columns and can't be inlined here",
                 function.qualified_name()
             ));
         }
+        self.checked_calls
+            .get(&call_address(call))
+            .cloned()
+            .unwrap_or(CallCheck::DONE)
     }
 
-    /// Check a call. `Ok(Some(function))` if it must be inlined.
+    /// Check a call, and record what's left to check once its arguments are
+    /// transformed. `Ok(Some(function))` if it must be inlined.
     fn call_target(&mut self, call: &nodes::FuncCall) -> Result<Option<&'c Function>, ()> {
-        self.checked_calls.insert(call_address(call));
+        let (target, check) = match self.resolve_call(call) {
+            Ok((target, side_effect)) => {
+                let kind = match &target {
+                    CallTarget::Trusted => CallKind::Trusted,
+                    CallTarget::Udf(candidates) => CallKind::Udf(candidates.clone()),
+                    CallTarget::Inline(_) => CallKind::Done,
+                };
+                (Ok(target), CallCheck { side_effect, kind })
+            }
+            Err(()) => (Err(()), CallCheck::DONE),
+        };
+        self.checked_calls.insert(call_address(call), check);
+        target.map(|target| match target {
+            CallTarget::Inline(function) => Some(function),
+            CallTarget::Trusted | CallTarget::Udf(_) => None,
+        })
+    }
+
+    /// What a call resolves to, and whether it's a built-in that stores its
+    /// arguments.
+    fn resolve_call(&mut self, call: &nodes::FuncCall) -> Result<(CallTarget<'c>, bool), ()> {
         let names: Vec<&str> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
         let (schema, name) = match names.as_slice() {
             [name] => (None, *name),
             [.., schema, name] => (Some(*schema), *name),
-            [] => return Ok(None),
+            [] => return Ok((CallTarget::Trusted, false)),
         };
         if let Some(reason) = rules::denied_function(name) {
             self.block(reason);
@@ -98,7 +173,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
         // By name: Postgres prefers the built-in to a user-defined function
         // with the same signature, as pg_catalog is searched first.
-        if matches!(schema, None | Some("pg_catalog")) && name == "set_config" {
+        let builtin_name = matches!(schema, None | Some("pg_catalog"));
+        let side_effect = builtin_name && rules::side_effect(name);
+        if builtin_name && name == "set_config" {
             self.check_set_config(call)?;
         }
         if schema.is_none()
@@ -110,20 +187,59 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return Err(());
         }
 
-        match self.resolve_function(schema, name, call.args().iter().count()) {
-            Target::Builtin | Target::Allowlisted => Ok(None),
+        let target = match self.resolve_function(schema, name, call.args().iter().count()) {
+            Target::Builtin | Target::Allowlisted => CallTarget::Trusted,
             Target::Unknown(reason) => {
                 self.block(reason);
-                Err(())
+                return Err(());
             }
             // Function bodies resolve names with the new search_path too,
             // even when the call is qualified.
             Target::Functions(_) if self.path_changed => {
                 self.block(RESOLUTION_CHANGED);
-                Err(())
+                return Err(());
             }
-            Target::Functions(functions) => self.functions_target(name, &functions),
+            Target::Functions(functions) => self.functions_target(name, &functions)?,
+        };
+        Ok((target, side_effect))
+    }
+
+    /// After a call's arguments are transformed: built-ins that store their
+    /// arguments are sinks, user-defined functions whose body reads
+    /// proxy-masked columns return values computed from them.
+    pub(super) fn call_post_check(&mut self, check: &CallCheck<'c>, args: Taint, name: &str) {
+        if check.side_effect {
+            self.sink(args, &format!("{name}()"));
         }
+        let CallKind::Udf(candidates) = &check.kind else {
+            return;
+        };
+        if candidates
+            .iter()
+            .any(|function| self.body_reads_proxies(function))
+        {
+            self.note(Taint::Computed, false);
+            self.state.reads_proxies = true;
+        }
+        // Until bodies are checked for where their parameters go, tainted
+        // arguments can't be allowed.
+        let label = candidates
+            .first()
+            .map_or_else(|| name.to_owned(), |function| function.qualified_name());
+        self.check_taint(args, |_| {
+            format!(
+                "function {label}() is called with values of proxy-masked columns; this isn't supported yet"
+            )
+        });
+    }
+
+    /// Does a function's body read proxy-masked columns?
+    fn body_reads_proxies(&self, function: &Function) -> bool {
+        self.memo
+            .borrow()
+            .functions
+            .get(&function.oid)
+            .is_some_and(|info| info.reads_proxies)
     }
 
     /// `set_config` changes settings out of PgDog's sight. PgDog only tracks
@@ -141,7 +257,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             Some(setting)
                 if !setting.eq_ignore_ascii_case("search_path") || self.tracked_set_config =>
             {
-                self.changes_resolution |= rules::changes_resolution_setting(setting);
+                self.state.changes_resolution |= rules::changes_resolution_setting(setting);
                 Ok(())
             }
             _ => {
@@ -189,16 +305,21 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Combine the verdicts of every candidate: any block blocks, and a function
-    /// can only be inlined if it's the only candidate.
+    /// can only be inlined if it's the only candidate. Candidates that are all
+    /// allowlisted are trusted.
     fn functions_target(
         &mut self,
         name: &str,
         functions: &[&'c Function],
-    ) -> Result<Option<&'c Function>, ()> {
+    ) -> Result<CallTarget<'c>, ()> {
         let mut inline = vec![];
+        let mut udfs = vec![];
         for function in functions {
+            if self.function_allowlisted(function) {
+                continue;
+            }
             match self.function_verdict(function) {
-                Verdict::Safe => (),
+                Verdict::Safe => udfs.push(*function),
                 Verdict::Inline => inline.push(*function),
                 Verdict::Blocked(reason) => {
                     self.block(reason);
@@ -207,8 +328,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             }
         }
         match inline.as_slice() {
-            [] => Ok(None),
-            [function] if functions.len() == 1 => Ok(Some(*function)),
+            [] if udfs.is_empty() => Ok(CallTarget::Trusted),
+            [] => Ok(CallTarget::Udf(udfs)),
+            [function] if functions.len() == 1 => Ok(CallTarget::Inline(function)),
             _ => {
                 self.block(format!(
                     "function {name}() has several overloads and one reads masked columns, so it can't be inlined"
@@ -218,77 +340,143 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// What calling a user-defined function means for this user.
-    fn function_verdict(&mut self, function: &Function) -> Verdict {
-        if let Some((verdict, touched)) = self.memo.borrow().functions.get(&function.oid).cloned() {
-            self.touched |= touched;
-            return verdict;
-        }
-
+    /// Is a function trusted by the configuration?
+    fn function_allowlisted(&self, function: &Function) -> bool {
         let general = &self.ctx.policies.config.general;
-        let label = function.qualified_name();
-        let active = format!("function {}", function.oid);
-        let allowlisted = rules::allowlisted(
+        rules::allowlisted(
             Some(&function.schema),
             &function.name,
             &general.udf_allowlist,
         ) || function
             .extension
             .as_ref()
-            .is_some_and(|extension| general.extension_allowlist.contains(extension));
+            .is_some_and(|extension| general.extension_allowlist.contains(extension))
+    }
 
-        let (verdict, touched) = if allowlisted {
-            (Verdict::Safe, false)
+    /// What calling a user-defined function means for this user.
+    fn function_verdict(&mut self, function: &Function) -> Verdict {
+        if let Some(info) = self.memo.borrow().functions.get(&function.oid).cloned() {
+            self.touched |= info.touched;
+            return info.verdict;
+        }
+
+        let label = function.qualified_name();
+        let active = format!("function {}", function.oid);
+
+        let info = if self.function_allowlisted(function) {
+            BodyInfo {
+                verdict: Verdict::Safe,
+                touched: false,
+                reads_proxies: false,
+            }
         } else if self.memo.borrow().active.contains(&active) {
-            (
-                Verdict::Blocked(format!("function {label}() is recursive")),
-                false,
-            )
+            BodyInfo::blocked(format!("function {label}() is recursive"))
         } else if function.kind != "function" {
-            (
-                Verdict::Blocked(format!(
-                    "{} {label}() is not allowed for masked users; add it to udf_allowlist if it's safe",
-                    function.kind
-                )),
-                false,
-            )
+            BodyInfo::blocked(format!(
+                "{} {label}() is not allowed for masked users; add it to udf_allowlist if it's safe",
+                function.kind
+            ))
         } else if function.language != "sql" {
-            (
-                Verdict::Blocked(format!(
-                    "function {label}() is written in {} and can't be analyzed; add it to udf_allowlist if it's safe",
-                    function.language
-                )),
-                false,
-            )
+            BodyInfo::blocked(format!(
+                "function {label}() is written in {} and can't be analyzed; add it to udf_allowlist if it's safe",
+                function.language
+            ))
         } else if let Some(body) = function_body(function) {
             let search_path = function
                 .search_path()
                 .map(|path| parse_search_path(path, ""))
                 .unwrap_or_else(|| self.ctx.search_path.clone());
             self.memo.borrow_mut().active.push(active);
-            let (verdict, touched) =
-                self.analyze_body(&body, search_path, |stmt| inlinable(function, stmt));
+            let mut info = self.analyze_body(&body, search_path, |stmt| inlinable(function, stmt));
             self.memo.borrow_mut().active.pop();
-            let verdict = match verdict {
-                Verdict::Blocked(reason) => {
-                    Verdict::Blocked(format!("function {label}(): {reason}"))
-                }
-                verdict => verdict,
-            };
-            (verdict, touched)
+            if let Verdict::Blocked(reason) = &info.verdict {
+                info.verdict = Verdict::Blocked(format!("function {label}(): {reason}"));
+            }
+            info
         } else {
-            (
-                Verdict::Blocked(format!("function {label}() has an unreadable body")),
-                false,
-            )
+            BodyInfo::blocked(format!("function {label}() has an unreadable body"))
         };
 
         self.memo
             .borrow_mut()
             .functions
-            .insert(function.oid, (verdict.clone(), touched));
-        self.touched |= touched;
-        verdict
+            .insert(function.oid, info.clone());
+        self.touched |= info.touched;
+        info.verdict
+    }
+
+    /// Column names of a function in FROM, when they're known: the column
+    /// definition list, or the catalog's, renamed by the alias's column list.
+    pub(super) fn range_function_names(
+        &self,
+        range_function: &nodes::RangeFunction,
+        refname: &str,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = range_function
+            .coldeflist()
+            .iter()
+            .filter_map(|column| column.colname().map(str::to_owned))
+            .collect();
+        if names.is_empty() {
+            names = self
+                .catalog_output_names(range_function, refname)
+                .unwrap_or_default();
+        }
+        let aliases = range_function
+            .alias()
+            .map(|alias| super::names(alias.colnames()))
+            .unwrap_or_default();
+        for (i, alias) in aliases.into_iter().enumerate() {
+            match names.get_mut(i) {
+                Some(name) => *name = alias,
+                None => names.push(alias),
+            }
+        }
+        names
+    }
+
+    /// Output column names of a single user-defined function in FROM, if every
+    /// overload it could resolve to agrees on them.
+    fn catalog_output_names(
+        &self,
+        range_function: &nodes::RangeFunction,
+        refname: &str,
+    ) -> Option<Vec<String>> {
+        let mut calls = range_function
+            .functions()
+            .iter()
+            .filter_map(|pair| pair.as_node_list().and_then(|list| list.iter().next()));
+        let (Some(Node::FuncCall(call)), None) = (calls.next(), calls.next()) else {
+            return None;
+        };
+        let names: Vec<&str> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
+        let (schema, name) = match names.as_slice() {
+            [name] => (None, *name),
+            [.., "pg_catalog", _] => return None,
+            [.., schema, name] => (Some(*schema), *name),
+            [] => return None,
+        };
+        let count = call.args().iter().count();
+        let path: &[String] = if schema.is_some() {
+            &[]
+        } else {
+            &self.ctx.search_path
+        };
+        let mut outputs = self
+            .ctx
+            .catalog
+            .functions(schema, name, path)
+            .into_iter()
+            .filter(|function| function.accepts(count))
+            .map(|function| {
+                self.function_outputs(function, refname)
+                    .ok()
+                    .map(|(names, _)| names)
+            });
+        let first = outputs.next()??;
+        outputs
+            .all(|names| names.as_ref() == Some(&first))
+            .then_some(first)
     }
 
     /// A function call in FROM. `None` if it can stay as it is.
@@ -348,17 +536,36 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// An operator expression. Operators defined outside `pg_catalog` are calls to
     /// their functions.
     pub(super) fn operator(&mut self, expr: &nodes::A_Expr) -> CallUse<'mem> {
+        let (use_, check) = self.operator_use(expr);
+        self.checked_calls.insert(expr_address(expr), check);
+        use_
+    }
+
+    /// An operator in a position where it can't be replaced.
+    pub(super) fn check_operator(&mut self, expr: &nodes::A_Expr) -> CallCheck<'c> {
+        if let CallUse::Inline(_) = self.operator(expr) {
+            self.block("an operator that reads masked columns can't be inlined here");
+        }
+        self.checked_calls
+            .get(&expr_address(expr))
+            .cloned()
+            .unwrap_or(CallCheck::DONE)
+    }
+
+    /// What to do with an operator, and what's left to check once its operands
+    /// are transformed.
+    fn operator_use(&mut self, expr: &nodes::A_Expr) -> (CallUse<'mem>, CallCheck<'c>) {
         let Some((schema, name)) = operator_name(expr) else {
-            return CallUse::Allow;
+            return (CallUse::Allow, CallCheck::TRUSTED);
         };
         let catalog = self.ctx.catalog;
         if self.path_changed && catalog.has_operator_named(name) {
             self.block(RESOLUTION_CHANGED);
-            return CallUse::Block;
+            return (CallUse::Block, CallCheck::DONE);
         }
         let operators = catalog.operators(schema, name, &self.ctx.search_path);
         if operators.is_empty() {
-            return CallUse::Allow;
+            return (CallUse::Allow, CallCheck::TRUSTED);
         }
 
         let mut functions: Vec<&'c Function> = vec![];
@@ -376,21 +583,30 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                         operator.function_schema,
                         operator.function_name
                     ));
-                    return CallUse::Block;
+                    return (CallUse::Block, CallCheck::DONE);
                 }
             }
         }
 
         let function = match self.functions_target(name, &functions) {
-            Ok(None) => return CallUse::Allow,
-            Ok(Some(function)) => function,
-            Err(()) => return CallUse::Block,
+            Ok(CallTarget::Trusted) => return (CallUse::Allow, CallCheck::TRUSTED),
+            Ok(CallTarget::Udf(candidates)) => {
+                return (
+                    CallUse::Allow,
+                    CallCheck {
+                        side_effect: false,
+                        kind: CallKind::Udf(candidates),
+                    },
+                );
+            }
+            Ok(CallTarget::Inline(function)) => function,
+            Err(()) => return (CallUse::Block, CallCheck::DONE),
         };
         if operators.len() != 1 || expr.kind != A_Expr_Kind::AEXPR_OP {
             self.block(format!(
                 "operator {name} reads masked columns and can't be inlined"
             ));
-            return CallUse::Block;
+            return (CallUse::Block, CallCheck::DONE);
         }
 
         let args: Vec<Node<'_>> = [expr.lexpr(), expr.rexpr()]
@@ -398,12 +614,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .filter(|node| !matches!(node, Node::None))
             .collect();
         match self.inline_scalar(function, &args) {
-            Ok(inlined) => CallUse::Inline(inlined),
+            Ok(inlined) => (CallUse::Inline(inlined), CallCheck::DONE),
             Err(why) => {
                 self.block(format!(
                     "operator {name} reads masked columns and can't be inlined: {why}"
                 ));
-                CallUse::Block
+                (CallUse::Block, CallCheck::DONE)
             }
         }
     }

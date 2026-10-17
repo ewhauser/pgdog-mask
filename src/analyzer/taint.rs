@@ -1,7 +1,5 @@
 //! What values carry from proxy-masked columns, and the output columns of a
 //! query level.
-// Only the types and clean values are used until results-only proxy masks land.
-#![allow(dead_code)]
 
 /// What a value carries from proxy-masked columns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -65,6 +63,17 @@ pub(crate) struct OutputColumn {
     /// FigureColname might differ.
     pub name: Option<String>,
     pub taint: Taint,
+}
+
+/// What a query level's outputs say about a column name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    /// Columns with this name, combined.
+    Certain(Taint),
+    /// No column certainly has this name, but columns with uncertain names,
+    /// or the open rest, might: they carry at most this.
+    Possible(Taint),
+    Absent,
 }
 
 /// Output columns of a query level, or the columns of a derived FROM item.
@@ -154,34 +163,39 @@ impl Outputs {
         self
     }
 
-    /// The outputs of values computed from these.
-    pub fn computed(self) -> Outputs {
+    /// Every column clean, e.g. a recursive CTE that read no proxy values.
+    pub fn cleaned(self) -> Outputs {
         Outputs {
             columns: self
                 .columns
                 .into_iter()
                 .map(|column| OutputColumn {
                     name: column.name,
-                    taint: column.taint.computed(),
+                    taint: Taint::Clean,
                 })
                 .collect(),
-            rest: self.rest.map(Taint::computed),
+            rest: self.rest.map(|_| Taint::Clean),
         }
     }
 
-    /// Does a column have this name? `None` if a column's name is uncertain.
-    pub fn has_column(&self, name: &str) -> Option<bool> {
-        if self
+    /// The columns a name may refer to.
+    pub fn lookup(&self, name: &str) -> Lookup {
+        let certain = self
             .columns
             .iter()
-            .any(|column| column.name.as_deref() == Some(name))
-        {
-            Some(true)
-        } else if self.rest.is_some() || self.columns.iter().any(|c| c.name.is_none()) {
-            None
-        } else {
-            Some(false)
+            .filter(|column| column.name.as_deref() == Some(name))
+            .map(|column| column.taint)
+            .reduce(Taint::union);
+        if let Some(taint) = certain {
+            return Lookup::Certain(taint);
         }
+        self.columns
+            .iter()
+            .filter(|column| column.name.is_none())
+            .map(|column| column.taint)
+            .chain(self.rest)
+            .reduce(Taint::union)
+            .map_or(Lookup::Absent, Lookup::Possible)
     }
 }
 
@@ -309,8 +323,8 @@ mod test {
         outputs.push(column("b", A));
         assert_eq!(outputs.columns, vec![column("a", Taint::Clean)]);
         assert_eq!(outputs.rest, Some(Taint::Computed));
-        assert_eq!(outputs.has_column("a"), Some(true));
-        assert_eq!(outputs.has_column("b"), None);
+        assert_eq!(outputs.lookup("a"), Lookup::Certain(Taint::Clean));
+        assert_eq!(outputs.lookup("b"), Lookup::Possible(Taint::Computed));
 
         // An alias list names the known columns first, then the next ones.
         let renamed = outputs.clone().renamed(&["x".into(), "y".into()]);
@@ -324,7 +338,7 @@ mod test {
             columns: vec![column("a", A)],
             rest: None,
         };
-        assert_eq!(closed.has_column("b"), Some(false));
+        assert_eq!(closed.lookup("b"), Lookup::Absent);
         assert_eq!(
             closed
                 .clone()
@@ -333,9 +347,21 @@ mod test {
                 .len(),
             1
         );
-        assert_eq!(
-            closed.computed().columns,
-            vec![column("a", Taint::Computed)]
-        );
+        assert_eq!(closed.cleaned().columns, vec![column("a", Taint::Clean)]);
+
+        // Duplicate names combine; uncertain names may be anything.
+        let mixed = Outputs {
+            columns: vec![
+                column("a", A),
+                column("a", Taint::Clean),
+                OutputColumn {
+                    name: None,
+                    taint: B,
+                },
+            ],
+            rest: None,
+        };
+        assert_eq!(mixed.lookup("a"), Lookup::Certain(Taint::Computed));
+        assert_eq!(mixed.lookup("z"), Lookup::Possible(B));
     }
 }

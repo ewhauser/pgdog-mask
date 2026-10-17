@@ -1,37 +1,39 @@
-//! Rewrites a statement so every reference to a masked column reads the mask instead.
+//! Rewrites a statement so every reference to a SQL-masked column reads the
+//! mask instead, and tracks what values carry from proxy-masked columns,
+//! which are masked in the results (see `results`).
+mod columns;
 mod functions;
+mod results;
+mod stars;
 mod views;
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::LazyLock;
 
 use pg_raw_parse::{
     Node, NodeMut,
     make::{MemoryToken, Unique},
     nodes,
-    raw::{A_Expr_Kind, JsonTableColumnType, ReturningOptionKind, SetOperation},
+    raw::{JsonTableColumnType, ObjectType, ReturningOptionKind, SetOperation, SubLinkType},
     transform::{self, Assignable, Transform},
 };
 
 use super::Context;
 use super::rules;
-use super::scope::{
-    Cte, Frame, Item, ItemKind, Resolution, ResolvedColumn, WholeRowOf, derived_outputs, find_cte,
-    find_item, resolve, resolve_column, unknown_columns,
-};
-use super::taint::{OutputColumn, Outputs, Taint};
-use crate::catalog::Relation;
+use super::scope::{Cte, Frame, Item, ItemKind, derived_outputs, find_cte, unknown_columns};
+use super::shape::is_placeholder;
+use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::config::OnUnresolved;
-use crate::mask::{SearchOp, VALUE, castable};
-use functions::CallUse;
-
-/// Raw searches of a mask without a SQL part.
-static NO_RAW_SEARCH: LazyLock<HashSet<SearchOp>> = LazyLock::new(HashSet::new);
+use crate::mask::SearchOp;
+use functions::{CallCheck, CallUse};
+use results::{OutputRef, StatementState};
 
 /// Why statements after one that may change name resolution are blocked.
 const RESOLUTION_CHANGED: &str = "statements after one that may change name resolution (search_path, role or DDL) can't be checked in the same query; send them separately";
+
+/// Why EXECUTE of a statement prepared elsewhere is blocked.
+const EXECUTE_UNKNOWN: &str = "EXECUTE of a statement prepared outside this query can't be checked for masked users; send the PREPARE in the same query";
 
 /// Quote an identifier.
 pub(super) fn ident(name: &str) -> String {
@@ -42,16 +44,48 @@ pub(super) fn ident(name: &str) -> String {
 struct MaskTarget<'c> {
     /// Index of the policy in the config.
     policy: usize,
-    template: &'c str,
-    raw_search: &'c HashSet<SearchOp>,
-    cast: &'c str,
     qualifier: String,
-    arguments: &'c [String],
     label: String,
-    /// Index of the proxy mask, if the policy has one for this user.
-    proxy: Option<usize>,
-    /// Type OID of the column; 0 if unknown.
-    type_oid: u32,
+    kind: TargetKind<'c>,
+}
+
+/// How a masked column is masked for this user.
+enum TargetKind<'c> {
+    /// Rewritten in the statement.
+    Sql {
+        template: &'c str,
+        raw_search: &'c HashSet<SearchOp>,
+        cast: &'c str,
+        arguments: &'c [String],
+    },
+    /// Masked in the results by `Policies::proxies[proxy]`; references are
+    /// never rewritten.
+    Proxy {
+        proxy: usize,
+        /// Type OID of the column; 0 if unknown.
+        type_oid: u32,
+    },
+}
+
+impl MaskTarget<'_> {
+    /// The value a reference reads, if the column is proxy-masked.
+    fn proxy(&self) -> Option<Taint> {
+        match self.kind {
+            TargetKind::Proxy { proxy, type_oid } => Some(Taint::Proxy { proxy, type_oid }),
+            TargetKind::Sql { .. } => None,
+        }
+    }
+}
+
+/// How a table-like view's column computed from masked columns is masked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DerivedPolicy {
+    /// Not computed from columns masked for this user.
+    None,
+    /// Computed from a SQL-masked column: it can't be masked.
+    Sql,
+    /// Computed only from proxy-masked columns: NULL in results.
+    Proxy,
 }
 
 /// How `*` covers one FROM item.
@@ -62,9 +96,6 @@ enum Expansion {
     /// Anything else: `refname.*`.
     Star(String),
 }
-
-/// Functions that only normalize a value, allowed around a column in raw searches.
-const NORMALIZERS: &[&str] = &["lower", "upper", "btrim", "ltrim", "rtrim"];
 
 /// Views and functions nested deeper than this are blocked.
 const MAX_DEPTH: usize = 16;
@@ -102,20 +133,39 @@ macro_rules! child {
 /// What a view or function does for this user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
-    /// Reads no masked columns; use it as is.
+    /// Reads no SQL-masked columns; use it as is.
     Safe,
     /// Reads masked columns; inline its definition with masks applied.
     Inline,
     Blocked(String),
 }
 
+/// What a view or function body does for this user.
+#[derive(Debug, Clone)]
+struct BodyInfo {
+    verdict: Verdict,
+    /// Reads relations with masked columns.
+    touched: bool,
+    /// Reads proxy-masked columns.
+    reads_proxies: bool,
+}
+
+impl BodyInfo {
+    fn blocked(reason: impl Into<String>) -> Self {
+        Self {
+            verdict: Verdict::Blocked(reason.into()),
+            touched: false,
+            reads_proxies: false,
+        }
+    }
+}
+
 /// Verdicts shared by the masker of a statement and the maskers it starts for
 /// view and function bodies.
 #[derive(Debug, Default)]
 struct Memo {
-    /// Verdict and whether it reads relations with masked columns.
-    views: HashMap<(String, String), (Verdict, bool)>,
-    functions: HashMap<i64, (Verdict, bool)>,
+    views: HashMap<(String, String), BodyInfo>,
+    functions: HashMap<i64, BodyInfo>,
     /// Views and functions being analyzed, to stop recursion.
     active: Vec<String>,
 }
@@ -128,8 +178,10 @@ pub(super) struct Masker<'c, 'mem> {
     predicate: bool,
     /// Column references used in an allowed raw search shape.
     raw_refs: HashSet<usize>,
-    /// Function calls already checked, e.g. in a FROM list.
-    checked_calls: HashSet<usize>,
+    /// Function calls and user operators already checked, e.g. in a FROM
+    /// list, by address, and what's left to check once their arguments are
+    /// transformed.
+    checked_calls: HashMap<usize, CallCheck<'c>>,
     /// Inside a FROM list, where views can be inlined.
     from: bool,
     /// Nesting of view and function bodies.
@@ -137,19 +189,39 @@ pub(super) struct Masker<'c, 'mem> {
     memo: Rc<RefCell<Memo>>,
     pub(super) blocked: Option<String>,
     pub(super) changed: bool,
+    /// SQL masks changed what the statement computes, not only its text.
+    masked_sql: bool,
     pub(super) masked: BTreeSet<String>,
     pub(super) raw: BTreeSet<String>,
     /// Reads or writes a relation with masked columns.
     pub(super) touched: bool,
-    /// The next SELECT is the statement's top level, whose plain output
-    /// columns can be masked by proxy masks.
-    proxies_allowed: bool,
-    /// Column references left raw for a proxy mask.
-    proxy_refs: HashSet<usize>,
-    /// Output columns masked by proxy masks.
-    pub(super) proxies: Vec<super::ProxyColumn>,
-    /// This statement may change how the names of later ones resolve.
-    changes_resolution: bool,
+    /// Taint of the expression being transformed: the join of its inputs.
+    taint: Taint,
+    /// Column references that are whole output columns.
+    passthrough: HashSet<usize>,
+    /// ORDER BY, DISTINCT ON and GROUP BY names of output columns.
+    output_refs: HashMap<usize, OutputRef>,
+    /// Outputs of the query level that finished last; its caller takes them.
+    outputs: Option<Outputs>,
+    /// What the statement being analyzed does with proxy-masked columns.
+    state: StatementState,
+    /// Result masks and redaction of the statements analyzed so far.
+    pub(super) results: super::Results,
+    /// Some statement, or a body it uses, reads proxy-masked columns.
+    pub(super) reads_proxies: bool,
+    /// Transforming a WINDOW clause, whose definitions are recorded by name.
+    in_window_clause: bool,
+    /// Transforming a set operation's ORDER BY, which sees only its outputs.
+    setop_sort: bool,
+    /// Transforming the SET list of UPDATE or ON CONFLICT DO UPDATE.
+    writing: Option<&'static str>,
+    /// Non-Clean taints from sources so far, to tell whether a recursive CTE
+    /// read any.
+    sources: u64,
+    /// CTEs being analyzed, innermost last.
+    ctes: Vec<String>,
+    /// Names SQL-PREPAREd by earlier statements of this query.
+    prepared: HashSet<String>,
     /// An earlier statement of this query may change name resolution.
     path_changed: bool,
     /// The query is the one `set_config` call PgDog tracks.
@@ -181,6 +253,10 @@ fn address(column: &nodes::ColumnRef) -> usize {
 
 fn call_address(call: &nodes::FuncCall) -> usize {
     std::ptr::from_ref(call) as usize
+}
+
+fn expr_address(expr: &nodes::A_Expr) -> usize {
+    std::ptr::from_ref(expr) as usize
 }
 
 /// Output column name Postgres gives an expression, if it's a (cast) column reference.
@@ -226,19 +302,29 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             frames: vec![],
             predicate: false,
             raw_refs: HashSet::new(),
-            checked_calls: HashSet::new(),
+            checked_calls: HashMap::new(),
             from: false,
             depth: 0,
             memo: Rc::default(),
             blocked: None,
             changed: false,
+            masked_sql: false,
             masked: BTreeSet::new(),
             raw: BTreeSet::new(),
             touched: false,
-            proxies_allowed: false,
-            proxy_refs: HashSet::new(),
-            proxies: vec![],
-            changes_resolution: false,
+            taint: Taint::Clean,
+            passthrough: HashSet::new(),
+            output_refs: HashMap::new(),
+            outputs: None,
+            state: StatementState::default(),
+            results: super::Results::default(),
+            reads_proxies: false,
+            in_window_clause: false,
+            setop_sort: false,
+            writing: None,
+            sources: 0,
+            ctes: vec![],
+            prepared: HashSet::new(),
             path_changed: false,
             tracked_set_config: false,
         }
@@ -250,7 +336,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.tracked_set_config = true;
     }
 
-    /// A masker for the body of a view or function, sharing this one's verdicts.
+    /// A masker for the body of a view or function, sharing this one's
+    /// verdicts. Verdicts are memoized whatever context first asked for them,
+    /// so it starts from a clean state.
     fn nested<'n>(&self, ctx: &'n Context<'n>) -> Masker<'n, 'mem> {
         let mut nested = Masker::new(self.mem, ctx);
         nested.depth = self.depth + 1;
@@ -259,22 +347,18 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Analyze the statements of a view or function body for this user.
-    /// Returns the verdict and whether the body reads relations with masked columns.
     fn analyze_body(
         &self,
         body: &str,
         search_path: Vec<String>,
         inlinable: impl FnOnce(&nodes::RawStmt) -> Result<(), String>,
-    ) -> (Verdict, bool) {
+    ) -> BodyInfo {
         if self.depth >= MAX_DEPTH {
-            return (
-                Verdict::Blocked("views or functions are nested too deeply".into()),
-                false,
-            );
+            return BodyInfo::blocked("views or functions are nested too deeply");
         }
         let mut stmts = match self.mem.parse(body) {
             Ok(stmts) => stmts,
-            Err(err) => return (Verdict::Blocked(format!("failed to parse: {err}")), false),
+            Err(err) => return BodyInfo::blocked(format!("failed to parse: {err}")),
         };
         let ctx = Context {
             catalog: self.ctx.catalog,
@@ -289,18 +373,22 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             _ => Err("it has more than one statement".into()),
         };
         let mut changes_resolution = false;
-        for stmt in stmts.as_mut() {
+        for (i, stmt) in stmts.as_mut().into_iter().enumerate() {
             nested.statement(stmt);
-            changes_resolution |= nested.changes_resolution;
+            changes_resolution |= nested.state.changes_resolution;
+            // Deferred sinks apply inside bodies too.
+            nested.finish_statement(i, false);
         }
 
+        // Only SQL masks make a body unsafe as is: star expansions are
+        // plan-equivalent, and proxy-masked columns are never rewritten.
         let verdict = match nested.blocked {
             // The change would outlive the call, without PgDog seeing it.
             _ if changes_resolution => Verdict::Blocked(
                 "it changes name resolution (search_path, role or DDL) beyond the call".into(),
             ),
             Some(reason) => Verdict::Blocked(reason),
-            None if !nested.changed => Verdict::Safe,
+            None if !nested.masked_sql => Verdict::Safe,
             None => match shape {
                 Ok(()) => Verdict::Inline,
                 Err(why) => {
@@ -308,28 +396,81 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 }
             },
         };
-        (verdict, nested.touched)
+        BodyInfo {
+            verdict,
+            touched: nested.touched,
+            reads_proxies: nested.reads_proxies,
+        }
     }
 
     fn block(&mut self, reason: impl Into<String>) {
         self.blocked.get_or_insert_with(|| reason.into());
     }
 
-    /// Mask a top-level statement.
+    /// Mask a top-level statement. `finish_statement` ends it.
     pub(super) fn statement(&mut self, stmt: nodes::RawStmtMut<'mem, '_>) {
         let node = stmt.stmt();
-        // `set_config('role', ...)` calls also set it, in `call_target`.
-        self.changes_resolution = rules::changes_resolution(node);
+        let query = match node {
+            Node::ExplainStmt(explain) => explain.query(),
+            node => node,
+        };
+        self.state = StatementState {
+            // `set_config('role', ...)` calls also set it, in `call_target`.
+            changes_resolution: rules::changes_resolution(node),
+            stores_expressions: rules::stores_expressions(node),
+            returns_rows: super::returns_rows(node),
+            select_into: matches!(query, Node::SelectStmt(select) if rules::into_clause(select).is_some()),
+            ..StatementState::default()
+        };
+        self.outputs = None;
+        self.passthrough.clear();
+        self.output_refs.clear();
         if let Err(reason) = rules::check_statement(node) {
             self.block(reason);
             return;
         }
         self.check_shadowing(node);
         self.check_ddl(node);
+        self.check_maintenance(node);
         transform::transform_raw_stmt(stmt, self);
-        // The statement itself resolves names the old way, as in Postgres;
-        // only the ones after it can't be checked.
-        self.path_changed |= self.changes_resolution;
+    }
+
+    /// TRUNCATE, VACUUM, ANALYZE and LOCK of relations with proxy-masked
+    /// columns run their triggers and index expressions on real values.
+    fn check_maintenance(&mut self, node: Node<'_>) {
+        let range_vars: Vec<&nodes::RangeVar> = match node {
+            Node::TruncateStmt(truncate) => range_vars(truncate.relations()),
+            Node::LockStmt(lock) => range_vars(lock.relations()),
+            Node::VacuumStmt(vacuum) => {
+                let relations: Vec<_> = vacuum
+                    .rels()
+                    .iter()
+                    .filter_map(|relation| relation.relation())
+                    .collect();
+                // Without a list, every table: those with proxy masks too.
+                if relations.is_empty() && self.ctx.profile.proxies {
+                    self.state.writes_proxies = true;
+                }
+                relations
+            }
+            _ => return,
+        };
+        for range_var in range_vars {
+            if self.resolves_to_proxy_relation(range_var) {
+                self.state.touches_proxies = true;
+                self.state.writes_proxies = true;
+            }
+        }
+    }
+
+    /// Does a relation name resolve to a relation with proxy-masked columns?
+    fn resolves_to_proxy_relation(&self, range_var: &nodes::RangeVar) -> bool {
+        range_var.relname().is_some_and(|name| {
+            self.ctx
+                .catalog
+                .resolve(range_var.schemaname(), name, &self.ctx.search_path)
+                .is_some_and(|relation| self.has_proxy_masks(relation))
+        })
     }
 
     /// DDL masked users may run can't touch relations with masked columns:
@@ -435,260 +576,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// The mask for a relation column, if it's masked for this user.
-    fn mask_target(
-        &self,
-        relation: &'c Relation,
-        column: &str,
-        refname: &str,
-    ) -> Option<MaskTarget<'c>> {
-        let ctx: &'c Context<'c> = self.ctx;
-        let assignment = ctx
-            .assignments
-            .column(&relation.schema, &relation.name, column)?;
-        let mask = &ctx.profile.masks[assignment.policy];
-        if !mask.is_masked() {
-            return None;
-        }
-        // A mask without a SQL part reads NULL wherever it's rewritten.
-        let sql = mask.sql();
-        let policy = &ctx.policies.policies[assignment.policy].policy;
-        let catalog_column = relation.column(column);
-        let data_type = catalog_column
-            .map(|c| c.data_type.as_str())
-            .filter(|t| castable(t))
-            .unwrap_or(&policy.data_type);
-
-        Some(MaskTarget {
-            policy: assignment.policy,
-            template: sql.map_or("NULL", |sql| sql.template),
-            raw_search: sql.map_or(&*NO_RAW_SEARCH, |sql| sql.raw_search),
-            cast: data_type,
-            qualifier: refname.to_owned(),
-            arguments: &assignment.arguments,
-            label: format!("{}.{}.{}", relation.schema, relation.name, column),
-            proxy: mask.proxy(),
-            type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
-        })
-    }
-
-    /// The position of a relation's first column that is masked for this
-    /// user, or computed from columns that are.
-    fn first_masked_column(&self, relation: &Relation) -> Option<usize> {
-        let (assignments, masks) = (self.ctx.assignments, &self.ctx.profile.masks);
-        let (schema, name) = (&relation.schema, &relation.name);
-        relation.columns.iter().position(|column| {
-            assignments
-                .column(schema, name, &column.name)
-                .is_some_and(|assignment| masks[assignment.policy].is_masked())
-                || assignments
-                    .derived(schema, name, &column.name)
-                    .is_some_and(|policies| policies.iter().any(|p| masks[*p].is_masked()))
-        })
-    }
-
-    fn is_masked_relation(&self, relation: &Relation) -> bool {
-        self.ctx
-            .assignments
-            .relation_policies(&relation.schema, &relation.name)
-            .any(|policy| self.ctx.profile.masks[policy].is_masked())
-    }
-
-    /// The mask for a column reference, if it points to a masked column.
-    fn column_target(&self, fields: &[&str]) -> Option<MaskTarget<'c>> {
-        let resolved = resolve_column(&self.frames, fields)?;
-        self.mask_target(resolved.relation, resolved.column, &resolved.refname)
-    }
-
-    /// Block `q.N` where Postgres would call `N(q)` on a whole row carrying
-    /// masked values: the implicit call is never checked. Returns whether it
-    /// blocked.
-    fn guard_attribute(&mut self, fields: &[&str], resolution: &Resolution<'_>) -> bool {
-        let masked = match resolution.attribute_of {
-            Some(WholeRowOf::Relation(relation)) => self.is_masked_relation(relation),
-            Some(WholeRowOf::Derived(taint)) => !taint.is_clean(),
-            None => false,
-        };
-        if let ([qualifier @ .., name], true) = (fields, masked) {
-            let qualifier = qualifier.join(".");
-            self.block(format!(
-                "{qualifier}.{name} calls {name}() on the whole row of {qualifier}, which carries masked columns; write {name}({qualifier})"
-            ));
-        }
-        masked
-    }
-
-    /// Parse a SQL expression into this statement's memory.
-    fn parse_expr(&mut self, expr: &str) -> Option<Unique<'mem, Node<'mem>>> {
-        let parsed = match self.mem.parse(&format!("SELECT {expr}")) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                self.block(format!("failed to build mask expression: {err}"));
-                return None;
-            }
-        };
-        let stmt = parsed.as_ref().iter().next()?;
-        let Node::SelectStmt(select) = stmt.stmt() else {
-            return None;
-        };
-        let target = select.target_list().iter().next()?;
-        Some(self.mem.make_unique(target.val()))
-    }
-
-    /// Build the masked expression replacing `original`.
-    fn masked_expr(
-        &mut self,
-        original: &nodes::ColumnRef,
-        target: &MaskTarget<'c>,
-    ) -> Option<Unique<'mem, Node<'mem>>> {
-        let template = match self
-            .ctx
-            .policies
-            .template(&format!("({})::{}", target.template, target.cast))
-        {
-            Ok(template) => template,
-            Err(err) => {
-                self.block(format!("failed to build mask expression: {err}"));
-                return None;
-            }
-        };
-        let val = template.iter().next().and_then(|stmt| match stmt.stmt() {
-            Node::SelectStmt(select) => select.target_list().iter().next().map(|t| t.val()),
-            _ => None,
-        })?;
-        let mut expr = self.mem.make_unique(val);
-        let mem = self.mem;
-        let policy_arguments: &[String] =
-            &self.ctx.policies.policies[target.policy].policy.arguments;
-
-        transform::transform(&mut expr, |node| {
-            let replacement = match &*node {
-                NodeMut::ColumnRef(column) => {
-                    let (names, _) = fields(column);
-                    match names.as_slice() {
-                        [name] if *name == VALUE => Some(mem.make_unique(original).uncast()),
-                        [name] => policy_arguments
-                            .iter()
-                            .position(|arg| arg == name)
-                            .and_then(|i| target.arguments.get(i))
-                            .map(|column| {
-                                let mut fields = vec![];
-                                if !target.qualifier.is_empty() {
-                                    fields.push(mem.make_string(Some(&target.qualifier)).uncast());
-                                }
-                                fields.push(mem.make_string(Some(column)).uncast());
-                                mem.make_column_ref(mem.make_list(&fields)).uncast()
-                            }),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            };
-            match replacement {
-                Some(replacement) => {
-                    node.replace(replacement);
-                    None
-                }
-                None => Some(node),
-            }
-        });
-
-        Some(expr)
-    }
-
-    /// Masked columns used directly as a clause, e.g. `WHERE flag`, can't be
-    /// replaced in place. Columns computed from masked columns can't be
-    /// masked at all.
-    fn guard_bare(&mut self, node: Node<'_>) {
-        if let Node::ColumnRef(column) = node {
-            let (names, star) = fields(column);
-            if star {
-                return;
-            }
-            let resolution = resolve(&self.frames, &names);
-            if self.guard_attribute(&names, &resolution) {
-                return;
-            }
-            let Some(resolved) = resolution.columns.first() else {
-                return;
-            };
-            if let Some(target) =
-                self.mask_target(resolved.relation, resolved.column, &resolved.refname)
-            {
-                self.block(format!(
-                    "masked column {} can't be used directly as a condition",
-                    target.label
-                ));
-            } else {
-                self.guard_derived(resolved);
-            }
-        }
-    }
-
-    /// Block a column computed from columns masked for this user, e.g. a
-    /// column of a materialized view. Returns whether it blocked.
-    fn guard_derived(&mut self, resolved: &ResolvedColumn<'_>) -> bool {
-        if let Some(policies) = self.ctx.assignments.derived(
-            &resolved.relation.schema,
-            &resolved.relation.name,
-            resolved.column,
-        ) && policies
-            .iter()
-            .any(|policy| self.ctx.profile.masks[*policy].is_masked())
-        {
-            self.block(format!(
-                "column {}.{} is computed from masked columns and can't be masked; assign it a policy",
-                resolved.relation.qualified_name(),
-                resolved.column
-            ));
-            return true;
-        }
-        false
-    }
-
-    /// Record raw-search references in a comparison.
-    fn mark_raw(&mut self, op: Option<SearchOp>, sides: &[(Node<'_>, Node<'_>)]) {
-        let Some(op) = op else {
-            return;
-        };
-        for (column_side, other_side) in sides {
-            let Some(column) = raw_column(*column_side) else {
-                continue;
-            };
-            if !operand_ok(*other_side) {
-                continue;
-            }
-            let (names, star) = fields(column);
-            if star {
-                continue;
-            }
-            if let Some(target) = self.column_target(&names)
-                && target.raw_search.contains(&op)
-            {
-                self.raw_refs.insert(address(column));
-            }
-        }
-    }
-
-    /// Record a raw-search reference with no other operand, e.g. `IS NULL`.
-    fn mark_raw_column(&mut self, op: SearchOp, node: Node<'_>) {
-        if let Some(column) = raw_column(node) {
-            let (names, star) = fields(column);
-            if !star
-                && let Some(target) = self.column_target(&names)
-                && target.raw_search.contains(&op)
-            {
-                self.raw_refs.insert(address(column));
-            }
-        }
-    }
-
-    fn mark_raw_a_expr(&mut self, expr: &nodes::A_Expr) {
-        let op = search_op(expr);
-        let (l, r) = (expr.lexpr(), expr.rexpr());
-        self.mark_raw(op, &[(l, r), (r, l)]);
-    }
-
     /// A FROM item naming a relation.
     fn add_range_var(&mut self, range_var: &nodes::RangeVar) {
         let Some(name) = range_var.relname() else {
@@ -704,7 +591,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .then(|| find_cte(&self.frames, name))
             .flatten()
         {
-            Item::derived(refname, cte.outputs.clone().renamed(&aliases))
+            let mut item = Item::derived(refname, cte.outputs.clone().renamed(&aliases));
+            item.pending = cte.pending.then(|| cte.name.clone());
+            item
         } else if self.path_changed {
             self.block(RESOLUTION_CHANGED);
             Item::derived(refname, unknown_columns())
@@ -724,6 +613,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             }
             if self.is_masked_relation(relation) {
                 self.touched = true;
+            }
+            if self.has_proxy_masks(relation) {
+                self.state.touches_proxies = true;
             }
             // Aliases map to columns by position, which a stale catalog can
             // get wrong; names can't be.
@@ -749,7 +641,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     "relation \"{name}\" is not in the catalog, so its columns can't be checked"
                 ));
             }
-            Item::derived(refname, unknown_columns())
+            // Nothing is known about its columns.
+            Item::derived(refname, Outputs::unknown())
         };
 
         if let Some(frame) = self.frames.last_mut() {
@@ -757,181 +650,15 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// `qualifier.column`, or `qualifier.*`, as a target list entry.
-    fn star_target(
-        &self,
-        qualifier: &str,
-        column: Option<&str>,
-    ) -> Unique<'mem, &'mem nodes::ResTarget> {
-        let mem = self.mem;
-        let last = match column {
-            Some(column) => mem.make_string(Some(column)).uncast(),
-            None => mem.make_node::<nodes::A_Star>().uncast(),
-        };
-        let fields = [mem.make_string(Some(qualifier)).uncast(), last];
-        let column = mem.make_column_ref(mem.make_list(&fields));
-        mem.make_res_target(None, mem.empty(), column.uncast())
-    }
-
-    /// How `*` covers an item.
-    fn expansion(&self, item: &Item<'_>) -> Expansion {
-        match &item.kind {
-            ItemKind::Relation { relation, names } if self.is_masked_relation(relation) => {
-                Expansion::Columns {
-                    refname: item.refname.clone(),
-                    names: names.clone(),
-                }
-            }
-            _ => Expansion::Star(item.refname.clone()),
-        }
-    }
-
-    /// The targets replacing `*` for one item.
-    fn expand(
-        &mut self,
-        expansion: Expansion,
-    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
-        match expansion {
-            Expansion::Columns { refname, names } => Some(
-                names
-                    .iter()
-                    .map(|name| self.star_target(&refname, Some(name)))
-                    .collect(),
-            ),
-            Expansion::Star(refname) if !refname.is_empty() => {
-                Some(vec![self.star_target(&refname, None)])
-            }
-            Expansion::Star(_) => {
-                self.block("can't expand * over a subquery without an alias");
-                None
-            }
-        }
-    }
-
-    fn item_is_masked(&self, item: &Item<'_>) -> bool {
-        matches!(&item.kind, ItemKind::Relation { relation, .. } if self.is_masked_relation(relation))
-    }
-
-    /// The columns replacing `qualifier.*`, if it covers masked columns. The
-    /// item can be in an outer query level.
-    fn expand_qualified(
-        &mut self,
-        qualifier: &str,
-    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
-        match self.expansion(find_item(&self.frames, qualifier)?) {
-            expansion @ Expansion::Columns { .. } => self.expand(expansion),
-            Expansion::Star(_) => None,
-        }
-    }
-
-    /// The item `(name).*` or `(name.*).*` expands, if `name` is an item and
-    /// not a column. Postgres reads `(name)` as a column first.
-    fn indirection_star<'n>(&self, indirection: &'n nodes::A_Indirection) -> Option<&'n str> {
-        let mut path = indirection.indirection().iter();
-        let (Some(Node::A_Star(_)), None) = (path.next(), path.next()) else {
-            return None;
-        };
-        let Node::ColumnRef(column) = indirection.arg() else {
-            return None;
-        };
-        match fields(column) {
-            (names, false) => match names.as_slice() {
-                [name] if !resolve(&self.frames, &[name]).certain => Some(name),
-                _ => None,
-            },
-            (names, true) => match names.as_slice() {
-                [name] => Some(name),
-                _ => None,
-            },
-        }
-    }
-
-    /// Target list with `*` and `alias.*` replaced by explicit columns, if they
-    /// cover masked columns.
-    fn expand_stars(
-        &mut self,
-        targets: &[&nodes::ResTarget],
-    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
-        let star = |target: &&nodes::ResTarget| match target.val() {
-            Node::ColumnRef(column) => fields(column).1,
-            Node::A_Indirection(_) => true,
-            _ => false,
-        };
-        if !targets.iter().any(star) {
-            return None;
-        }
-        let frame = self.frames.last()?;
-        // A bare `*` covers every item of this level, but not RETURNING `old`
-        // and `new`.
-        let items: Vec<Expansion> = frame
-            .items
-            .iter()
-            .filter(|item| !item.qualified_only)
-            .map(|item| self.expansion(item))
-            .collect();
-        let masked = items
-            .iter()
-            .any(|item| matches!(item, Expansion::Columns { .. }));
-        let merging = frame.merging_join;
-
-        let mut plans: Vec<Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>>> = vec![];
-        let mut needed = false;
-
-        for target in targets {
-            let plan = match target.val() {
-                Node::ColumnRef(column) => match fields(column) {
-                    (names, true) if names.is_empty() => {
-                        if masked {
-                            if merging {
-                                self.block("can't expand * across a JOIN with USING or NATURAL over masked columns; list the columns");
-                                return None;
-                            }
-                            let parts: Option<Vec<_>> = items
-                                .iter()
-                                .cloned()
-                                .map(|item| self.expand(item))
-                                .collect();
-                            parts.map(|p| p.into_iter().flatten().collect())
-                        } else {
-                            None
-                        }
-                    }
-                    (names, true) => self.expand_qualified(names.last().copied().unwrap_or("")),
-                    _ => None,
-                },
-                Node::A_Indirection(indirection) => self
-                    .indirection_star(indirection)
-                    .and_then(|qualifier| self.expand_qualified(qualifier)),
-                _ => None,
-            };
-            needed |= plan.is_some();
-            plans.push(plan);
-        }
-
-        if !needed {
-            return None;
-        }
-
-        let mut expanded: Vec<Unique<'mem, &'mem nodes::ResTarget>> = vec![];
-        for (target, plan) in targets.iter().zip(plans) {
-            match plan {
-                None => expanded.push(self.mem.make_unique(*target)),
-                Some(columns) => expanded.extend(columns),
-            }
-        }
-
-        self.changed = true;
-        Some(expanded)
-    }
-
-    /// Expand `*` in RETURNING, then mask it. `target` is the DML target's
-    /// item in the current frame.
+    /// Expand `*` in RETURNING, then mask it and set its outputs. `target` is
+    /// the DML target's item in the current frame.
     fn returning(
         &mut self,
         returning: Option<nodes::ReturningClauseMut<'mem, '_>>,
         target: Option<usize>,
     ) {
         let Some(mut returning) = returning else {
+            self.outputs = Some(Outputs::default());
             return;
         };
 
@@ -955,108 +682,57 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     refname: refname.to_owned(),
                     kind: kind.clone(),
                     qualified_only: true,
+                    pending: None,
+                    function: false,
                 });
             }
         }
 
-        let targets: Vec<_> = returning
-            .exprs()
-            .iter()
-            .filter_map(|node| match node {
-                Node::ResTarget(target) => Some(target),
-                _ => None,
-            })
-            .collect();
+        let targets = res_targets(returning.exprs());
         if let Some(exprs) = self.expand_stars(&targets) {
             let exprs: Vec<_> = exprs.into_iter().map(|e| e.uncast()).collect();
             returning.set_exprs(self.mem.make_list(&exprs));
         }
-        self.transform_returning_clause(returning);
+        let top = self.result_level();
+        let slots = self.output_slots(
+            returning
+                .exprs_mut()
+                .into_iter()
+                .filter_map(|node| match node {
+                    NodeMut::ResTarget(target) => Some(target),
+                    _ => None,
+                }),
+            top,
+        );
+        let (outputs, expand) = self.level_outputs(&slots, top);
+        if expand && let Some(exprs) = self.expand_slots(&res_targets(returning.exprs()), &slots) {
+            let exprs: Vec<_> = exprs.into_iter().map(|e| e.uncast()).collect();
+            returning.set_exprs(self.mem.make_list(&exprs));
+        }
+        self.outputs = Some(outputs);
 
         if let Some(frame) = self.frames.last_mut() {
             frame.items.truncate(items);
         }
     }
 
-    /// Whole-row reference to a masked relation: `t`, `t.*` in an expression.
-    fn whole_row(&mut self, refname: &str) -> Option<Unique<'mem, Node<'mem>>> {
-        let item = find_item(&self.frames, refname)?;
-        let ItemKind::Relation { relation, names } = &item.kind else {
-            return None;
-        };
-        if !self.is_masked_relation(relation) {
-            return None;
-        }
-        let qualifier = ident(&item.refname);
-        let columns = names
-            .iter()
-            .map(|name| format!("{qualifier}.{}", ident(name)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "ROW({columns})::{}.{}",
-            ident(&relation.schema),
-            ident(&relation.name)
-        );
-        let mut expr = self.parse_expr(&sql)?;
-        // Mask the columns inside the row.
-        self.transform_node(Assignable::new(&mut expr));
-        Some(expr)
-    }
-
-    fn column_ref(&mut self, column: &nodes::ColumnRef) -> Option<Unique<'mem, Node<'mem>>> {
-        let (names, star) = fields(column);
-
-        if star {
-            return match names.as_slice() {
-                [.., qualifier] => self.whole_row(qualifier),
-                [] => None,
-            };
-        }
-
-        let resolution = resolve(&self.frames, &names);
-        if self.guard_attribute(&names, &resolution) {
-            return None;
-        }
-        let resolved = resolution.columns.first();
-        if resolved.is_some_and(|resolved| self.guard_derived(resolved)) {
-            return None;
-        }
-
-        if let Some(target) = resolved.and_then(|resolved| {
-            self.mask_target(resolved.relation, resolved.column, &resolved.refname)
-        }) {
-            if self.proxy_refs.contains(&address(column)) {
-                // Masked in the results by the proxy mask.
-                self.masked.insert(target.label);
-                return None;
-            }
-            if self.raw_refs.contains(&address(column)) {
-                self.raw.insert(target.label);
-                return None;
-            }
-            let expr = self.masked_expr(column, &target)?;
-            self.masked.insert(target.label);
-            return Some(expr);
-        }
-
-        // `SELECT t FROM t` is a whole-row reference if no column is named `t`.
-        if let [name] = names.as_slice()
-            && !resolution.certain
-        {
-            return self.whole_row(name);
-        }
-
-        None
-    }
-
+    /// Transform a query level. Its references never join the enclosing
+    /// expression's taint: what it passes on is in its outputs.
     fn with_frame(&mut self, f: impl FnOnce(&mut Self)) {
         self.frames.push(Frame::default());
         let predicate = std::mem::replace(&mut self.predicate, false);
         let from = std::mem::replace(&mut self.from, false);
+        let taint = std::mem::take(&mut self.taint);
+        let in_window_clause = std::mem::replace(&mut self.in_window_clause, false);
+        let setop_sort = std::mem::replace(&mut self.setop_sort, false);
+        let writing = self.writing.take();
         f(self);
         self.predicate = predicate;
         self.from = from;
+        self.taint = taint;
+        self.in_window_clause = in_window_clause;
+        self.setop_sort = setop_sort;
+        self.writing = writing;
         self.frames.pop();
     }
 
@@ -1102,73 +778,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.touched = true;
     }
 
-    /// Allow proxy masks on the next SELECT, the statement's top level.
-    pub(super) fn allow_proxies(&mut self) {
-        self.proxies_allowed = true;
-    }
-
-    /// Leave plain output columns of the top-level SELECT whose policy has a
-    /// proxy mask unmasked in the statement, for the plugin to mask in the
-    /// results. Other references to the same columns still get the fallback.
-    fn route_proxies(&mut self, select: &nodes::SelectStmt) {
-        // Raw values would be written, deduplicated, grouped or aggregated.
-        if select.into_clause().is_some()
-            || !select.distinct_clause().is_empty()
-            || !select.group_clause().is_empty()
-            || !matches!(select.having_clause(), Node::None)
-        {
-            return;
-        }
-
-        for (position, target) in select.target_list().iter().enumerate() {
-            let column = match target.val() {
-                Node::ColumnRef(column) => column,
-                // Positions after `(row).*` depend on what it expands to.
-                Node::A_Indirection(indirection)
-                    if matches!(
-                        indirection.indirection().iter().next_back(),
-                        Some(Node::A_Star(_))
-                    ) =>
-                {
-                    return;
-                }
-                _ => continue,
-            };
-            let (names, star) = fields(column);
-            // Positions after a star depend on what it expands to.
-            if star {
-                return;
-            }
-            let Some(mask) = self.column_target(&names) else {
-                continue;
-            };
-            let (Some(proxy), type_oid @ 1..) = (mask.proxy, mask.type_oid) else {
-                continue;
-            };
-            let output = target
-                .name()
-                .or_else(|| names.last().copied())
-                .unwrap_or_default();
-            // ORDER BY the output column would sort by raw values.
-            if select
-                .sort_clause()
-                .iter()
-                .any(|sort| refers_to_output(sort.node(), position, output))
-            {
-                continue;
-            }
-            let Ok(column_index) = u16::try_from(position) else {
-                return;
-            };
-            self.proxy_refs.insert(address(column));
-            self.proxies.push(super::ProxyColumn {
-                column: column_index,
-                proxy,
-                type_oid,
-            });
-        }
-    }
-
     /// Add a DML target relation to the current frame. Returns its item's
     /// position.
     fn add_target(&mut self, relation: Option<&nodes::RangeVar>) -> Option<usize> {
@@ -1176,7 +785,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.check_view_write(range_var);
         let position = self.frames.last()?.items.len();
         self.add_range_var(range_var);
-        (self.frames.last()?.items.len() > position).then_some(position)
+        let item = self.frames.last()?.items.get(position)?;
+        if let ItemKind::Relation { relation, .. } = item.kind
+            && self.has_proxy_masks(relation)
+        {
+            self.state.writes_proxies = true;
+        }
+        Some(position)
     }
 
     /// Transform the FROM list of UPDATE or DELETE, which can't see the
@@ -1197,26 +812,84 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
+    /// The output name `transform_res_target` pins on a target without one.
+    fn pinned_name(&self, val: Node<'_>) -> Option<String> {
+        column_ref_name(val)
+            .filter(|name| !is_placeholder(name))
+            .or_else(|| match val {
+                Node::FuncCall(_) => Some(figure_name(val)),
+                Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
+                _ => None,
+            })
+    }
+
+    /// What the merged columns of a USING or NATURAL join over `items` of
+    /// this level carry.
+    fn merged_taint(
+        &self,
+        items: std::ops::Range<usize>,
+        using: &[String],
+        natural: bool,
+    ) -> Taint {
+        let Some(items) = self.frames.last().and_then(|frame| frame.items.get(items)) else {
+            return Taint::Clean;
+        };
+        let mut taint = Taint::Clean;
+        for item in items {
+            let column = |name: &str| match &item.kind {
+                ItemKind::Relation { .. } => item
+                    .relation_column(name)
+                    .and_then(|(relation, column)| self.mask_target(relation, column, ""))
+                    .and_then(|target| target.proxy())
+                    .unwrap_or_default(),
+                ItemKind::Derived(outputs) => match outputs.lookup(name) {
+                    Lookup::Certain(taint) | Lookup::Possible(taint) => taint,
+                    Lookup::Absent => Taint::Clean,
+                },
+            };
+            if natural {
+                // Every column with a matching name: any of them.
+                taint = taint.join(match &item.kind {
+                    ItemKind::Relation { relation, .. } if self.has_proxy_masks(relation) => {
+                        Taint::Computed
+                    }
+                    ItemKind::Relation { .. } => Taint::Clean,
+                    ItemKind::Derived(outputs) => outputs.bound().computed(),
+                });
+            }
+            for name in using {
+                taint = taint.join(column(name));
+            }
+        }
+        taint
+    }
+
     /// Push an item for a table function (XMLTABLE, JSON_TABLE) whose columns
-    /// are defined in the call.
+    /// are defined in the call: names, and whether they're FOR ORDINALITY.
+    /// Every other column is computed from the arguments.
     fn add_table_function(
         &mut self,
         refname: String,
-        columns: Option<Vec<String>>,
+        columns: Option<Vec<(String, bool)>>,
         aliases: &[String],
+        args: Taint,
     ) {
+        let taint = args.computed();
         let outputs = match columns {
             Some(columns) => Outputs {
                 columns: columns
                     .into_iter()
-                    .map(|name| OutputColumn {
+                    .map(|(name, ordinality)| OutputColumn {
                         name: Some(name),
-                        taint: Taint::Clean,
+                        taint: if ordinality { Taint::Clean } else { taint },
                     })
                     .collect(),
                 rest: None,
             },
-            None => unknown_columns(),
+            None => Outputs {
+                columns: vec![],
+                rest: Some(taint),
+            },
         };
         if let Some(frame) = self.frames.last_mut() {
             frame
@@ -1248,10 +921,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             },
             NodeMut::RangeSubselect(subselect) => {
                 let alias = subselect.alias();
-                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
                 Action::Keep(Keep::Subselect {
                     refname: alias.and_then(|a| a.aliasname()).unwrap_or("").to_owned(),
-                    outputs: derived_outputs(subselect.subquery()).renamed(&aliases),
+                    aliases: alias.map(|a| names(a.colnames())).unwrap_or_default(),
                     lateral: subselect.lateral,
                 })
             }
@@ -1263,7 +935,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             }
             NodeMut::RangeFunction(function) => {
                 let alias = function.alias();
-                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
                 let function_name = function
                     .functions()
                     .iter()
@@ -1276,26 +947,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                         _ => None,
                     })
                     .unwrap_or("");
-                let outputs = if aliases.is_empty() {
-                    unknown_columns()
-                } else {
-                    Outputs {
-                        columns: aliases
-                            .into_iter()
-                            .map(|name| OutputColumn {
-                                name: Some(name),
-                                taint: Taint::Clean,
-                            })
-                            .collect(),
-                        rest: None,
-                    }
-                };
+                let refname = alias
+                    .and_then(|a| a.aliasname())
+                    .unwrap_or(function_name)
+                    .to_owned();
                 Action::Keep(Keep::Function {
-                    refname: alias
-                        .and_then(|a| a.aliasname())
-                        .unwrap_or(function_name)
-                        .to_owned(),
-                    outputs,
+                    names: self.range_function_names(function, &refname),
+                    refname,
                 })
             }
             _ => Action::Keep(Keep::Recurse),
@@ -1335,7 +993,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             Keep::Recurse => transform::transform_node(node, self),
             Keep::Subselect {
                 refname,
-                outputs,
+                aliases,
                 lateral,
             } => {
                 // A non-LATERAL subquery doesn't see the other items of this level.
@@ -1343,98 +1001,70 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     .frames
                     .last_mut()
                     .map(|frame| std::mem::replace(&mut frame.lateral_only, !lateral));
+                self.outputs = None;
                 transform::transform_node(node, self);
+                let outputs = self
+                    .outputs
+                    .take()
+                    .unwrap_or_else(Outputs::unknown)
+                    .renamed(&aliases);
                 if let Some(frame) = self.frames.last_mut() {
                     frame.lateral_only = saved.unwrap_or_default();
                     frame.items.push(Item::derived(refname, outputs));
                 }
             }
-            Keep::Function { refname, outputs } => {
-                transform::transform_node(node, self);
+            Keep::Function { refname, names } => {
+                // Every column is computed from the arguments, and from the
+                // body of a function that reads proxy-masked columns.
+                let taint = self
+                    .scoped(|masker| transform::transform_node(node, masker))
+                    .computed();
+                let mut item = Item::derived(
+                    refname,
+                    Outputs {
+                        columns: names
+                            .into_iter()
+                            .map(|name| OutputColumn {
+                                name: Some(name),
+                                taint,
+                            })
+                            .collect(),
+                        rest: Some(taint),
+                    },
+                );
+                item.function = true;
                 if let Some(frame) = self.frames.last_mut() {
-                    frame.items.push(Item::derived(refname, outputs));
+                    frame.items.push(item);
                 }
             }
         }
     }
 }
 
-/// The column in a raw-search comparison side, possibly wrapped in a normalizer.
-/// Does an `ORDER BY` item refer to the output column at `position` named `name`,
-/// by ordinal or by name?
-fn refers_to_output(node: Node<'_>, position: usize, name: &str) -> bool {
-    match node {
-        Node::A_Const(constant) => matches!(
-            constant.val(),
-            Some(pg_raw_parse::ConstValue::Integer(ordinal)) if ordinal as usize == position + 1
-        ),
-        Node::ColumnRef(column) => matches!(fields(column).0.as_slice(), [field] if *field == name),
-        _ => false,
-    }
-}
-
-fn raw_column(node: Node<'_>) -> Option<&nodes::ColumnRef> {
-    match node {
-        Node::ColumnRef(column) => Some(column),
-        Node::FuncCall(call) if is_normalizer(call) => {
-            let mut args = call.args().iter();
-            match (args.next(), args.next()) {
-                (Some(arg), None) => raw_column(arg),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn is_normalizer(call: &nodes::FuncCall) -> bool {
-    let names: Vec<_> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
-    matches!(names.as_slice(), [name] | ["pg_catalog", name] if NORMALIZERS.contains(name))
-}
-
-/// Values a masked column may be compared with in a raw search.
-fn operand_ok(node: Node<'_>) -> bool {
-    match node {
-        Node::ParamRef(_) | Node::A_Const(_) | Node::ColumnRef(_) => true,
-        Node::TypeCast(cast) => operand_ok(cast.arg()),
-        Node::FuncCall(call) if is_normalizer(call) => call.args().iter().all(operand_ok),
-        Node::NodeList(list) => list.iter().all(operand_ok),
-        Node::A_ArrayExpr(array) => array.elements().iter().all(operand_ok),
-        _ => false,
-    }
-}
-
-fn search_op(expr: &nodes::A_Expr) -> Option<SearchOp> {
-    let op = expr
-        .name()
-        .iter()
-        .next_back()
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
-    match expr.kind {
-        A_Expr_Kind::AEXPR_OP => match op {
-            "=" | "<>" | "!=" => Some(SearchOp::Equality),
-            "<" | ">" | "<=" | ">=" => Some(SearchOp::Range),
-            "~~" | "!~~" | "~~*" | "!~~*" => Some(SearchOp::Like),
+/// The relations of a list of relation names.
+fn range_vars(list: &pg_raw_parse::list::NodeList) -> Vec<&nodes::RangeVar> {
+    list.iter()
+        .filter_map(|node| match node {
+            Node::RangeVar(range_var) => Some(range_var),
             _ => None,
-        },
-        A_Expr_Kind::AEXPR_OP_ANY | A_Expr_Kind::AEXPR_OP_ALL if matches!(op, "=" | "<>") => {
-            Some(SearchOp::Any)
-        }
-        A_Expr_Kind::AEXPR_DISTINCT | A_Expr_Kind::AEXPR_NOT_DISTINCT => Some(SearchOp::Distinct),
-        A_Expr_Kind::AEXPR_IN => Some(SearchOp::In),
-        A_Expr_Kind::AEXPR_LIKE | A_Expr_Kind::AEXPR_ILIKE => Some(SearchOp::Like),
-        A_Expr_Kind::AEXPR_BETWEEN
-        | A_Expr_Kind::AEXPR_NOT_BETWEEN
-        | A_Expr_Kind::AEXPR_BETWEEN_SYM
-        | A_Expr_Kind::AEXPR_NOT_BETWEEN_SYM => Some(SearchOp::Range),
-        _ => None,
-    }
+        })
+        .collect()
 }
 
-/// Add the columns a JSON_TABLE column defines, NESTED ones flattened. Sets
-/// `names` to `None` if a column can't be read.
-fn json_table_columns(column: &nodes::JsonTableColumn, names: &mut Option<Vec<String>>) {
+/// The targets of a RETURNING list.
+fn res_targets(list: &pg_raw_parse::list::NodeList) -> Vec<&nodes::ResTarget> {
+    list.iter()
+        .filter_map(|node| match node {
+            Node::ResTarget(target) => Some(target),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Add the columns a JSON_TABLE column defines, NESTED ones flattened, and
+/// whether they're FOR ORDINALITY. Sets `names` to `None` if a column can't be
+/// read.
+fn json_table_columns(column: &nodes::JsonTableColumn, names: &mut Option<Vec<(String, bool)>>) {
     if column.coltype == JsonTableColumnType::JTC_NESTED {
         for nested in column.columns().iter() {
             match nested {
@@ -1444,18 +1074,50 @@ fn json_table_columns(column: &nodes::JsonTableColumn, names: &mut Option<Vec<St
         }
         return;
     }
+    let ordinality = column.coltype == JsonTableColumnType::JTC_FOR_ORDINALITY;
     match (column.name(), names.as_mut()) {
-        (Some(name), Some(names)) => names.push(name.to_owned()),
+        (Some(name), Some(names)) => names.push((name.to_owned(), ordinality)),
         (None, _) => *names = None,
         (Some(_), None) => (),
     }
 }
 
-fn cte_info(cte: &nodes::CommonTableExpr) -> Cte {
+/// A recursive CTE before it's analyzed: it can refer to itself, and to CTEs
+/// after it. Nothing is known about what its columns carry yet.
+fn pending_cte(cte: &nodes::CommonTableExpr) -> Cte {
+    let outputs = derived_outputs(cte.ctequery()).renamed(&names(cte.aliascolnames()));
     Cte {
         name: cte.ctename().unwrap_or("").to_owned(),
-        outputs: derived_outputs(cte.ctequery()).renamed(&names(cte.aliascolnames())),
+        outputs: Outputs {
+            columns: outputs
+                .columns
+                .into_iter()
+                .map(|column| OutputColumn {
+                    name: column.name,
+                    taint: Taint::Unknown,
+                })
+                .collect(),
+            rest: outputs.rest.map(|_| Taint::Unknown),
+        },
+        pending: true,
     }
+}
+
+/// Columns a CTE's SEARCH and CYCLE clauses add, after its own. They hold the
+/// listed columns' values.
+fn search_cycle_columns(cte: &nodes::CommonTableExpr) -> Vec<(String, Vec<String>)> {
+    let mut columns = vec![];
+    if let Some(search) = cte.search_clause() {
+        let listed = names(search.search_col_list());
+        columns.push((search.search_seq_column().unwrap_or("").to_owned(), listed));
+    }
+    if let Some(cycle) = cte.cycle_clause() {
+        let listed = names(cycle.cycle_col_list());
+        for column in [cycle.cycle_mark_column(), cycle.cycle_path_column()] {
+            columns.push((column.unwrap_or("").to_owned(), listed.clone()));
+        }
+    }
+    columns
 }
 
 /// What to do with a generic node, decided while it's borrowed.
@@ -1472,12 +1134,13 @@ enum Keep {
     Done,
     Subselect {
         refname: String,
-        outputs: Outputs,
+        aliases: Vec<String>,
         lateral: bool,
     },
     Function {
         refname: String,
-        outputs: Outputs,
+        /// Column names, when known.
+        names: Vec<String>,
     },
 }
 
@@ -1494,6 +1157,12 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     fn transform_join_expr<'mutref>(&mut self, mut node: nodes::JoinExprMut<'mem, 'mutref>) {
         let merging = node.is_natural || !node.using_clause().is_empty();
         let aliased = node.alias().is_some() || node.join_using_alias().is_some();
+        let using: Vec<String> = node
+            .using_clause()
+            .iter()
+            .filter_map(|name| name.sval().map(str::to_owned))
+            .collect();
+        let natural = node.is_natural;
         let before = self.frames.last().map_or(0, |frame| frame.items.len());
         child!(self, node, larg_mut, set_larg);
         child!(self, node, rarg_mut, set_rarg);
@@ -1510,6 +1179,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             frame.merging_join |= merging;
         }
 
+        // Merged columns compare, and combine, both sides' values.
+        let merged = self.merged_taint(before..after, &using, natural);
+        self.note(merged, false);
+
         if aliased
             && let Some(frame) = self.frames.last()
             && frame.items[before.min(frame.items.len())..]
@@ -1520,13 +1193,57 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         }
     }
 
-    // Postgres analyzes a prepared statement again when search_path changes.
     fn transform_execute_stmt<'mutref>(&mut self, node: nodes::ExecuteStmtMut<'mem, 'mutref>) {
+        // Postgres analyzes a prepared statement again when search_path changes.
         if self.path_changed {
             self.block(RESOLUTION_CHANGED);
             return;
         }
-        transform::transform_execute_stmt(node, self);
+        // Only statements prepared earlier in this query were checked, and
+        // PgDog attaches no masks to the rows of the others.
+        if !self.ctx.profile.exempt && !node.name().is_some_and(|name| self.prepared.contains(name))
+        {
+            self.block(EXECUTE_UNKNOWN);
+            return;
+        }
+        self.state.runs_earlier = true;
+        // The statement was analyzed with clean parameters.
+        let params = self.scoped(|masker| transform::transform_execute_stmt(node, masker));
+        self.sink(params, "EXECUTE");
+        self.outputs = Some(Outputs::default());
+    }
+
+    fn transform_fetch_stmt<'mutref>(&mut self, node: nodes::FetchStmtMut<'mem, 'mutref>) {
+        self.state.runs_earlier = true;
+        transform::transform_fetch_stmt(node, self);
+    }
+
+    fn transform_declare_cursor_stmt<'mutref>(
+        &mut self,
+        node: nodes::DeclareCursorStmtMut<'mem, 'mutref>,
+    ) {
+        self.state.portal = Some(("DECLARE CURSOR", None));
+        transform::transform_declare_cursor_stmt(node, self);
+    }
+
+    fn transform_prepare_stmt<'mutref>(&mut self, node: nodes::PrepareStmtMut<'mem, 'mutref>) {
+        self.state.portal = Some(("PREPARE", node.name().map(str::to_owned)));
+        transform::transform_prepare_stmt(node, self);
+    }
+
+    fn transform_create_table_as_stmt<'mutref>(
+        &mut self,
+        node: nodes::CreateTableAsStmtMut<'mem, 'mutref>,
+    ) {
+        let what = if node.objtype == ObjectType::OBJECT_MATVIEW {
+            "CREATE MATERIALIZED VIEW"
+        } else {
+            "CREATE TABLE AS"
+        };
+        self.outputs = None;
+        transform::transform_create_table_as_stmt(node, self);
+        let taint = self.outputs.take().map_or(Taint::Unknown, |o| o.bound());
+        self.sink(taint, what);
     }
 
     // MERGE can appear inside EXPLAIN, PREPARE and CTEs, which `check_statement`
@@ -1545,13 +1262,17 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             .unwrap_or("xmltable")
             .to_owned();
         let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
-        let columns: Option<Vec<String>> = node
+        let columns: Option<Vec<(String, bool)>> = node
             .columns()
             .iter()
-            .map(|column| column.colname().map(str::to_owned))
+            .map(|column| {
+                column
+                    .colname()
+                    .map(|name| (name.to_owned(), column.for_ordinality))
+            })
             .collect();
-        transform::transform_range_table_func(node, self);
-        self.add_table_function(refname, columns, &aliases);
+        let args = self.scoped(|masker| transform::transform_range_table_func(node, masker));
+        self.add_table_function(refname, columns, &aliases, args);
     }
 
     fn transform_json_table<'mutref>(&mut self, node: nodes::JsonTableMut<'mem, 'mutref>) {
@@ -1565,8 +1286,8 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         for column in node.columns().iter() {
             json_table_columns(column, &mut columns);
         }
-        transform::transform_json_table(node, self);
-        self.add_table_function(refname, columns, &aliases);
+        let args = self.scoped(|masker| transform::transform_json_table(node, masker));
+        self.add_table_function(refname, columns, &aliases, args);
     }
 
     // Expressions are checked in their typed hooks, which run for top-level
@@ -1575,7 +1296,23 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         if self.predicate {
             self.mark_raw_a_expr(&node);
         }
-        transform::transform_a_expr(node, self);
+        let check = match self.checked_calls.get(&expr_address(&node)) {
+            Some(check) => check.clone(),
+            None => self.check_operator(&node),
+        };
+        if !check.needs_post_check() {
+            transform::transform_a_expr(node, self);
+            return;
+        }
+        let name = node
+            .name()
+            .iter()
+            .next_back()
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let args = self.scoped(|masker| transform::transform_a_expr(node, masker));
+        self.call_post_check(&check, args, &name);
     }
 
     fn transform_null_test<'mutref>(&mut self, node: nodes::NullTestMut<'mem, 'mutref>) {
@@ -1587,10 +1324,67 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     fn transform_func_call<'mutref>(&mut self, node: nodes::FuncCallMut<'mem, 'mutref>) {
         // Calls in generic positions were checked by `transform_node`.
-        if !self.checked_calls.contains(&call_address(&node)) {
-            self.check_call(&node);
+        let check = match self.checked_calls.get(&call_address(&node)) {
+            Some(check) => check.clone(),
+            None => self.check_call(&node),
+        };
+        let name = node
+            .funcname()
+            .iter()
+            .next_back()
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let windows: Vec<String> = node
+            .over()
+            .into_iter()
+            .flat_map(|over| [over.name(), over.refname()])
+            .flatten()
+            .map(str::to_owned)
+            .collect();
+        let args = self.scoped(|masker| transform::transform_func_call(node, masker));
+        // A named window's PARTITION BY and ORDER BY decide the value too.
+        for window in windows {
+            if let Some(taint) = self
+                .frames
+                .last()
+                .and_then(|frame| frame.windows.get(&window))
+                .copied()
+            {
+                self.note_from(taint, false, false);
+            }
         }
-        transform::transform_func_call(node, self);
+        self.call_post_check(&check, args, &name);
+    }
+
+    fn transform_window_def<'mutref>(&mut self, node: nodes::WindowDefMut<'mem, 'mutref>) {
+        let named = self.in_window_clause.then(|| {
+            (
+                node.name().map(str::to_owned),
+                node.refname().map(str::to_owned),
+            )
+        });
+        let taint = self.scoped(|masker| transform::transform_window_def(node, masker));
+        if let Some((Some(name), refname)) = named
+            && let Some(frame) = self.frames.last_mut()
+        {
+            let inherited = refname
+                .and_then(|refname| frame.windows.get(&refname).copied())
+                .unwrap_or_default();
+            frame.windows.insert(name, taint.join(inherited));
+        }
+    }
+
+    fn transform_sub_link<'mutref>(&mut self, node: nodes::SubLinkMut<'mem, 'mutref>) {
+        let exists = node.sub_link_type == SubLinkType::EXISTS_SUBLINK;
+        self.outputs = None;
+        transform::transform_sub_link(node, self);
+        let outputs = self.outputs.take().unwrap_or_else(Outputs::unknown);
+        // A scalar or array subquery is computed, even when it passes a
+        // column through. EXISTS only says whether there are rows.
+        if !exists {
+            self.note_from(outputs.bound().computed(), false, false);
+        }
     }
 
     fn transform_with_clause<'mutref>(&mut self, node: nodes::WithClauseMut<'mem, 'mutref>) {
@@ -1598,7 +1392,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         // A recursive CTE can refer to itself, and to CTEs after it.
         if recursive {
             for cte in node.ctes().iter() {
-                let cte = cte_info(cte);
+                let cte = pending_cte(cte);
                 if let Some(frame) = self.frames.last_mut() {
                     frame.ctes.push(cte);
                 }
@@ -1611,12 +1405,57 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         &mut self,
         node: nodes::CommonTableExprMut<'mem, 'mutref>,
     ) {
-        let cte = cte_info(&node);
+        let name = node.ctename().unwrap_or("").to_owned();
+        let aliases = names(node.aliascolnames());
+        let added = search_cycle_columns(&node);
+        let recursive = self
+            .frames
+            .last()
+            .is_some_and(|frame| frame.ctes.iter().any(|cte| cte.name == name && cte.pending));
+
+        self.ctes.push(name.clone());
+        // Deferred sinks aren't part of the snapshot: they must survive.
+        let (sources, computes) = (self.sources, self.state.computes);
+        self.outputs = None;
         transform::transform_common_table_expr(node, self);
-        if let Some(frame) = self.frames.last_mut()
-            && !frame.ctes.iter().any(|c| c.name == cte.name)
-        {
-            frame.ctes.push(cte);
+        let mut outputs = self
+            .outputs
+            .take()
+            .unwrap_or_else(Outputs::unknown)
+            .renamed(&aliases);
+        // Nothing but its own pending rows entered it: it's provably clean.
+        if recursive && self.sources == sources {
+            outputs = outputs.cleaned();
+            self.state.computes = computes;
+        }
+        self.ctes.pop();
+
+        for (column, listed) in added {
+            let taint = listed
+                .iter()
+                .map(|listed| match outputs.lookup(listed) {
+                    Lookup::Certain(taint) => taint,
+                    _ => Taint::Unknown,
+                })
+                .fold(Taint::Clean, Taint::join)
+                .computed();
+            outputs.push(OutputColumn {
+                name: Some(column),
+                taint,
+            });
+        }
+
+        if let Some(frame) = self.frames.last_mut() {
+            let cte = Cte {
+                name,
+                outputs,
+                pending: false,
+            };
+            match frame.ctes.iter_mut().find(|c| c.name == cte.name) {
+                Some(existing) if existing.pending => *existing = cte,
+                Some(_) => (),
+                None => frame.ctes.push(cte),
+            }
         }
     }
 
@@ -1625,35 +1464,50 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         // This is the name Postgres would give them anyway.
         // Function calls can be inlined, which would change their output name too.
         if node.name().is_none()
-            && let Some(name) = column_ref_name(node.val())
-                .filter(|name| !super::shape::is_placeholder(name))
-                .or_else(|| match node.val() {
-                    Node::FuncCall(_) => Some(figure_name(node.val())),
-                    Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
-                    _ => None,
-                })
+            && let Some(name) = self.pinned_name(node.val())
         {
             node.set_name(Some(self.mem.copy_string(&name)));
         }
-        transform::transform_res_target(node, self);
+        match self.writing {
+            // A SET target, subscripts included, is written as a whole.
+            Some(what) => {
+                let taint = self.scoped(|masker| transform::transform_res_target(node, masker));
+                self.sink(taint, what);
+            }
+            None => transform::transform_res_target(node, self),
+        }
     }
 
     fn transform_select_stmt<'mutref>(&mut self, mut node: nodes::SelectStmtMut<'mem, 'mutref>) {
-        let top = std::mem::take(&mut self.proxies_allowed);
         self.with_frame(|masker| {
             if let Some(with) = node.with_clause_mut() {
                 masker.transform_with_clause(with);
             }
 
             if node.op != SetOperation::SETOP_NONE {
+                // Columns are combined by position, and named after the left
+                // branch's.
+                let mut outputs = Outputs::unknown();
                 if let Some(larg) = node.larg_mut() {
+                    masker.outputs = None;
                     masker.transform_select_stmt(larg);
+                    outputs = masker.outputs.take().unwrap_or_else(Outputs::unknown);
                 }
                 if let Some(rarg) = node.rarg_mut() {
+                    masker.outputs = None;
                     masker.transform_select_stmt(rarg);
+                    let right = masker.outputs.take().unwrap_or_else(Outputs::unknown);
+                    outputs = outputs.union(right);
                 }
-                // ORDER BY / LIMIT of a set operation refer to its (masked) output.
+                // ORDER BY / LIMIT of a set operation refer to its outputs.
+                masker.record_output_refs(
+                    &outputs,
+                    node.sort_clause().iter().map(|sort| sort.node()),
+                    OutputRef::Only,
+                );
+                masker.setop_sort = true;
                 masker.transform_sort_by_list(node.sort_clause_mut());
+                masker.setop_sort = false;
                 clause!(
                     masker,
                     node,
@@ -1662,19 +1516,63 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                     set_limit_offset
                 );
                 clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
+                masker.outputs = Some(outputs);
                 return;
             }
 
-            masker.transform_list(node.values_lists_mut());
+            let mut outputs = None;
+            if !node.values_lists().is_empty() {
+                // One scope over every cell: each column carries what any does.
+                let width = node
+                    .values_lists()
+                    .iter()
+                    .next()
+                    .and_then(|row| row.as_node_list().map(|row| row.iter().count()))
+                    .unwrap_or(0);
+                let taint = masker
+                    .scoped(|masker| masker.transform_list(node.values_lists_mut()))
+                    .computed();
+                outputs = Some(Outputs {
+                    columns: (1..=width)
+                        .map(|i| OutputColumn {
+                            name: Some(format!("column{i}")),
+                            taint,
+                        })
+                        .collect(),
+                    rest: None,
+                });
+            }
             masker.transform_from_list(node.from_clause_mut());
+            // Named windows first: calls read their definitions' taint.
+            masker.in_window_clause = true;
+            masker.transform_list(node.window_clause_mut());
+            masker.in_window_clause = false;
+
             let targets: Vec<_> = node.target_list().iter().collect();
             if let Some(targets) = masker.expand_stars(&targets) {
                 node.set_target_list(masker.mem.make_list(&targets));
             }
-            if top {
-                masker.route_proxies(&node);
+            if node.values_lists().is_empty() {
+                let top = masker.result_level();
+                let slots = masker.output_slots(node.target_list_mut(), top);
+                let (level, expand) = masker.level_outputs(&slots, top);
+                if expand {
+                    let targets: Vec<_> = node.target_list().iter().collect();
+                    if let Some(targets) = masker.expand_slots(&targets, &slots) {
+                        node.set_target_list(masker.mem.make_list(&targets));
+                    }
+                }
+                masker.record_output_refs(
+                    &level,
+                    node.sort_clause()
+                        .iter()
+                        .map(|sort| sort.node())
+                        .chain(node.distinct_clause().iter()),
+                    OutputRef::Prefer,
+                );
+                masker.record_output_refs(&level, node.group_clause().iter(), OutputRef::Fallback);
+                outputs = Some(level);
             }
-            masker.transform_res_target_list(node.target_list_mut());
             masker.transform_list(node.distinct_clause_mut());
 
             masker.with_predicate(true, |masker| {
@@ -1695,7 +1593,6 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 having_clause_mut,
                 set_having_clause
             );
-            masker.transform_list(node.window_clause_mut());
             masker.transform_sort_by_list(node.sort_clause_mut());
             clause!(
                 masker,
@@ -1705,6 +1602,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 set_limit_offset
             );
             clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
+            masker.outputs = outputs;
         });
     }
 
@@ -1714,15 +1612,23 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 masker.transform_with_clause(with);
             }
             // The source query doesn't see the target table.
+            masker.outputs = None;
             transform::transform_node(node.select_stmt_mut(), masker);
+            // DEFAULT VALUES has no source.
+            let source = masker.outputs.take().map_or(Taint::Clean, |o| o.bound());
+            masker.sink(source, "INSERT");
 
             let target = masker.add_target(node.relation());
             if let Some(on_conflict) = node.on_conflict_clause_mut() {
-                // The proposed row; it's the client's own input, so it's not masked.
+                // The proposed row: what the source carries.
                 if let Some(frame) = masker.frames.last_mut() {
-                    frame
-                        .items
-                        .push(Item::derived("excluded".into(), unknown_columns()));
+                    frame.items.push(Item::derived(
+                        "excluded".into(),
+                        Outputs {
+                            columns: vec![],
+                            rest: Some(source),
+                        },
+                    ));
                 }
                 masker.transform_on_conflict_clause(on_conflict);
                 if let Some(frame) = masker.frames.last_mut() {
@@ -1733,6 +1639,15 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         });
     }
 
+    fn transform_on_conflict_clause<'mutref>(
+        &mut self,
+        node: nodes::OnConflictClauseMut<'mem, 'mutref>,
+    ) {
+        let writing = self.writing.replace("ON CONFLICT DO UPDATE");
+        transform::transform_on_conflict_clause(node, self);
+        self.writing = writing;
+    }
+
     fn transform_update_stmt<'mutref>(&mut self, mut node: nodes::UpdateStmtMut<'mem, 'mutref>) {
         self.with_frame(|masker| {
             if let Some(with) = node.with_clause_mut() {
@@ -1740,7 +1655,9 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             }
             let target = masker.add_target(node.relation());
             masker.transform_dml_from_list(node.from_clause_mut(), target);
+            let writing = masker.writing.replace("UPDATE");
             masker.transform_res_target_list(node.target_list_mut());
+            masker.writing = writing;
             masker.with_predicate(true, |masker| {
                 clause!(
                     masker,
@@ -1776,6 +1693,14 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     fn transform_copy_stmt<'mutref>(&mut self, mut node: nodes::CopyStmtMut<'mem, 'mutref>) {
         if node.is_from {
+            // Triggers and constraints of the table see real values.
+            if node
+                .relation()
+                .is_some_and(|range_var| self.resolves_to_proxy_relation(range_var))
+            {
+                self.state.touches_proxies = true;
+                self.state.writes_proxies = true;
+            }
             return;
         }
         if node.is_program || node.filename().is_some() {
@@ -1805,6 +1730,9 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             };
             if !self.is_masked_relation(relation) {
                 return;
+            }
+            if self.has_proxy_masks(relation) {
+                self.state.touches_proxies = true;
             }
 
             // COPY t TO ... => COPY (SELECT <columns> FROM t) TO ..., which is then masked.
@@ -1840,12 +1768,16 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 copy.as_mut()
                     .set_options(self.mem.make_unique(node.options()));
             }
+            self.outputs = None;
             transform::transform_node(copy.as_mut().query_mut(), self);
+            self.sink_outputs("COPY");
             node.replace(copy);
             self.changed = true;
             return;
         }
 
+        self.outputs = None;
         transform::transform_node(node.query_mut(), self);
+        self.sink_outputs("COPY");
     }
 }

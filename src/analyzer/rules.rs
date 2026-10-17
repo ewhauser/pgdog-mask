@@ -31,6 +31,41 @@ const DENIED_FUNCTIONS: &[&str] = &[
     "loread",
 ];
 
+/// Built-ins that store or send their arguments where they can be read back.
+const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "set_config",
+    "setseed",
+    "setval",
+    "nextval",
+    "pg_notify",
+    "pg_logical_emit_message",
+    "lowrite",
+    // PG17/18: write pg_class and pg_statistic.
+    "pg_restore_relation_stats",
+    "pg_restore_attribute_stats",
+    "pg_clear_relation_stats",
+    "pg_clear_attribute_stats",
+    "pg_replication_slot_advance",
+];
+
+/// Families of built-ins that store or send their arguments.
+const SIDE_EFFECT_PREFIXES: &[&str] = &[
+    // Keys show in pg_locks.
+    "pg_advisory_",
+    "pg_try_advisory_",
+    // Large objects (lo_get and friends are denied outright).
+    "lo_",
+    // Restore points and replication slots.
+    "pg_create_",
+    "pg_copy_",
+    "pg_drop_",
+    "pg_replication_origin_",
+    "pg_backup_",
+    "pg_start_backup",
+    // adminpack installs into pg_catalog.
+    "pg_file_",
+];
+
 /// Catalog relations that expose column values.
 const DENIED_RELATIONS: &[&str] = &[
     "pg_stats",
@@ -48,6 +83,14 @@ const CATALOG_SCHEMAS: &[&str] = &["pg_catalog", "information_schema", "pg_toast
 pub(super) fn denied_function(name: &str) -> Option<String> {
     (DENIED_FUNCTIONS.contains(&name) || name.starts_with("dblink"))
         .then(|| format!("function {name}() is not allowed for masked users"))
+}
+
+/// Does a built-in store or send its arguments where they can be read back?
+pub(super) fn side_effect(name: &str) -> bool {
+    SIDE_EFFECT_FUNCTIONS.contains(&name)
+        || SIDE_EFFECT_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 /// Is a function in `udf_allowlist`? Unqualified calls match entries by name.
@@ -161,6 +204,15 @@ pub(super) fn changes_resolution(node: Node<'_>) -> bool {
     }
 }
 
+/// DDL whose expressions are stored, or evaluated over rows: defaults,
+/// generated columns, checks, `ALTER ... TYPE ... USING` and indexes.
+pub(super) fn stores_expressions(node: Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::CreateStmt(_) | Node::AlterTableStmt(_) | Node::IndexStmt(_)
+    )
+}
+
 /// The INTO clause of a SELECT: on a set operation, its leftmost leaf's,
 /// where the parser attaches it.
 pub(super) fn into_clause(select: &nodes::SelectStmt) -> Option<&nodes::IntoClause> {
@@ -232,6 +284,24 @@ pub(super) fn tracked_set_config(node: Node<'_>) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_side_effect() {
+        for name in [
+            "set_config",
+            "nextval",
+            "pg_notify",
+            "pg_advisory_xact_lock",
+            "lo_from_bytea",
+            "pg_copy_logical_replication_slot",
+            "pg_restore_relation_stats",
+        ] {
+            assert!(side_effect(name), "{name}");
+        }
+        for name in ["upper", "current_setting", "length", "pg_typeof"] {
+            assert!(!side_effect(name), "{name}");
+        }
+    }
 
     #[test]
     fn test_functions() {

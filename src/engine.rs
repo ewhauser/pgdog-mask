@@ -13,7 +13,7 @@ use pgdog_plugin::{
 };
 use tracing::{Level, debug, enabled, error, info, warn};
 
-use crate::analyzer::{Context, Outcome, ProxyColumn, analyze, shape};
+use crate::analyzer::{self, Context, Outcome, ResultMask, analyze, shape};
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies, Profile, ProxyInstance};
@@ -44,23 +44,32 @@ impl Settings {
         }
     }
 
-    /// Column masks for the proxy columns of a statement.
-    fn column_masks(&self, proxies: &[ProxyColumn]) -> Proxies {
-        proxies
+    /// How PgDog masks a statement's results.
+    fn results(&self, results: &analyzer::Results) -> Results {
+        let columns = results
+            .columns
             .iter()
-            .map(|proxy| {
-                let mask = ColumnMask::new(
-                    proxy.column,
-                    MaskId(self.proxy_base + proxy.proxy as u64),
-                    proxy.type_oid,
-                );
-                if self.policies.proxies[proxy.proxy].mask.blocking() {
-                    mask.blocking()
-                } else {
-                    mask
+            .map(|column| match column.mask {
+                ResultMask::Null => ColumnMask::null(column.column).in_result(column.result),
+                ResultMask::Proxy { proxy, type_oid } => {
+                    let mask = ColumnMask::new(
+                        column.column,
+                        MaskId(self.proxy_base + proxy as u64),
+                        type_oid,
+                    )
+                    .in_result(column.result);
+                    if self.policies.proxies[proxy].mask.blocking() {
+                        mask.blocking()
+                    } else {
+                        mask
+                    }
                 }
             })
-            .collect()
+            .collect();
+        Results {
+            columns,
+            redact_errors: results.redact_errors,
+        }
     }
 
     /// Compute a profile and add it to the snapshot.
@@ -191,14 +200,25 @@ struct Database {
     settings_epoch: u64,
 }
 
-/// Output columns masked by proxy masks in the results.
-type Proxies = Arc<[ColumnMask]>;
+/// How PgDog masks a statement's results.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Results {
+    columns: Arc<[ColumnMask]>,
+    /// Errors may quote values of proxy-masked columns.
+    redact_errors: bool,
+}
+
+impl Results {
+    fn is_empty(&self) -> bool {
+        self.columns.is_empty() && !self.redact_errors
+    }
+}
 
 /// Cached decision for a statement shape.
 #[derive(Debug, Clone)]
 enum ShapeDecision {
-    Continue(Proxies),
-    Rewrite(Arc<shape::Template>, Proxies),
+    Continue(Results),
+    Rewrite(Arc<shape::Template>, Results),
     Block(String),
 }
 
@@ -206,10 +226,10 @@ impl ShapeDecision {
     /// `None` if the rewrite can't be turned into a template.
     fn new(decision: Decision, literals: usize) -> Option<Self> {
         Some(match decision {
-            Decision::Continue(proxies) => Self::Continue(proxies),
+            Decision::Continue(results) => Self::Continue(results),
             Decision::Block(reason) => Self::Block(reason),
-            Decision::Rewrite(sql, proxies) => {
-                Self::Rewrite(Arc::new(shape::Template::new(&sql, literals)?), proxies)
+            Decision::Rewrite(sql, results) => {
+                Self::Rewrite(Arc::new(shape::Template::new(&sql, literals)?), results)
             }
         })
     }
@@ -217,10 +237,10 @@ impl ShapeDecision {
     /// The decision for a statement with this shape and these literals.
     fn render(self, literals: &[String]) -> Option<Decision> {
         Some(match self {
-            Self::Continue(proxies) => Decision::Continue(proxies),
+            Self::Continue(results) => Decision::Continue(results),
             Self::Block(reason) => Decision::Block(reason),
-            Self::Rewrite(template, proxies) => {
-                Decision::Rewrite(template.render(literals)?, proxies)
+            Self::Rewrite(template, results) => {
+                Decision::Rewrite(template.render(literals)?, results)
             }
         })
     }
@@ -229,10 +249,10 @@ impl ShapeDecision {
 /// What to do with a statement, cached by statement and profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Decision {
-    /// Send it as is, masking these output columns in the results.
-    Continue(Proxies),
-    /// Send this SQL instead, masking these output columns in the results.
-    Rewrite(String, Proxies),
+    /// Send it as is, masking its results as said.
+    Continue(Results),
+    /// Send this SQL instead, masking its results as said.
+    Rewrite(String, Results),
     Block(String),
 }
 
@@ -434,11 +454,13 @@ impl Engine {
             }
 
             match (self.decide(session, sql, &settings, profile), mode) {
-                (Decision::Continue(proxies), Mode::Enforce) if !proxies.is_empty() => {
-                    Verdict::rewrite_masked(sql, proxies.to_vec()).redact_errors(false)
+                (Decision::Continue(results), Mode::Enforce) if !results.is_empty() => {
+                    Verdict::rewrite_masked(sql, results.columns.to_vec())
+                        .redact_errors(results.redact_errors)
                 }
-                (Decision::Rewrite(sql, proxies), Mode::Enforce) => {
-                    Verdict::rewrite_masked(sql, proxies.to_vec()).redact_errors(false)
+                (Decision::Rewrite(sql, results), Mode::Enforce) => {
+                    Verdict::rewrite_masked(sql, results.columns.to_vec())
+                        .redact_errors(results.redact_errors)
                 }
                 (Decision::Block(reason), Mode::Enforce) => Verdict::Deny(denied(reason)),
                 // Shadow mode: decisions are logged when they're made.
@@ -637,20 +659,20 @@ fn outcome_decision(
     shadow: bool,
 ) -> Decision {
     match outcome {
-        Outcome::Unchanged { raw, proxies, .. } => {
+        Outcome::Unchanged { raw, results, .. } => {
             if !raw.is_empty() {
                 info!(
                     "[pgdog_mask] user \"{}\" searched raw values of {:?}",
                     user, raw
                 );
             }
-            Decision::Continue(settings.column_masks(&proxies))
+            Decision::Continue(settings.results(&results))
         }
         Outcome::Rewritten {
             sql,
             masked,
             raw,
-            proxies,
+            results,
             ..
         } => {
             if !raw.is_empty() {
@@ -663,7 +685,7 @@ fn outcome_decision(
                 user,
                 original,
                 &format!("masked {masked:?}"),
-                Decision::Rewrite(sql, settings.column_masks(&proxies)),
+                Decision::Rewrite(sql, settings.results(&results)),
                 shadow,
             )
         }
@@ -776,7 +798,7 @@ mod test {
         ));
         assert!(matches!(
             decide(&engine, "anonymous", "SELECT id FROM orders"),
-            Decision::Continue(proxies) if proxies.is_empty()
+            Decision::Continue(results) if results.is_empty()
         ));
 
         // Deterministic: PgDog relies on it for prepared statements.
@@ -836,7 +858,7 @@ mod test {
             settings_epoch: 1,
             schema_epoch: 1,
         };
-        cache.put(key, Decision::Continue(Arc::new([])));
+        cache.put(key, Decision::Continue(Results::default()));
         assert!(cache.get(key).is_some());
 
         // Force a slot collision: same slot, different statement.
