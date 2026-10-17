@@ -139,6 +139,8 @@ pub(super) enum WholeRowOf<'c> {
         taint: Taint,
         /// The item is a recursive CTE still being analyzed.
         pending: bool,
+        /// A column whose name isn't certain may have that name.
+        uncertain: bool,
     },
 }
 
@@ -334,11 +336,12 @@ fn item_column<'c>(item: &Item<'c>, name: &str, current_cte: Option<&str>) -> Re
                 ..Default::default()
             },
             // A name the item may not have: Postgres would call `N(q)`.
-            Lookup::Possible(_) | Lookup::Absent => Resolution {
+            lookup @ (Lookup::Possible(_) | Lookup::Absent) => Resolution {
                 pending_only,
                 attribute_of: Some(WholeRowOf::Derived {
                     taint: outputs.bound(),
                     pending: item.pending.is_some(),
+                    uncertain: matches!(lookup, Lookup::Possible(_)),
                 }),
                 ..Default::default()
             },

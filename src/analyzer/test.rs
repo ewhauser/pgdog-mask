@@ -1031,6 +1031,10 @@ fn test_functions() {
     unchanged("anonymous", "SELECT count_users()");
     unchanged("anonymous", "SELECT public.same('a', 'b')");
 
+    // Inlining keeps the name Postgres gives the call, cast or not.
+    let sql = rewritten("anonymous", "SELECT user_ssn(1)::text FROM orders");
+    assert!(sql.ends_with(" AS user_ssn FROM orders"), "{sql}");
+
     // Functions that do are inlined, with masks applied.
     let sql = rewritten("anonymous", "SELECT user_ssn(o.user_id) FROM orders o");
     assert!(

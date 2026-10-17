@@ -175,16 +175,20 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         fields: &[&str],
         resolution: &Resolution<'_>,
     ) -> Result<Option<Taint>, ()> {
-        let (masked, taint) = match resolution.attribute_of {
+        let (masked, taint, uncertain) = match resolution.attribute_of {
             None => return Ok(None),
             Some(WholeRowOf::Relation(relation)) => {
-                (self.is_masked_relation(relation), Taint::Clean)
+                (self.is_masked_relation(relation), Taint::Clean, false)
             }
-            Some(WholeRowOf::Derived { taint, pending }) => match taint {
-                Taint::Proxy { .. } | Taint::Computed => (true, taint),
+            Some(WholeRowOf::Derived {
+                taint,
+                pending,
+                uncertain,
+            }) => match taint {
+                Taint::Proxy { .. } | Taint::Computed => (true, taint, uncertain),
                 // A recursive CTE's rows aren't known while it's analyzed.
-                Taint::Unknown => (pending && self.ctx.profile.proxies, taint),
-                Taint::Clean => (false, taint),
+                Taint::Unknown => (pending && self.ctx.profile.proxies, taint, uncertain),
+                Taint::Clean => (false, taint, uncertain),
             },
         };
         if !masked {
@@ -192,9 +196,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
         if let [qualifier @ .., name] = fields {
             let qualifier = qualifier.join(".");
-            self.block(format!(
-                "{qualifier}.{name} calls {name}() on the whole row of {qualifier}, which carries masked columns; write {name}({qualifier})"
-            ));
+            // Postgres reads a column of that name if there's one.
+            self.block(if uncertain {
+                format!(
+                    "{qualifier}.{name} may name a column of {qualifier} without an AS name, or call {name}() on its whole row, which carries masked columns; name the column with AS"
+                )
+            } else {
+                format!(
+                    "{qualifier}.{name} calls {name}() on the whole row of {qualifier}, which carries masked columns; write {name}({qualifier})"
+                )
+            });
         }
         Err(())
     }

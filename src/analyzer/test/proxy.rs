@@ -1162,6 +1162,28 @@ fn computed_outputs() -> Vec<Case> {
             Block("on the whole row"),
         ),
         case("H29", "SELECT o.row_to_json FROM orders o", allow()),
+        // Postgres names these columns `case` and `coalesce` here, but not
+        // always (CASE ... ELSE col is `col`): the name isn't certain.
+        case(
+            "H30",
+            "SELECT s.case FROM (SELECT CASE WHEN true THEN ssn END FROM users) s",
+            Block("name the column with AS"),
+        ),
+        case(
+            "H30",
+            "SELECT s.coalesce FROM (SELECT COALESCE(ssn, 'x') FROM users) s",
+            Block("name the column with AS"),
+        ),
+        case(
+            "H30",
+            "SELECT s.upper FROM (SELECT upper(ssn) FROM users) s",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "H30",
+            "SELECT s.c FROM (SELECT CASE WHEN true THEN ssn END AS c FROM users) s",
+            Same(vec![n(0)], true),
+        ),
     ]
 }
 

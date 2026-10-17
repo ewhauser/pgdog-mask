@@ -22,8 +22,9 @@ use pg_raw_parse::{
 
 use super::Context;
 use super::rules;
-use super::scope::{Cte, Frame, Item, ItemKind, derived_outputs, find_cte, unknown_columns};
-use super::shape::is_placeholder;
+use super::scope::{
+    Cte, Frame, Item, ItemKind, derived_outputs, exact_name, find_cte, unknown_columns,
+};
 use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::catalog::Relation;
 use crate::config::OnUnresolved;
@@ -286,41 +287,6 @@ fn call_address(call: &nodes::FuncCall) -> usize {
 
 fn expr_address(expr: &nodes::A_Expr) -> usize {
     std::ptr::from_ref(expr) as usize
-}
-
-/// Output column name Postgres gives an expression, if it's a (cast) column reference.
-fn column_ref_name(node: Node<'_>) -> Option<String> {
-    match node {
-        Node::ColumnRef(column) => {
-            let (fields, star) = fields(column);
-            if star {
-                None
-            } else {
-                fields.last().map(|f| (*f).to_owned())
-            }
-        }
-        Node::TypeCast(cast) => column_ref_name(cast.arg()),
-        _ => None,
-    }
-}
-
-/// Approximation of Postgres' FigureColname, good enough for pinning names.
-fn figure_name(node: Node<'_>) -> String {
-    match node {
-        Node::ColumnRef(_) | Node::TypeCast(_) => {
-            column_ref_name(node).unwrap_or_else(|| "?column?".into())
-        }
-        Node::FuncCall(call) => call
-            .funcname()
-            .iter()
-            .next_back()
-            .and_then(|n| n.as_str())
-            .unwrap_or("?column?")
-            .to_owned(),
-        Node::CaseExpr(_) => "case".into(),
-        Node::CoalesceExpr(_) => "coalesce".into(),
-        _ => "?column?".into(),
-    }
 }
 
 impl<'c, 'mem> Masker<'c, 'mem> {
@@ -770,15 +736,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// The output name `transform_res_target` pins on a target without one.
+    /// The output name `transform_res_target` pins on a target without one,
+    /// where masking could change it: column references, and calls and user
+    /// operators, which can be inlined.
     fn pinned_name(&self, val: Node<'_>) -> Option<String> {
-        column_ref_name(val)
-            .filter(|name| !is_placeholder(name))
-            .or_else(|| match val {
-                Node::FuncCall(_) => Some(figure_name(val)),
-                Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
-                _ => None,
-            })
+        match val {
+            Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
+            val => exact_name(val),
+        }
     }
 
     /// What the merged columns of a USING or NATURAL join over `items` of
