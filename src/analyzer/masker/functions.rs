@@ -15,14 +15,14 @@
 //! DEFINER`, `SET` options, volatile or polymorphic functions) is blocked unless
 //! it's in `udf_allowlist` or `extension_allowlist`.
 use pg_raw_parse::{
-    Node, NodeMut,
+    ConstValue, Node, NodeMut,
     make::Unique,
     nodes,
     raw::A_Expr_Kind,
     transform::{self},
 };
 
-use super::{Masker, Verdict, call_address, fields, ident, rules};
+use super::{Masker, RESOLUTION_CHANGED, Verdict, call_address, fields, ident, rules};
 use crate::catalog::{Function, RelationKind, parse_search_path};
 
 /// What to do with a call.
@@ -96,6 +96,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.block(reason);
             return Err(());
         }
+        // By name: Postgres prefers the built-in to a user-defined function
+        // with the same signature, as pg_catalog is searched first.
+        if matches!(schema, None | Some("pg_catalog")) && name == "set_config" {
+            self.check_set_config(call)?;
+        }
+        if schema.is_none()
+            && self.path_changed
+            && (self.ctx.catalog.has_function_named(name)
+                || !self.ctx.catalog.is_system_function(name))
+        {
+            self.block(RESOLUTION_CHANGED);
+            return Err(());
+        }
 
         match self.resolve_function(schema, name, call.args().iter().count()) {
             Target::Builtin | Target::Allowlisted => Ok(None),
@@ -103,7 +116,38 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 self.block(reason);
                 Err(())
             }
+            // Function bodies resolve names with the new search_path too,
+            // even when the call is qualified.
+            Target::Functions(_) if self.path_changed => {
+                self.block(RESOLUTION_CHANGED);
+                Err(())
+            }
             Target::Functions(functions) => self.functions_target(name, &functions),
+        }
+    }
+
+    /// `set_config` changes settings out of PgDog's sight. PgDog only tracks
+    /// `search_path` when the query is a single literal call, and a role
+    /// change alters `$user` for later statements.
+    fn check_set_config(&mut self, call: &nodes::FuncCall) -> Result<(), ()> {
+        let setting = match call.args().iter().next() {
+            Some(Node::A_Const(constant)) => match constant.val() {
+                Some(ConstValue::String(setting)) => Some(setting),
+                _ => None,
+            },
+            _ => None,
+        };
+        match setting {
+            Some(setting)
+                if !setting.eq_ignore_ascii_case("search_path") || self.tracked_set_config =>
+            {
+                self.changes_resolution |= rules::changes_resolution_setting(setting);
+                Ok(())
+            }
+            _ => {
+                self.block("set_config() can only change search_path as a query of its own, SELECT set_config('search_path', '...', false); use SET search_path");
+                Err(())
+            }
         }
     }
 
@@ -308,6 +352,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return CallUse::Allow;
         };
         let catalog = self.ctx.catalog;
+        if self.path_changed && catalog.has_operator_named(name) {
+            self.block(RESOLUTION_CHANGED);
+            return CallUse::Block;
+        }
         let operators = catalog.operators(schema, name, &self.ctx.search_path);
         if operators.is_empty() {
             return CallUse::Allow;

@@ -313,6 +313,16 @@ impl Catalog {
         self.system_functions.contains(name)
     }
 
+    /// Is there a user-defined function with this name, in any schema?
+    pub fn has_function_named(&self, name: &str) -> bool {
+        self.functions.contains_key(name)
+    }
+
+    /// Is there a user-defined operator with this name, in any schema?
+    pub fn has_operator_named(&self, name: &str) -> bool {
+        self.operators.contains_key(name)
+    }
+
     /// User-defined functions a call could resolve to: by name, in the given
     /// schema or the `search_path`.
     pub fn functions(

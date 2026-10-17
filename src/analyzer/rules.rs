@@ -1,5 +1,8 @@
 //! Fail-closed rules for masked users.
-use pg_raw_parse::Node;
+use pg_raw_parse::{
+    ConstValue, Node, nodes,
+    raw::{DiscardMode, SetOperation, VariableSetKind},
+};
 
 /// Built-in functions that run SQL or read data out of band.
 const DENIED_FUNCTIONS: &[&str] = &[
@@ -123,6 +126,107 @@ pub(super) fn check_statement(node: Node<'_>) -> Result<(), String> {
     } else {
         Err("this statement type is not allowed for masked users".to_owned())
     }
+}
+
+/// Settings that change how names resolve.
+const RESOLUTION_SETTINGS: &[&str] = &["search_path", "role", "session_authorization"];
+
+/// Does this setting change how names resolve? Setting names are
+/// case-insensitive.
+pub(super) fn changes_resolution_setting(name: &str) -> bool {
+    RESOLUTION_SETTINGS
+        .iter()
+        .any(|setting| setting.eq_ignore_ascii_case(name))
+}
+
+/// Statements after which names may resolve differently: changes to
+/// `search_path` or the role (`$user`), and DDL that creates, drops or
+/// renames relations or changes their columns.
+pub(super) fn changes_resolution(node: Node<'_>) -> bool {
+    match node {
+        Node::ExplainStmt(explain) => changes_resolution(explain.query()),
+        Node::VariableSetStmt(set) => {
+            set.kind == VariableSetKind::VAR_RESET_ALL
+                || (set.kind != VariableSetKind::VAR_SET_MULTI
+                    && set.name().is_some_and(changes_resolution_setting))
+        }
+        Node::DiscardStmt(discard) => discard.target == DiscardMode::DISCARD_ALL,
+        Node::SelectStmt(select) => into_clause(select).is_some(),
+        Node::CreateStmt(_)
+        | Node::CreateTableAsStmt(_)
+        | Node::DropStmt(_)
+        | Node::RenameStmt(_)
+        | Node::AlterTableStmt(_) => true,
+        _ => false,
+    }
+}
+
+/// The INTO clause of a SELECT: on a set operation, its leftmost leaf's,
+/// where the parser attaches it.
+pub(super) fn into_clause(select: &nodes::SelectStmt) -> Option<&nodes::IntoClause> {
+    let mut leaf = select;
+    while leaf.op != SetOperation::SETOP_NONE {
+        leaf = leaf.larg()?;
+    }
+    select.into_clause().or_else(|| leaf.into_clause())
+}
+
+/// Is this the one form of `set_config` PgDog tracks, so the session's
+/// `search_path` follows it: `SELECT [pg_catalog.]set_config('<name>',
+/// '<value>' | NULL, <boolean>)` and nothing else?
+pub(super) fn tracked_set_config(node: Node<'_>) -> bool {
+    let Node::SelectStmt(select) = node else {
+        return false;
+    };
+    let plain = select.op == SetOperation::SETOP_NONE
+        && select.with_clause().is_none()
+        && select.into_clause().is_none()
+        && select.distinct_clause().is_empty()
+        && select.from_clause().is_empty()
+        && matches!(select.where_clause(), Node::None)
+        && select.group_clause().is_empty()
+        && matches!(select.having_clause(), Node::None)
+        && select.window_clause().is_empty()
+        && select.values_lists().is_empty()
+        && select.sort_clause().is_empty()
+        && matches!(select.limit_offset(), Node::None)
+        && matches!(select.limit_count(), Node::None)
+        && select.locking_clause().is_empty();
+    let targets: Vec<_> = select.target_list().iter().collect();
+    let [target] = targets.as_slice() else {
+        return false;
+    };
+    let Node::FuncCall(call) = target.val() else {
+        return false;
+    };
+    let name: Vec<_> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
+    let args: Vec<_> = call
+        .args()
+        .iter()
+        .map(|arg| match arg {
+            Node::A_Const(constant) => Some(constant.val()),
+            _ => None,
+        })
+        .collect();
+    plain
+        && matches!(
+            name.as_slice(),
+            ["set_config"] | ["pg_catalog", "set_config"]
+        )
+        && !call.agg_star
+        && !call.agg_distinct
+        && !call.func_variadic
+        && call.over().is_none()
+        && call.agg_order().is_empty()
+        && matches!(call.agg_filter(), Node::None)
+        && matches!(
+            args.as_slice(),
+            [
+                Some(Some(ConstValue::String(_))),
+                Some(Some(ConstValue::String(_)) | None),
+                Some(Some(ConstValue::Boolean(_))),
+            ]
+        )
 }
 
 #[cfg(test)]

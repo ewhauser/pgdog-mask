@@ -5,6 +5,7 @@ mod masker;
 mod rules;
 mod scope;
 pub mod shape;
+mod taint;
 
 use std::collections::BTreeSet;
 
@@ -70,14 +71,16 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     let parsed = make::try_owned(|mem| {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, ctx);
+        let all: Vec<_> = stmts.as_ref().iter().collect();
         // Proxy masks apply to the rows of a single SELECT.
-        let single_select = {
-            let all: Vec<_> = stmts.as_ref().iter().collect();
-            matches!(all.as_slice(), [stmt] if matches!(stmt.stmt(), pg_raw_parse::Node::SelectStmt(_)))
-        };
-        if single_select {
+        if matches!(all.as_slice(), [stmt] if matches!(stmt.stmt(), pg_raw_parse::Node::SelectStmt(_)))
+        {
             masker.allow_proxies();
         }
+        if matches!(all.as_slice(), [stmt] if rules::tracked_set_config(stmt.stmt())) {
+            masker.track_set_config();
+        }
+        // Each statement may change name resolution for the ones after it.
         for stmt in stmts.as_mut() {
             masker.statement(stmt);
         }

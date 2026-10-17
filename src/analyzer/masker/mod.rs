@@ -5,22 +5,33 @@ mod views;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use pg_raw_parse::{
     Node, NodeMut,
     make::{MemoryToken, Unique},
     nodes,
-    raw::{A_Expr_Kind, SetOperation},
+    raw::{A_Expr_Kind, JsonTableColumnType, ReturningOptionKind, SetOperation},
     transform::{self, Assignable, Transform},
 };
 
 use super::Context;
 use super::rules;
-use super::scope::{Cte, Frame, Item, ItemKind, find_cte, find_item, resolve_column};
+use super::scope::{
+    Cte, Frame, Item, ItemKind, Resolution, ResolvedColumn, WholeRowOf, derived_outputs, find_cte,
+    find_item, resolve, resolve_column, unknown_columns,
+};
+use super::taint::{OutputColumn, Outputs, Taint};
 use crate::catalog::Relation;
 use crate::config::OnUnresolved;
-use crate::mask::{Mask, SearchOp, VALUE, castable};
+use crate::mask::{SearchOp, VALUE, castable};
 use functions::CallUse;
+
+/// Raw searches of a mask without a SQL part.
+static NO_RAW_SEARCH: LazyLock<HashSet<SearchOp>> = LazyLock::new(HashSet::new);
+
+/// Why statements after one that may change name resolution are blocked.
+const RESOLUTION_CHANGED: &str = "statements after one that may change name resolution (search_path, role or DDL) can't be checked in the same query; send them separately";
 
 /// Quote an identifier.
 pub(super) fn ident(name: &str) -> String {
@@ -43,6 +54,15 @@ struct MaskTarget<'c> {
     type_oid: u32,
 }
 
+/// How `*` covers one FROM item.
+#[derive(Clone)]
+enum Expansion {
+    /// A relation with masked columns: its columns, by name.
+    Columns { refname: String, names: Vec<String> },
+    /// Anything else: `refname.*`.
+    Star(String),
+}
+
 /// Functions that only normalize a value, allowed around a column in raw searches.
 const NORMALIZERS: &[&str] = &["lower", "upper", "btrim", "ltrim", "rtrim"];
 
@@ -62,6 +82,19 @@ macro_rules! clause {
                 $node.$set(replacement);
             }
             None => transform::transform_node($node.$get_mut(), $masker),
+        }
+    }};
+}
+
+/// Transform a generic child of a node of a known type the way
+/// `transform_node` would, replacing it through the field's setter.
+macro_rules! child {
+    ($masker:expr, $node:expr, $get_mut:ident, $set:ident) => {{
+        let action = $masker.action(&$node.$get_mut());
+        match $masker.replacement(action, &$node.$get_mut()) {
+            Ok(Some(replacement)) => $node.$set(replacement),
+            Ok(None) => (),
+            Err(keep) => $masker.descend(keep, $node.$get_mut()),
         }
     }};
 }
@@ -115,6 +148,12 @@ pub(super) struct Masker<'c, 'mem> {
     proxy_refs: HashSet<usize>,
     /// Output columns masked by proxy masks.
     pub(super) proxies: Vec<super::ProxyColumn>,
+    /// This statement may change how the names of later ones resolve.
+    changes_resolution: bool,
+    /// An earlier statement of this query may change name resolution.
+    path_changed: bool,
+    /// The query is the one `set_config` call PgDog tracks.
+    tracked_set_config: bool,
 }
 
 fn names(list: &pg_raw_parse::list::NodeList) -> Vec<String> {
@@ -160,33 +199,7 @@ fn column_ref_name(node: Node<'_>) -> Option<String> {
     }
 }
 
-/// Output column names of a subquery, if they can be determined without expanding `*`.
-fn output_names(node: Node<'_>) -> Option<Vec<String>> {
-    let Node::SelectStmt(select) = node else {
-        return None;
-    };
-    if select.op != SetOperation::SETOP_NONE {
-        return select
-            .larg()
-            .and_then(|larg| output_names(Node::SelectStmt(larg)));
-    }
-    if !select.values_lists().is_empty() {
-        return None;
-    }
-    select
-        .target_list()
-        .iter()
-        .map(|target| match target.name() {
-            Some(name) => Some(name.to_owned()),
-            None => match target.val() {
-                Node::ColumnRef(column) if fields(column).1 => None,
-                val => Some(figure_name(val)),
-            },
-        })
-        .collect()
-}
-
-/// Approximation of Postgres' FigureColname, good enough for name lookups.
+/// Approximation of Postgres' FigureColname, good enough for pinning names.
 fn figure_name(node: Node<'_>) -> String {
     match node {
         Node::ColumnRef(_) | Node::TypeCast(_) => {
@@ -225,7 +238,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             proxies_allowed: false,
             proxy_refs: HashSet::new(),
             proxies: vec![],
+            changes_resolution: false,
+            path_changed: false,
+            tracked_set_config: false,
         }
+    }
+
+    /// The query is the one `SELECT set_config(...)` PgDog tracks: it may
+    /// change `search_path`.
+    pub(super) fn track_set_config(&mut self) {
+        self.tracked_set_config = true;
     }
 
     /// A masker for the body of a view or function, sharing this one's verdicts.
@@ -266,11 +288,17 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             [stmt] => inlinable(stmt),
             _ => Err("it has more than one statement".into()),
         };
+        let mut changes_resolution = false;
         for stmt in stmts.as_mut() {
             nested.statement(stmt);
+            changes_resolution |= nested.changes_resolution;
         }
 
         let verdict = match nested.blocked {
+            // The change would outlive the call, without PgDog seeing it.
+            _ if changes_resolution => Verdict::Blocked(
+                "it changes name resolution (search_path, role or DDL) beyond the call".into(),
+            ),
             Some(reason) => Verdict::Blocked(reason),
             None if !nested.changed => Verdict::Safe,
             None => match shape {
@@ -290,6 +318,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// Mask a top-level statement.
     pub(super) fn statement(&mut self, stmt: nodes::RawStmtMut<'mem, '_>) {
         let node = stmt.stmt();
+        // `set_config('role', ...)` calls also set it, in `call_target`.
+        self.changes_resolution = rules::changes_resolution(node);
         if let Err(reason) = rules::check_statement(node) {
             self.block(reason);
             return;
@@ -297,6 +327,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.check_shadowing(node);
         self.check_ddl(node);
         transform::transform_raw_stmt(stmt, self);
+        // The statement itself resolves names the old way, as in Postgres;
+        // only the ones after it can't be checked.
+        self.path_changed |= self.changes_resolution;
     }
 
     /// DDL masked users may run can't touch relations with masked columns:
@@ -347,6 +380,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.block("this statement is not allowed for masked users");
             return;
         }
+        if self.path_changed {
+            self.block(RESOLUTION_CHANGED);
+            return;
+        }
 
         for (schema, name) in relations {
             if let Some(relation) =
@@ -366,18 +403,25 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
     /// Masked users can't create tables that shadow masked relations.
     fn check_shadowing(&mut self, node: Node<'_>) {
+        let node = match node {
+            Node::ExplainStmt(explain) => explain.query(),
+            node => node,
+        };
         let created = match node {
             Node::CreateStmt(create) => create.relation().and_then(|r| r.relname()),
             Node::CreateTableAsStmt(ctas) => ctas
                 .into()
                 .and_then(|into| into.rel())
                 .and_then(|r| r.relname()),
-            Node::SelectStmt(select) => select
-                .into_clause()
+            Node::SelectStmt(select) => rules::into_clause(select)
                 .and_then(|into| into.rel())
                 .and_then(|r| r.relname()),
             _ => None,
         };
+        if created.is_some() && self.path_changed {
+            self.block(RESOLUTION_CHANGED);
+            return;
+        }
         if let Some(name) = created
             && self
                 .ctx
@@ -402,14 +446,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let assignment = ctx
             .assignments
             .column(&relation.schema, &relation.name, column)?;
-        let Mask::Masked {
-            template,
-            raw_search,
-            proxy,
-        } = &ctx.profile.masks[assignment.policy]
-        else {
+        let mask = &ctx.profile.masks[assignment.policy];
+        if !mask.is_masked() {
             return None;
-        };
+        }
+        // A mask without a SQL part reads NULL wherever it's rewritten.
+        let sql = mask.sql();
         let policy = &ctx.policies.policies[assignment.policy].policy;
         let catalog_column = relation.column(column);
         let data_type = catalog_column
@@ -419,14 +461,29 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
         Some(MaskTarget {
             policy: assignment.policy,
-            template,
-            raw_search,
+            template: sql.map_or("NULL", |sql| sql.template),
+            raw_search: sql.map_or(&*NO_RAW_SEARCH, |sql| sql.raw_search),
             cast: data_type,
             qualifier: refname.to_owned(),
             arguments: &assignment.arguments,
             label: format!("{}.{}.{}", relation.schema, relation.name, column),
-            proxy: *proxy,
+            proxy: mask.proxy(),
             type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
+        })
+    }
+
+    /// The position of a relation's first column that is masked for this
+    /// user, or computed from columns that are.
+    fn first_masked_column(&self, relation: &Relation) -> Option<usize> {
+        let (assignments, masks) = (self.ctx.assignments, &self.ctx.profile.masks);
+        let (schema, name) = (&relation.schema, &relation.name);
+        relation.columns.iter().position(|column| {
+            assignments
+                .column(schema, name, &column.name)
+                .is_some_and(|assignment| masks[assignment.policy].is_masked())
+                || assignments
+                    .derived(schema, name, &column.name)
+                    .is_some_and(|policies| policies.iter().any(|p| masks[*p].is_masked()))
         })
     }
 
@@ -440,7 +497,25 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// The mask for a column reference, if it points to a masked column.
     fn column_target(&self, fields: &[&str]) -> Option<MaskTarget<'c>> {
         let resolved = resolve_column(&self.frames, fields)?;
-        self.mask_target(resolved.relation, resolved.column, resolved.refname)
+        self.mask_target(resolved.relation, resolved.column, &resolved.refname)
+    }
+
+    /// Block `q.N` where Postgres would call `N(q)` on a whole row carrying
+    /// masked values: the implicit call is never checked. Returns whether it
+    /// blocked.
+    fn guard_attribute(&mut self, fields: &[&str], resolution: &Resolution<'_>) -> bool {
+        let masked = match resolution.attribute_of {
+            Some(WholeRowOf::Relation(relation)) => self.is_masked_relation(relation),
+            Some(WholeRowOf::Derived(taint)) => !taint.is_clean(),
+            None => false,
+        };
+        if let ([qualifier @ .., name], true) = (fields, masked) {
+            let qualifier = qualifier.join(".");
+            self.block(format!(
+                "{qualifier}.{name} calls {name}() on the whole row of {qualifier}, which carries masked columns; write {name}({qualifier})"
+            ));
+        }
+        masked
     }
 
     /// Parse a SQL expression into this statement's memory.
@@ -530,29 +605,36 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             if star {
                 return;
             }
-            if let Some(target) = self.column_target(&names) {
+            let resolution = resolve(&self.frames, &names);
+            if self.guard_attribute(&names, &resolution) {
+                return;
+            }
+            let Some(resolved) = resolution.columns.first() else {
+                return;
+            };
+            if let Some(target) =
+                self.mask_target(resolved.relation, resolved.column, &resolved.refname)
+            {
                 self.block(format!(
                     "masked column {} can't be used directly as a condition",
                     target.label
                 ));
             } else {
-                self.guard_derived(&names);
+                self.guard_derived(resolved);
             }
         }
     }
 
     /// Block a column computed from columns masked for this user, e.g. a
     /// column of a materialized view. Returns whether it blocked.
-    fn guard_derived(&mut self, names: &[&str]) -> bool {
-        if let Some(resolved) = resolve_column(&self.frames, names)
-            && let Some(policies) = self.ctx.assignments.derived(
-                &resolved.relation.schema,
-                &resolved.relation.name,
-                resolved.column,
-            )
-            && policies
-                .iter()
-                .any(|policy| self.ctx.profile.masks[*policy].is_masked())
+    fn guard_derived(&mut self, resolved: &ResolvedColumn<'_>) -> bool {
+        if let Some(policies) = self.ctx.assignments.derived(
+            &resolved.relation.schema,
+            &resolved.relation.name,
+            resolved.column,
+        ) && policies
+            .iter()
+            .any(|policy| self.ctx.profile.masks[*policy].is_masked())
         {
             self.block(format!(
                 "column {}.{} is computed from masked columns and can't be masked; assign it a policy",
@@ -622,15 +704,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .then(|| find_cte(&self.frames, name))
             .flatten()
         {
-            let columns = if aliases.is_empty() {
-                cte.columns.clone()
-            } else {
-                Some(aliases)
-            };
-            Item {
-                refname,
-                kind: ItemKind::Derived(columns),
-            }
+            Item::derived(refname, cte.outputs.clone().renamed(&aliases))
+        } else if self.path_changed {
+            self.block(RESOLUTION_CHANGED);
+            Item::derived(refname, unknown_columns())
         } else if let Some(relation) = self
             .ctx
             .catalog
@@ -648,25 +725,31 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             if self.is_masked_relation(relation) {
                 self.touched = true;
             }
+            // Aliases map to columns by position, which a stale catalog can
+            // get wrong; names can't be.
+            if !aliases.is_empty()
+                && let Some(first) = self.first_masked_column(relation)
+                && aliases.len() > first
+            {
+                self.block(format!(
+                    "the column aliases of {refname} cover masked column {}.{}; alias columns in the select list instead",
+                    relation.qualified_name(),
+                    relation.columns[first].name
+                ));
+            }
             Item::relation(refname, relation, &aliases)
         } else if let Some(result) = rules::check_catalog_relation(schema, name) {
             if let Err(reason) = result {
                 self.block(reason);
             }
-            Item {
-                refname,
-                kind: ItemKind::Derived(None),
-            }
+            Item::derived(refname, unknown_columns())
         } else {
             if self.ctx.policies.config.general.on_unresolved == OnUnresolved::Block {
                 self.block(format!(
                     "relation \"{name}\" is not in the catalog, so its columns can't be checked"
                 ));
             }
-            Item {
-                refname,
-                kind: ItemKind::Derived(None),
-            }
+            Item::derived(refname, unknown_columns())
         };
 
         if let Some(frame) = self.frames.last_mut() {
@@ -690,23 +773,35 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         mem.make_res_target(None, mem.empty(), column.uncast())
     }
 
-    /// An item's columns, replacing `*` for it.
-    fn expand_item(
-        &mut self,
-        item_index: usize,
-    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
-        let frame = self.frames.last()?;
-        let item = &frame.items[item_index];
-        let masked = self.item_is_masked(item);
+    /// How `*` covers an item.
+    fn expansion(&self, item: &Item<'_>) -> Expansion {
         match &item.kind {
-            ItemKind::Relation { names, .. } if masked => Some(
+            ItemKind::Relation { relation, names } if self.is_masked_relation(relation) => {
+                Expansion::Columns {
+                    refname: item.refname.clone(),
+                    names: names.clone(),
+                }
+            }
+            _ => Expansion::Star(item.refname.clone()),
+        }
+    }
+
+    /// The targets replacing `*` for one item.
+    fn expand(
+        &mut self,
+        expansion: Expansion,
+    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
+        match expansion {
+            Expansion::Columns { refname, names } => Some(
                 names
                     .iter()
-                    .map(|name| self.star_target(&item.refname, Some(name)))
+                    .map(|name| self.star_target(&refname, Some(name)))
                     .collect(),
             ),
-            _ if !item.refname.is_empty() => Some(vec![self.star_target(&item.refname, None)]),
-            _ => {
+            Expansion::Star(refname) if !refname.is_empty() => {
+                Some(vec![self.star_target(&refname, None)])
+            }
+            Expansion::Star(_) => {
                 self.block("can't expand * over a subquery without an alias");
                 None
             }
@@ -717,23 +812,66 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         matches!(&item.kind, ItemKind::Relation { relation, .. } if self.is_masked_relation(relation))
     }
 
+    /// The columns replacing `qualifier.*`, if it covers masked columns. The
+    /// item can be in an outer query level.
+    fn expand_qualified(
+        &mut self,
+        qualifier: &str,
+    ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
+        match self.expansion(find_item(&self.frames, qualifier)?) {
+            expansion @ Expansion::Columns { .. } => self.expand(expansion),
+            Expansion::Star(_) => None,
+        }
+    }
+
+    /// The item `(name).*` or `(name.*).*` expands, if `name` is an item and
+    /// not a column. Postgres reads `(name)` as a column first.
+    fn indirection_star<'n>(&self, indirection: &'n nodes::A_Indirection) -> Option<&'n str> {
+        let mut path = indirection.indirection().iter();
+        let (Some(Node::A_Star(_)), None) = (path.next(), path.next()) else {
+            return None;
+        };
+        let Node::ColumnRef(column) = indirection.arg() else {
+            return None;
+        };
+        match fields(column) {
+            (names, false) => match names.as_slice() {
+                [name] if !resolve(&self.frames, &[name]).certain => Some(name),
+                _ => None,
+            },
+            (names, true) => match names.as_slice() {
+                [name] => Some(name),
+                _ => None,
+            },
+        }
+    }
+
     /// Target list with `*` and `alias.*` replaced by explicit columns, if they
     /// cover masked columns.
     fn expand_stars(
         &mut self,
         targets: &[&nodes::ResTarget],
     ) -> Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>> {
+        let star = |target: &&nodes::ResTarget| match target.val() {
+            Node::ColumnRef(column) => fields(column).1,
+            Node::A_Indirection(_) => true,
+            _ => false,
+        };
+        if !targets.iter().any(star) {
+            return None;
+        }
         let frame = self.frames.last()?;
-        let masked: Vec<bool> = frame
+        // A bare `*` covers every item of this level, but not RETURNING `old`
+        // and `new`.
+        let items: Vec<Expansion> = frame
             .items
             .iter()
-            .map(|item| self.item_is_masked(item))
+            .filter(|item| !item.qualified_only)
+            .map(|item| self.expansion(item))
             .collect();
-        let refnames: Vec<String> = frame
-            .items
+        let masked = items
             .iter()
-            .map(|item| item.refname.clone())
-            .collect();
+            .any(|item| matches!(item, Expansion::Columns { .. }));
         let merging = frame.merging_join;
 
         let mut plans: Vec<Option<Vec<Unique<'mem, &'mem nodes::ResTarget>>>> = vec![];
@@ -743,27 +881,27 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             let plan = match target.val() {
                 Node::ColumnRef(column) => match fields(column) {
                     (names, true) if names.is_empty() => {
-                        if masked.iter().any(|m| *m) {
+                        if masked {
                             if merging {
                                 self.block("can't expand * across a JOIN with USING or NATURAL over masked columns; list the columns");
                                 return None;
                             }
-                            let parts: Option<Vec<_>> =
-                                (0..masked.len()).map(|i| self.expand_item(i)).collect();
+                            let parts: Option<Vec<_>> = items
+                                .iter()
+                                .cloned()
+                                .map(|item| self.expand(item))
+                                .collect();
                             parts.map(|p| p.into_iter().flatten().collect())
                         } else {
                             None
                         }
                     }
-                    (names, true) => {
-                        let qualifier = names.last().copied().unwrap_or("");
-                        match refnames.iter().position(|r| r == qualifier) {
-                            Some(i) if masked[i] => self.expand_item(i),
-                            _ => None,
-                        }
-                    }
+                    (names, true) => self.expand_qualified(names.last().copied().unwrap_or("")),
                     _ => None,
                 },
+                Node::A_Indirection(indirection) => self
+                    .indirection_star(indirection)
+                    .and_then(|qualifier| self.expand_qualified(qualifier)),
                 _ => None,
             };
             needed |= plan.is_some();
@@ -786,22 +924,57 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         Some(expanded)
     }
 
-    /// Expand `*` in RETURNING, then mask it.
-    fn returning(&mut self, returning: Option<nodes::ReturningClauseMut<'mem, '_>>) {
-        if let Some(mut returning) = returning {
-            let targets: Vec<_> = returning
-                .exprs()
-                .iter()
-                .filter_map(|node| match node {
-                    Node::ResTarget(target) => Some(target),
-                    _ => None,
-                })
-                .collect();
-            if let Some(exprs) = self.expand_stars(&targets) {
-                let exprs: Vec<_> = exprs.into_iter().map(|e| e.uncast()).collect();
-                returning.set_exprs(self.mem.make_list(&exprs));
+    /// Expand `*` in RETURNING, then mask it. `target` is the DML target's
+    /// item in the current frame.
+    fn returning(
+        &mut self,
+        returning: Option<nodes::ReturningClauseMut<'mem, '_>>,
+        target: Option<usize>,
+    ) {
+        let Some(mut returning) = returning else {
+            return;
+        };
+
+        // PG18: `old` and `new` (or their aliases) are the target row before
+        // and after the change, for qualified names only.
+        let target = target.and_then(|i| Some(self.frames.last()?.items.get(i)?.kind.clone()));
+        let items = self.frames.last().map_or(0, |frame| frame.items.len());
+        if let Some(kind) = target
+            && let Some(frame) = self.frames.last_mut()
+        {
+            let (mut old, mut new) = ("old", "new");
+            for option in returning.options().iter() {
+                match (option.option, option.value()) {
+                    (ReturningOptionKind::RETURNING_OPTION_OLD, Some(alias)) => old = alias,
+                    (ReturningOptionKind::RETURNING_OPTION_NEW, Some(alias)) => new = alias,
+                    _ => (),
+                }
             }
-            self.transform_returning_clause(returning);
+            for refname in [old, new] {
+                frame.items.push(Item {
+                    refname: refname.to_owned(),
+                    kind: kind.clone(),
+                    qualified_only: true,
+                });
+            }
+        }
+
+        let targets: Vec<_> = returning
+            .exprs()
+            .iter()
+            .filter_map(|node| match node {
+                Node::ResTarget(target) => Some(target),
+                _ => None,
+            })
+            .collect();
+        if let Some(exprs) = self.expand_stars(&targets) {
+            let exprs: Vec<_> = exprs.into_iter().map(|e| e.uncast()).collect();
+            returning.set_exprs(self.mem.make_list(&exprs));
+        }
+        self.transform_returning_clause(returning);
+
+        if let Some(frame) = self.frames.last_mut() {
+            frame.items.truncate(items);
         }
     }
 
@@ -841,11 +1014,18 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             };
         }
 
-        if self.guard_derived(&names) {
+        let resolution = resolve(&self.frames, &names);
+        if self.guard_attribute(&names, &resolution) {
+            return None;
+        }
+        let resolved = resolution.columns.first();
+        if resolved.is_some_and(|resolved| self.guard_derived(resolved)) {
             return None;
         }
 
-        if let Some(target) = self.column_target(&names) {
+        if let Some(target) = resolved.and_then(|resolved| {
+            self.mask_target(resolved.relation, resolved.column, &resolved.refname)
+        }) {
             if self.proxy_refs.contains(&address(column)) {
                 // Masked in the results by the proxy mask.
                 self.masked.insert(target.label);
@@ -862,7 +1042,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
         // `SELECT t FROM t` is a whole-row reference if no column is named `t`.
         if let [name] = names.as_slice()
-            && resolve_column(&self.frames, &names).is_none()
+            && !resolution.certain
         {
             return self.whole_row(name);
         }
@@ -922,7 +1102,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.touched = true;
     }
 
-    /// Add a DML target relation to the current frame.
     /// Allow proxy masks on the next SELECT, the statement's top level.
     pub(super) fn allow_proxies(&mut self) {
         self.proxies_allowed = true;
@@ -942,8 +1121,18 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
 
         for (position, target) in select.target_list().iter().enumerate() {
-            let Node::ColumnRef(column) = target.val() else {
-                continue;
+            let column = match target.val() {
+                Node::ColumnRef(column) => column,
+                // Positions after `(row).*` depend on what it expands to.
+                Node::A_Indirection(indirection)
+                    if matches!(
+                        indirection.indirection().iter().next_back(),
+                        Some(Node::A_Star(_))
+                    ) =>
+                {
+                    return;
+                }
+                _ => continue,
             };
             let (names, star) = fields(column);
             // Positions after a star depend on what it expands to.
@@ -980,10 +1169,192 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    fn add_target(&mut self, relation: Option<&nodes::RangeVar>) {
-        if let Some(range_var) = relation {
-            self.check_view_write(range_var);
-            self.add_range_var(range_var);
+    /// Add a DML target relation to the current frame. Returns its item's
+    /// position.
+    fn add_target(&mut self, relation: Option<&nodes::RangeVar>) -> Option<usize> {
+        let range_var = relation?;
+        self.check_view_write(range_var);
+        let position = self.frames.last()?.items.len();
+        self.add_range_var(range_var);
+        (self.frames.last()?.items.len() > position).then_some(position)
+    }
+
+    /// Transform the FROM list of UPDATE or DELETE, which can't see the
+    /// target, not even from LATERAL items.
+    fn transform_dml_from_list<'mutref>(
+        &mut self,
+        list: pg_raw_parse::list_mut::NodeListMut<'mem, 'mutref, pg_raw_parse::list::NodeList>,
+        target: Option<usize>,
+    ) {
+        let start = target.map_or(0, |target| target + 1);
+        let saved = self
+            .frames
+            .last_mut()
+            .map(|frame| frame.visible.replace(start..usize::MAX));
+        self.transform_from_list(list);
+        if let (Some(frame), Some(saved)) = (self.frames.last_mut(), saved) {
+            frame.visible = saved;
+        }
+    }
+
+    /// Push an item for a table function (XMLTABLE, JSON_TABLE) whose columns
+    /// are defined in the call.
+    fn add_table_function(
+        &mut self,
+        refname: String,
+        columns: Option<Vec<String>>,
+        aliases: &[String],
+    ) {
+        let outputs = match columns {
+            Some(columns) => Outputs {
+                columns: columns
+                    .into_iter()
+                    .map(|name| OutputColumn {
+                        name: Some(name),
+                        taint: Taint::Clean,
+                    })
+                    .collect(),
+                rest: None,
+            },
+            None => unknown_columns(),
+        };
+        if let Some(frame) = self.frames.last_mut() {
+            frame
+                .items
+                .push(Item::derived(refname, outputs.renamed(aliases)));
+        }
+    }
+
+    /// What to do with a generic node, decided while it's borrowed.
+    fn action(&mut self, node: &NodeMut<'mem, '_>) -> Action<'mem> {
+        match node {
+            NodeMut::ColumnRef(_) => Action::ColumnRef,
+            NodeMut::RangeVar(range_var) => match self.inline_view(range_var) {
+                Some(inlined) => Action::Replace(inlined),
+                None => {
+                    self.add_range_var(range_var);
+                    Action::Keep(Keep::Done)
+                }
+            },
+            NodeMut::FuncCall(call) => match self.call(call) {
+                CallUse::Allow => Action::Keep(Keep::Recurse),
+                CallUse::Inline(inlined) => Action::Replace(inlined),
+                CallUse::Block => Action::Keep(Keep::Done),
+            },
+            NodeMut::A_Expr(expr) => match self.operator(expr) {
+                CallUse::Allow => Action::Keep(Keep::Recurse),
+                CallUse::Inline(inlined) => Action::Replace(inlined),
+                CallUse::Block => Action::Keep(Keep::Done),
+            },
+            NodeMut::RangeSubselect(subselect) => {
+                let alias = subselect.alias();
+                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
+                Action::Keep(Keep::Subselect {
+                    refname: alias.and_then(|a| a.aliasname()).unwrap_or("").to_owned(),
+                    outputs: derived_outputs(subselect.subquery()).renamed(&aliases),
+                    lateral: subselect.lateral,
+                })
+            }
+            NodeMut::RangeFunction(function) if let Some(use_) = self.range_function(function) => {
+                match use_ {
+                    CallUse::Inline(inlined) => Action::Replace(inlined),
+                    CallUse::Allow | CallUse::Block => Action::Keep(Keep::Done),
+                }
+            }
+            NodeMut::RangeFunction(function) => {
+                let alias = function.alias();
+                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
+                let function_name = function
+                    .functions()
+                    .iter()
+                    .next()
+                    .and_then(|pair| pair.as_node_list().and_then(|l| l.iter().next()))
+                    .and_then(|call| match call {
+                        Node::FuncCall(call) => {
+                            call.funcname().iter().next_back().and_then(|n| n.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                let outputs = if aliases.is_empty() {
+                    unknown_columns()
+                } else {
+                    Outputs {
+                        columns: aliases
+                            .into_iter()
+                            .map(|name| OutputColumn {
+                                name: Some(name),
+                                taint: Taint::Clean,
+                            })
+                            .collect(),
+                        rest: None,
+                    }
+                };
+                Action::Keep(Keep::Function {
+                    refname: alias
+                        .and_then(|a| a.aliasname())
+                        .unwrap_or(function_name)
+                        .to_owned(),
+                    outputs,
+                })
+            }
+            _ => Action::Keep(Keep::Recurse),
+        }
+    }
+
+    /// The node replacing a generic node, if it must be replaced, or what to
+    /// do with it otherwise.
+    fn replacement(
+        &mut self,
+        action: Action<'mem>,
+        node: &NodeMut<'mem, '_>,
+    ) -> Result<Option<Unique<'mem, Node<'mem>>>, Keep> {
+        match action {
+            Action::Replace(mut replacement) => {
+                self.mask_replacement(&mut replacement);
+                Ok(Some(replacement))
+            }
+            Action::ColumnRef => {
+                let replacement = match node {
+                    NodeMut::ColumnRef(column) => self.column_ref(column),
+                    _ => None,
+                };
+                if replacement.is_some() {
+                    self.changed = true;
+                }
+                Ok(replacement)
+            }
+            Action::Keep(keep) => Err(keep),
+        }
+    }
+
+    /// Transform a generic node that stays in place.
+    fn descend(&mut self, keep: Keep, node: NodeMut<'mem, '_>) {
+        match keep {
+            Keep::Done => (),
+            Keep::Recurse => transform::transform_node(node, self),
+            Keep::Subselect {
+                refname,
+                outputs,
+                lateral,
+            } => {
+                // A non-LATERAL subquery doesn't see the other items of this level.
+                let saved = self
+                    .frames
+                    .last_mut()
+                    .map(|frame| std::mem::replace(&mut frame.lateral_only, !lateral));
+                transform::transform_node(node, self);
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.lateral_only = saved.unwrap_or_default();
+                    frame.items.push(Item::derived(refname, outputs));
+                }
+            }
+            Keep::Function { refname, outputs } => {
+                transform::transform_node(node, self);
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.items.push(Item::derived(refname, outputs));
+                }
+            }
         }
     }
 }
@@ -1061,152 +1432,141 @@ fn search_op(expr: &nodes::A_Expr) -> Option<SearchOp> {
     }
 }
 
+/// Add the columns a JSON_TABLE column defines, NESTED ones flattened. Sets
+/// `names` to `None` if a column can't be read.
+fn json_table_columns(column: &nodes::JsonTableColumn, names: &mut Option<Vec<String>>) {
+    if column.coltype == JsonTableColumnType::JTC_NESTED {
+        for nested in column.columns().iter() {
+            match nested {
+                Node::JsonTableColumn(nested) => json_table_columns(nested, names),
+                _ => *names = None,
+            }
+        }
+        return;
+    }
+    match (column.name(), names.as_mut()) {
+        (Some(name), Some(names)) => names.push(name.to_owned()),
+        (None, _) => *names = None,
+        (Some(_), None) => (),
+    }
+}
+
 fn cte_info(cte: &nodes::CommonTableExpr) -> Cte {
-    let aliases = names(cte.aliascolnames());
     Cte {
         name: cte.ctename().unwrap_or("").to_owned(),
-        columns: if aliases.is_empty() {
-            output_names(cte.ctequery())
-        } else {
-            Some(aliases)
-        },
+        outputs: derived_outputs(cte.ctequery()).renamed(&names(cte.aliascolnames())),
     }
 }
 
 /// What to do with a generic node, decided while it's borrowed.
 enum Action<'mem> {
-    Recurse,
-    Done,
-    ColumnRef,
     /// Replace the node with this one, then mask it.
     Replace(Unique<'mem, Node<'mem>>),
+    ColumnRef,
+    Keep(Keep),
+}
+
+/// What to do with a generic node that stays in place.
+enum Keep {
+    Recurse,
+    Done,
     Subselect {
         refname: String,
-        columns: Option<Vec<String>>,
+        outputs: Outputs,
+        lateral: bool,
     },
     Function {
         refname: String,
-        columns: Option<Vec<String>>,
-    },
-    Join {
-        merging: bool,
-        aliased: bool,
+        outputs: Outputs,
     },
 }
 
 impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     fn transform_node<'mutref>(&mut self, node: Assignable<'mem, 'mutref>) {
-        let action = match &*node {
-            NodeMut::ColumnRef(_) => Action::ColumnRef,
-            NodeMut::RangeVar(range_var) => match self.inline_view(range_var) {
-                Some(inlined) => Action::Replace(inlined),
-                None => {
-                    self.add_range_var(range_var);
-                    Action::Done
-                }
-            },
-            NodeMut::FuncCall(call) => match self.call(call) {
-                CallUse::Allow => Action::Recurse,
-                CallUse::Inline(inlined) => Action::Replace(inlined),
-                CallUse::Block => Action::Done,
-            },
-            NodeMut::A_Expr(expr) => match self.operator(expr) {
-                CallUse::Allow => Action::Recurse,
-                CallUse::Inline(inlined) => Action::Replace(inlined),
-                CallUse::Block => Action::Done,
-            },
-            NodeMut::RangeSubselect(subselect) => {
-                let alias = subselect.alias();
-                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
-                Action::Subselect {
-                    refname: alias.and_then(|a| a.aliasname()).unwrap_or("").to_owned(),
-                    columns: if aliases.is_empty() {
-                        output_names(subselect.subquery())
-                    } else {
-                        Some(aliases)
-                    },
-                }
-            }
-            NodeMut::RangeFunction(function) if let Some(use_) = self.range_function(function) => {
-                match use_ {
-                    CallUse::Inline(inlined) => Action::Replace(inlined),
-                    CallUse::Allow | CallUse::Block => Action::Done,
-                }
-            }
-            NodeMut::RangeFunction(function) => {
-                let alias = function.alias();
-                let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
-                let function_name = function
-                    .functions()
-                    .iter()
-                    .next()
-                    .and_then(|pair| pair.as_node_list().and_then(|l| l.iter().next()))
-                    .and_then(|call| match call {
-                        Node::FuncCall(call) => {
-                            call.funcname().iter().next_back().and_then(|n| n.as_str())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                Action::Function {
-                    refname: alias
-                        .and_then(|a| a.aliasname())
-                        .unwrap_or(function_name)
-                        .to_owned(),
-                    columns: (!aliases.is_empty()).then_some(aliases),
-                }
-            }
-            NodeMut::JoinExpr(join) => Action::Join {
-                merging: join.is_natural || !join.using_clause().is_empty(),
-                aliased: join.alias().is_some() || join.join_using_alias().is_some(),
-            },
-            _ => Action::Recurse,
-        };
-
-        match action {
-            Action::Done => (),
-            Action::Recurse => transform::transform_node(node.into_inner(), self),
-            Action::Replace(mut replacement) => {
-                self.mask_replacement(&mut replacement);
-                node.replace(replacement);
-            }
-            Action::ColumnRef => {
-                let replacement = match &*node {
-                    NodeMut::ColumnRef(column) => self.column_ref(column),
-                    _ => None,
-                };
-                if let Some(replacement) = replacement {
-                    node.replace(replacement);
-                    self.changed = true;
-                }
-            }
-            Action::Subselect { refname, columns } | Action::Function { refname, columns } => {
-                transform::transform_node(node.into_inner(), self);
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.items.push(Item {
-                        refname,
-                        kind: ItemKind::Derived(columns),
-                    });
-                }
-            }
-            Action::Join { merging, aliased } => {
-                let before = self.frames.last().map(|f| f.items.len()).unwrap_or(0);
-                self.with_predicate(true, |masker| {
-                    transform::transform_node(node.into_inner(), masker);
-                });
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.merging_join |= merging;
-                }
-                if aliased
-                    && let Some(frame) = self.frames.last()
-                    && frame.items[before.min(frame.items.len())..]
-                        .iter()
-                        .any(|item| self.item_is_masked(item))
-                {
-                    self.block("aliased joins over masked columns are not supported");
-                }
-            }
+        let action = self.action(&node);
+        match self.replacement(action, &node) {
+            Ok(Some(replacement)) => node.replace(replacement),
+            Ok(None) => (),
+            Err(keep) => self.descend(keep, node.into_inner()),
         }
+    }
+
+    fn transform_join_expr<'mutref>(&mut self, mut node: nodes::JoinExprMut<'mem, 'mutref>) {
+        let merging = node.is_natural || !node.using_clause().is_empty();
+        let aliased = node.alias().is_some() || node.join_using_alias().is_some();
+        let before = self.frames.last().map_or(0, |frame| frame.items.len());
+        child!(self, node, larg_mut, set_larg);
+        child!(self, node, rarg_mut, set_rarg);
+
+        // The ON clause only sees the join's own items, and outer query levels.
+        let after = self.frames.last().map_or(0, |frame| frame.items.len());
+        let saved = self
+            .frames
+            .last_mut()
+            .map(|frame| frame.visible.replace(before..after));
+        self.with_predicate(true, |masker| child!(masker, node, quals_mut, set_quals));
+        if let Some(frame) = self.frames.last_mut() {
+            frame.visible = saved.flatten();
+            frame.merging_join |= merging;
+        }
+
+        if aliased
+            && let Some(frame) = self.frames.last()
+            && frame.items[before.min(frame.items.len())..]
+                .iter()
+                .any(|item| self.item_is_masked(item))
+        {
+            self.block("aliased joins over masked columns are not supported");
+        }
+    }
+
+    // Postgres analyzes a prepared statement again when search_path changes.
+    fn transform_execute_stmt<'mutref>(&mut self, node: nodes::ExecuteStmtMut<'mem, 'mutref>) {
+        if self.path_changed {
+            self.block(RESOLUTION_CHANGED);
+            return;
+        }
+        transform::transform_execute_stmt(node, self);
+    }
+
+    // MERGE can appear inside EXPLAIN, PREPARE and CTEs, which `check_statement`
+    // allows.
+    fn transform_merge_stmt<'mutref>(&mut self, _node: nodes::MergeStmtMut<'mem, 'mutref>) {
+        self.block("MERGE is not allowed for masked users");
+    }
+
+    fn transform_range_table_func<'mutref>(
+        &mut self,
+        node: nodes::RangeTableFuncMut<'mem, 'mutref>,
+    ) {
+        let alias = node.alias();
+        let refname = alias
+            .and_then(|a| a.aliasname())
+            .unwrap_or("xmltable")
+            .to_owned();
+        let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
+        let columns: Option<Vec<String>> = node
+            .columns()
+            .iter()
+            .map(|column| column.colname().map(str::to_owned))
+            .collect();
+        transform::transform_range_table_func(node, self);
+        self.add_table_function(refname, columns, &aliases);
+    }
+
+    fn transform_json_table<'mutref>(&mut self, node: nodes::JsonTableMut<'mem, 'mutref>) {
+        let alias = node.alias();
+        let refname = alias
+            .and_then(|a| a.aliasname())
+            .unwrap_or("json_table")
+            .to_owned();
+        let aliases = alias.map(|a| names(a.colnames())).unwrap_or_default();
+        let mut columns = Some(vec![]);
+        for column in node.columns().iter() {
+            json_table_columns(column, &mut columns);
+        }
+        transform::transform_json_table(node, self);
+        self.add_table_function(refname, columns, &aliases);
     }
 
     // Expressions are checked in their typed hooks, which run for top-level
@@ -1356,21 +1716,20 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             // The source query doesn't see the target table.
             transform::transform_node(node.select_stmt_mut(), masker);
 
-            masker.add_target(node.relation());
+            let target = masker.add_target(node.relation());
             if let Some(on_conflict) = node.on_conflict_clause_mut() {
                 // The proposed row; it's the client's own input, so it's not masked.
                 if let Some(frame) = masker.frames.last_mut() {
-                    frame.items.push(Item {
-                        refname: "excluded".into(),
-                        kind: ItemKind::Derived(None),
-                    });
+                    frame
+                        .items
+                        .push(Item::derived("excluded".into(), unknown_columns()));
                 }
                 masker.transform_on_conflict_clause(on_conflict);
                 if let Some(frame) = masker.frames.last_mut() {
                     frame.items.pop();
                 }
             }
-            masker.returning(node.returning_clause_mut());
+            masker.returning(node.returning_clause_mut(), target);
         });
     }
 
@@ -1379,8 +1738,8 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             if let Some(with) = node.with_clause_mut() {
                 masker.transform_with_clause(with);
             }
-            masker.add_target(node.relation());
-            masker.transform_from_list(node.from_clause_mut());
+            let target = masker.add_target(node.relation());
+            masker.transform_dml_from_list(node.from_clause_mut(), target);
             masker.transform_res_target_list(node.target_list_mut());
             masker.with_predicate(true, |masker| {
                 clause!(
@@ -1391,7 +1750,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                     set_where_clause
                 );
             });
-            masker.returning(node.returning_clause_mut());
+            masker.returning(node.returning_clause_mut(), target);
         });
     }
 
@@ -1400,8 +1759,8 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             if let Some(with) = node.with_clause_mut() {
                 masker.transform_with_clause(with);
             }
-            masker.add_target(node.relation());
-            masker.transform_from_list(node.using_clause_mut());
+            let target = masker.add_target(node.relation());
+            masker.transform_dml_from_list(node.using_clause_mut(), target);
             masker.with_predicate(true, |masker| {
                 clause!(
                     masker,
@@ -1411,7 +1770,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                     set_where_clause
                 );
             });
-            masker.returning(node.returning_clause_mut());
+            masker.returning(node.returning_clause_mut(), target);
         });
     }
 
@@ -1427,6 +1786,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         if let Some(range_var) = node.relation()
             && let Some(name) = range_var.relname()
         {
+            if self.path_changed {
+                self.block(RESOLUTION_CHANGED);
+                return;
+            }
             let schema = range_var.schemaname();
             let Some(relation) = self
                 .ctx

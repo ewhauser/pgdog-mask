@@ -83,7 +83,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         &mut self,
         range_var: &nodes::RangeVar,
     ) -> Option<Unique<'mem, Node<'mem>>> {
-        if !self.from {
+        // After a change of name resolution, `add_range_var` blocks it.
+        if !self.from || self.path_changed {
             return None;
         }
         let name = range_var.relname()?;

@@ -306,7 +306,9 @@ const CORPUS: &[(&str, Expect)] = &[
         "SELECT s.a FROM (SELECT ssn AS a FROM users) s",
         Expect::Runs,
     ),
-    ("SELECT c FROM users AS t(a, b, c)", Expect::Runs),
+    // Column aliases map by position, so they can't cover masked columns.
+    ("SELECT c FROM users AS t(a, b, c)", Expect::Blocked),
+    ("SELECT b FROM users AS t(a, b)", Expect::Runs),
     (
         "SELECT ssn FROM users UNION ALL SELECT email FROM users",
         Expect::Runs,

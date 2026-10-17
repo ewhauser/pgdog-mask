@@ -159,6 +159,34 @@ pub(crate) fn functions() -> Vec<Function> {
     );
     volatile.volatility = "volatile".into();
 
+    let mut stash = sql_function(
+        13,
+        "stash",
+        &[("v", "text")],
+        "text",
+        "INSERT INTO public.audit (note) VALUES (v) RETURNING note",
+    );
+    stash.volatility = "volatile".into();
+
+    let mut digest = sql_function(
+        15,
+        "digest",
+        &[("", "text"), ("", "text")],
+        "bytea",
+        "pg_digest",
+    );
+    digest.language = "c".into();
+    digest.extension = Some("pgcrypto".into());
+
+    let mut upper_safe = sql_function(
+        18,
+        "upper_safe",
+        &[("v", "text")],
+        "text",
+        "SELECT upper(v)",
+    );
+    upper_safe.volatility = "immutable".into();
+
     vec![
         last4,
         sql_function(
@@ -207,6 +235,51 @@ pub(crate) fn functions() -> Vec<Function> {
             &[("a", "bigint"), ("b", "bigint")],
             "boolean",
             "SELECT (SELECT ssn FROM public.users WHERE id = a) = (SELECT ssn FROM public.users WHERE id = b)",
+        ),
+        stash,
+        sql_function(
+            14,
+            "ssn_is",
+            &[("uid", "bigint"), ("guess", "text")],
+            "boolean",
+            "SELECT EXISTS (SELECT 1 FROM public.users WHERE id = uid AND ssn = guess)",
+        ),
+        digest,
+        sql_function(
+            16,
+            "notify_fn",
+            &[("v", "text")],
+            "void",
+            "SELECT pg_notify('c', v)",
+        ),
+        sql_function(
+            17,
+            "wrap_stash",
+            &[("v", "text")],
+            "text",
+            "SELECT public.stash(v)",
+        ),
+        upper_safe,
+        sql_function(
+            19,
+            "email_of",
+            &[("uid", "bigint")],
+            "text",
+            "SELECT email FROM public.users WHERE id = uid",
+        ),
+        sql_function(
+            20,
+            "reroute",
+            &[],
+            "integer",
+            "SET search_path TO other; SELECT 1",
+        ),
+        sql_function(
+            21,
+            "noisy_eq",
+            &[("a", "text"), ("b", "text")],
+            "boolean",
+            "SELECT a = b FROM (SELECT pg_notify('c', a)) AS n",
         ),
     ]
 }
@@ -283,6 +356,40 @@ pub(crate) fn catalog() -> Catalog {
             barrier,
             counts,
             flags,
+            relation(
+                "archive",
+                RelationKind::Table,
+                vec![column("id", "bigint"), column("ssn", "character varying")],
+            ),
+            relation(
+                "patients",
+                RelationKind::Table,
+                vec![
+                    column("id", "bigint"),
+                    column("user_id", "bigint"),
+                    column("mrn", "text"),
+                ],
+            ),
+            relation(
+                "audit",
+                RelationKind::Table,
+                vec![column("id", "bigint"), column("note", "text")],
+            ),
+            relation(
+                "legacy",
+                RelationKind::Table,
+                vec![column("id", "bigint"), column("code", "citext")],
+            ),
+            view(
+                "user_loud",
+                &["id", "loud"],
+                " SELECT users.id, upper((users.ssn)::text) AS loud FROM public.users;",
+            ),
+            view(
+                "user_contacts",
+                &["id", "ssn", "email"],
+                " SELECT users.id, users.ssn, users.email FROM public.users;",
+            ),
         ],
     );
     catalog.full = true;
@@ -307,7 +414,30 @@ pub(crate) fn catalog() -> Catalog {
             function_schema: "public".into(),
             function_name: "ssn_eq".into(),
         },
+        Operator {
+            schema: "public".into(),
+            name: "~~~".into(),
+            left_type: Some("text".into()),
+            right_type: Some("text".into()),
+            function_oid: 21,
+            function_schema: "public".into(),
+            function_name: "noisy_eq".into(),
+        },
     ]);
+    catalog
+}
+
+/// The catalog with a user-defined `public.set_config`, which unqualified
+/// calls could resolve to.
+fn catalog_shadowing_set_config() -> Catalog {
+    let mut catalog = catalog();
+    catalog.add_functions(vec![sql_function(
+        22,
+        "set_config",
+        &[("name", "text"), ("value", "text"), ("is_local", "boolean")],
+        "text",
+        "SELECT value",
+    )]);
     catalog
 }
 
@@ -316,12 +446,15 @@ pub(crate) fn analyze_as(user: &str, sql: &str) -> Outcome {
 }
 
 fn analyze_with(config: &str, user: &str, sql: &str) -> Outcome {
+    analyze_in(&catalog(), config, user, sql)
+}
+
+fn analyze_in(catalog: &Catalog, config: &str, user: &str, sql: &str) -> Outcome {
     let policies = Policies::new(Config::from_toml(config).unwrap()).unwrap();
-    let catalog = catalog();
-    let assignments = Assignments::new(&policies, "db", &catalog);
+    let assignments = Assignments::new(&policies, "db", catalog);
     let profile = policies.profile(user, "db");
     let ctx = Context {
-        catalog: &catalog,
+        catalog,
         assignments: &assignments,
         policies: &policies,
         profile: &profile,
@@ -435,10 +568,20 @@ fn test_star() {
 
 #[test]
 fn test_column_aliases() {
-    // `c` is `ssn` under the alias.
-    let sql = rewritten("anonymous", "SELECT c FROM users AS x(a, b, c)");
-    assert!(sql.contains("'XXX-XX-'"), "{sql}");
-    assert!(sql.contains("AS c"), "{sql}");
+    // Aliases map by position, which a stale catalog can get wrong: they
+    // can't cover masked columns (`c` would be `ssn`).
+    let reason = blocked("anonymous", "SELECT c FROM users AS x(a, b, c)");
+    assert!(
+        reason.contains("alias columns in the select list"),
+        "{reason}"
+    );
+    blocked("anonymous", "SELECT a FROM ssn_flags AS f(a, b)");
+    // Before the first masked column, and for users without masked columns,
+    // they're fine.
+    unchanged("anonymous", "SELECT b FROM users AS x(a, b) WHERE x.a = $1");
+    unchanged("anonymous", "SELECT o.t FROM orders AS o(i, u, t)");
+    unchanged("admin", "SELECT c FROM users AS x(a, b, c)");
+    unchanged("anonymous", "SELECT f.a FROM ssn_flags AS f(a)");
 }
 
 #[test]
@@ -950,6 +1093,25 @@ const SHAPE_CORPUS: &[&str] = &[
     "SELECT plpgsql_fn() + 1",
     "SELECT volatile_ssn(1)",
     "SELECT user_ssn_definer(1)",
+    "SELECT (SELECT s.v FROM archive a, (SELECT ssn AS v) s LIMIT 1) FROM users u",
+    "SELECT (SELECT l.v FROM archive a, LATERAL (SELECT ssn AS v) l LIMIT 1) FROM users u",
+    "SELECT g FROM users u, generate_series(1, length(ssn)) g",
+    "SELECT (SELECT count(*) FROM archive a, orders b JOIN orders c ON c.id = length(ssn) + 1) FROM users u",
+    "SELECT 1 FROM orders b JOIN archive a ON a.ssn = 'x'",
+    "UPDATE orders SET total = 0 FROM (SELECT ssn AS v FROM archive) s WHERE s.v = 'x'",
+    "UPDATE users SET name = 'x' FROM archive a, LATERAL (SELECT ssn AS v) l WHERE l.v = 'y'",
+    "SELECT l.*, 1 FROM users u, LATERAL (SELECT u.*) l",
+    "SELECT (u).*, 1 FROM users u WHERE id = 2",
+    "SELECT u.row_to_json FROM users u WHERE id = 1",
+    "UPDATE users SET name = 'x' WHERE id = 1 RETURNING old.ssn, new.ssn",
+    "UPDATE users SET name = 'x' WHERE id = 1 RETURNING old.*",
+    "DELETE FROM users WHERE id = 1 RETURNING old",
+    "UPDATE users SET name = 'x' RETURNING WITH (OLD AS o, NEW AS n) o.ssn, n.ssn",
+    "SELECT 1 INTO users UNION SELECT 2",
+    "SELECT * FROM users, XMLTABLE('/r' PASSING ('<r/>'::xml) COLUMNS a text) x",
+    "SELECT * FROM users, JSON_TABLE('{}'::jsonb, '$' COLUMNS (a text PATH '$.a')) j",
+    "SELECT c FROM users AS x(a, b, c) WHERE id = 1",
+    "SELECT b FROM users AS x(a, b) WHERE x.a = 1",
 ];
 
 #[test]
@@ -1045,6 +1207,396 @@ fn test_ddl() {
     ] {
         blocked("anonymous", sql);
     }
+}
+
+#[test]
+fn test_scope_non_lateral_subquery() {
+    // A FROM subquery without LATERAL can't see `a`: `ssn` is `u.ssn`.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT (SELECT s.v FROM archive a, (SELECT ssn AS v) s LIMIT 1) FROM users u",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    // The same through a JOIN.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT (SELECT s.v FROM archive a JOIN (SELECT ssn AS v) s ON true LIMIT 1) FROM users u",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    // CTEs stay visible.
+    let sql = rewritten(
+        "anonymous",
+        "WITH c AS (SELECT ssn FROM users) SELECT x.ssn FROM orders o, (SELECT * FROM c) x",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_scope_lateral_subquery() {
+    // LATERAL sees `a`, whose ssn isn't masked.
+    unchanged(
+        "anonymous",
+        "SELECT (SELECT l.v FROM archive a, LATERAL (SELECT ssn AS v) l LIMIT 1) FROM users u",
+    );
+    let sql = rewritten(
+        "anonymous",
+        "SELECT l.v FROM users u, LATERAL (SELECT ssn AS v) l",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    // Functions in FROM are implicitly LATERAL.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT g FROM users u, generate_series(1, length(ssn)) g",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_scope_join_on() {
+    // The ON clause only sees `b` and `c`: `ssn` is `u.ssn`.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT (SELECT count(*) FROM archive a, orders b JOIN orders c ON c.id = length(ssn)) FROM users u",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    unchanged(
+        "anonymous",
+        "SELECT 1 FROM orders b JOIN archive a ON a.ssn = $1",
+    );
+    // Nested joins see both sides of each join.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id JOIN archive a ON a.id = u.id AND u.ssn = a.ssn",
+    );
+    assert_eq!(sql.matches("'XXX-XX-'").count(), 1, "{sql}");
+}
+
+#[test]
+fn test_scope_update_from_subquery() {
+    // The subquery resolves its own FROM; the target is invisible to it.
+    unchanged(
+        "anonymous",
+        "UPDATE orders SET total = 0 FROM (SELECT ssn AS v FROM archive) s WHERE s.v = $1",
+    );
+    // The target is visible to SET and WHERE.
+    let sql = rewritten(
+        "anonymous",
+        "UPDATE users SET name = 'x' FROM archive a WHERE a.id = users.id AND users.ssn = $1",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_scope_update_from_lateral() {
+    // The target is hidden from its FROM list, even from LATERAL items: `ssn`
+    // is `a.ssn`.
+    unchanged(
+        "anonymous",
+        "UPDATE users SET name = 'x' FROM archive a, LATERAL (SELECT ssn AS v) l WHERE l.v = $1",
+    );
+    unchanged(
+        "anonymous",
+        "DELETE FROM users USING archive a, LATERAL (SELECT ssn AS v) l WHERE l.v = $1",
+    );
+}
+
+#[test]
+fn test_scope_outer_star() {
+    // `u.*` over an outer level is expanded, not turned into a row.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT l.* FROM users u, LATERAL (SELECT u.*) l",
+    );
+    assert!(
+        sql.contains("(SELECT u.id AS id, u.name AS name, ('XXX-XX-'"),
+        "{sql}"
+    );
+    assert!(!sql.contains("ROW("), "{sql}");
+}
+
+#[test]
+fn test_indirection_star() {
+    let sql = rewritten("anonymous", "SELECT (u).* FROM users u");
+    assert!(
+        sql.starts_with("SELECT u.id AS id, u.name AS name, ('XXX-XX-'"),
+        "{sql}"
+    );
+    let sql = rewritten("anonymous", "SELECT (u.*).* FROM users u");
+    assert!(
+        sql.starts_with("SELECT u.id AS id, u.name AS name, ('XXX-XX-'"),
+        "{sql}"
+    );
+    // Over unmasked relations, and over a column, it's left alone.
+    unchanged("anonymous", "SELECT (o).* FROM orders o");
+    unchanged(
+        "anonymous",
+        "SELECT (x).* FROM (SELECT o AS x FROM orders o) s",
+    );
+}
+
+#[test]
+fn test_attribute_notation() {
+    // Postgres reads `u.row_to_json` as `row_to_json(u)`, on the raw row.
+    let reason = blocked("anonymous", "SELECT u.row_to_json FROM users u");
+    assert!(
+        reason.contains("calls row_to_json() on the whole row"),
+        "{reason}"
+    );
+    blocked(
+        "anonymous",
+        "SELECT public.users.to_jsonb FROM public.users",
+    );
+    blocked(
+        "anonymous",
+        "SELECT 1 FROM users u WHERE u.row_to_json IS NOT NULL",
+    );
+    blocked("anonymous", "SELECT id FROM users u WHERE u.some_flag");
+    unchanged("anonymous", "SELECT o.row_to_json FROM orders o");
+    // System columns are columns.
+    unchanged("anonymous", "SELECT u.ctid, u.xmin FROM users u");
+    unchanged("admin", "SELECT u.row_to_json FROM users u");
+    let sql = rewritten("anonymous", "SELECT row_to_json(u) FROM users u");
+    assert!(sql.contains("ROW(u.id, u.name, ('XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_returning_old_new() {
+    let sql = rewritten(
+        "anonymous",
+        "UPDATE users SET name = 'x' WHERE id = 1 RETURNING old.ssn, new.ssn",
+    );
+    assert_eq!(sql.matches("'XXX-XX-'").count(), 2, "{sql}");
+
+    let sql = rewritten(
+        "anonymous",
+        "UPDATE users SET name = 'x' WHERE id = 1 RETURNING old.*",
+    );
+    assert!(
+        sql.contains("RETURNING old.id AS id, old.name AS name, ('XXX-XX-'"),
+        "{sql}"
+    );
+
+    let sql = rewritten("anonymous", "DELETE FROM users WHERE id = 1 RETURNING old");
+    assert!(sql.contains("ROW(old.id, old.name, ('XXX-XX-'"), "{sql}");
+
+    let sql = rewritten(
+        "anonymous",
+        "UPDATE users SET name = 'x' RETURNING WITH (OLD AS o, NEW AS n) o.ssn, n.ssn",
+    );
+    assert_eq!(sql.matches("'XXX-XX-'").count(), 2, "{sql}");
+
+    let sql = rewritten(
+        "anonymous",
+        "INSERT INTO users (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET name = 'x' RETURNING old.ssn",
+    );
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+
+    // `old` and `new` aren't covered by `*`, or by unqualified names.
+    let sql = rewritten(
+        "anonymous",
+        "UPDATE users SET name = 'x' WHERE id = 1 RETURNING *",
+    );
+    assert!(
+        sql.contains("RETURNING users.id AS id, users.name AS name, ('XXX-XX-'"),
+        "{sql}"
+    );
+    assert!(!sql.contains("old."), "{sql}");
+    unchanged("anonymous", "DELETE FROM orders RETURNING old.total");
+}
+
+#[test]
+fn test_merge_anywhere() {
+    for sql in [
+        "EXPLAIN ANALYZE MERGE INTO orders o USING users u ON o.user_id = u.id WHEN MATCHED THEN UPDATE SET total = 0",
+        "PREPARE p AS MERGE INTO orders o USING users u ON o.user_id = u.id WHEN MATCHED THEN DELETE",
+    ] {
+        let reason = blocked("anonymous", sql);
+        assert!(reason.contains("MERGE"), "{sql}: {reason}");
+    }
+    // A parse error is a block too.
+    blocked(
+        "anonymous",
+        "WITH m AS (MERGE INTO orders o USING users u ON o.user_id = u.id WHEN MATCHED THEN DELETE RETURNING o.id) SELECT * FROM m",
+    );
+}
+
+#[test]
+fn test_search_path_change() {
+    for (sql, reason) in [
+        (
+            "SET search_path TO other; SELECT ssn FROM users",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO public; SELECT ssn FROM users",
+            "name resolution",
+        ),
+        (
+            "SELECT set_config('search_path', 'other', false); SELECT id FROM orders",
+            "set_config",
+        ),
+        (
+            "SELECT set_config('search_path', 'public', false); SELECT ssn FROM users",
+            "set_config",
+        ),
+        ("DISCARD ALL; SELECT * FROM orders", "name resolution"),
+        ("RESET ALL; SELECT * FROM orders", "name resolution"),
+        (
+            "SET LOCAL search_path TO other; SELECT 1 FROM orders",
+            "name resolution",
+        ),
+        (
+            "SET \"Search_Path\" TO other; SELECT 1 FROM orders",
+            "name resolution",
+        ),
+        (
+            "SET SCHEMA 'other'; SELECT 1 FROM orders",
+            "name resolution",
+        ),
+        ("SET ROLE someone; TABLE orders", "name resolution"),
+        (
+            "SET search_path TO other; SELECT last4('x')",
+            "name resolution",
+        ),
+        // Bodies resolve names with the new path, even if the call is qualified.
+        (
+            "SET search_path TO other; SELECT public.count_users()",
+            "name resolution",
+        ),
+        // Postgres analyzes prepared statements again with the new path.
+        ("SET search_path TO other; EXECUTE p(1)", "name resolution"),
+        (
+            "SET search_path TO other; EXPLAIN EXECUTE p(1)",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO other; SELECT 'a' === 'b'",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO other; COPY orders TO STDOUT",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO other; CREATE TABLE t (id int)",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO other; ALTER TABLE orders ADD COLUMN x int",
+            "name resolution",
+        ),
+        (
+            "SET search_path TO other; SELECT ssn FROM user_ssns",
+            "name resolution",
+        ),
+        (
+            "SELECT set_config('search_path', 'other', false) FROM orders",
+            "set_config",
+        ),
+        (
+            "SELECT id, pg_catalog.set_config('SEARCH_PATH', 'other', true) FROM orders",
+            "set_config",
+        ),
+        ("SELECT set_config($1, 'x', false)", "set_config"),
+        (
+            "SELECT * FROM set_config('search_path', 'x', false)",
+            "set_config",
+        ),
+        (
+            "SELECT set_config('role', 'x', false); SELECT id FROM orders",
+            "name resolution",
+        ),
+        (
+            "DROP TABLE archive; SELECT ssn FROM users",
+            "name resolution",
+        ),
+        (
+            "ALTER TABLE archive RENAME TO old_archive; SELECT ssn FROM users",
+            "name resolution",
+        ),
+        (
+            "CREATE TABLE t AS SELECT 1; SELECT id FROM orders",
+            "name resolution",
+        ),
+        ("SELECT reroute()", "changes name resolution"),
+    ] {
+        let blocked = blocked("anonymous", sql);
+        assert!(blocked.contains(reason), "{sql}: {blocked}");
+    }
+
+    for sql in [
+        "RESET search_path; SELECT 1",
+        "SET search_path TO other; SELECT 1",
+        "SET ROLE someone; SELECT now()",
+        "SELECT set_config('search_path', 'other', false)",
+        "SELECT pg_catalog.set_config('search_path', 'other', true)",
+        "SELECT set_config('app.tenant', '42', false)",
+        "SELECT set_config('app.tenant', '42', false); SELECT id FROM orders",
+        "CREATE TABLE t2 (id int); SELECT 1",
+        "SET statement_timeout TO 1000; SELECT id FROM orders",
+        "SELECT id FROM orders; SET search_path TO other",
+    ] {
+        unchanged("anonymous", sql);
+    }
+
+    for sql in [
+        "SELECT ssn FROM users; SET search_path TO other",
+        "BEGIN; SELECT ssn FROM users; COMMIT",
+    ] {
+        assert!(rewritten("anonymous", sql).contains("'XXX-XX-'"), "{sql}");
+    }
+}
+
+#[test]
+fn test_set_config_shadowed() {
+    // A user-defined set_config doesn't hide the built-in's rules.
+    let catalog = catalog_shadowing_set_config();
+    for sql in [
+        "SELECT set_config('search_path', 'other', false) FROM orders",
+        "SELECT set_config('search_path', 'other', false); SELECT 1",
+    ] {
+        assert!(
+            matches!(analyze_in(&catalog, CONFIG, "anonymous", sql), Outcome::Blocked { reason } if reason.contains("set_config")),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn test_shadowing_wrappers() {
+    for sql in [
+        "EXPLAIN ANALYZE CREATE TABLE users AS SELECT 1",
+        "SELECT 1 INTO users UNION SELECT 2",
+    ] {
+        let reason = blocked("anonymous", sql);
+        assert!(reason.contains("shadow"), "{sql}: {reason}");
+    }
+}
+
+#[test]
+fn test_table_functions_are_items() {
+    let sql = rewritten(
+        "anonymous",
+        "SELECT * FROM users, XMLTABLE('/r' PASSING ('<r/>'::xml) COLUMNS a text) x",
+    );
+    assert!(sql.contains(", x.* FROM users, "), "{sql}");
+    assert!(sql.ends_with(" AS x"), "{sql}");
+
+    let sql = rewritten(
+        "anonymous",
+        "SELECT * FROM users, JSON_TABLE('{}'::jsonb, '$' COLUMNS (a text PATH '$.a')) j",
+    );
+    assert!(sql.contains(", j.* FROM users, "), "{sql}");
+
+    unchanged(
+        "anonymous",
+        "SELECT x.a FROM XMLTABLE('/r' PASSING ('<r/>'::xml) COLUMNS a text) x",
+    );
+    // Their columns are known, so names don't resolve past them.
+    unchanged(
+        "anonymous",
+        "SELECT (SELECT ssn FROM JSON_TABLE('{}'::jsonb, '$' COLUMNS (ssn text PATH '$.a', NESTED PATH '$.b' COLUMNS (b int))) j) FROM users",
+    );
 }
 
 /// The ssn policy with a proxy mask, and a partial SQL fallback.
