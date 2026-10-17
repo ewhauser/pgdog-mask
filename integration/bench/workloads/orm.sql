@@ -1,3 +1,4 @@
+-- An ORM-style SELECT "customers".* over 34 columns, two of them masked.
 \set id random(1, 99990)
 \set id2 :id + 1
 \set id3 :id + 2

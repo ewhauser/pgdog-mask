@@ -11,3 +11,10 @@ database = "masking_bench"
 password = "pgdog"
 server_user = "pgdog"
 server_password = "pgdog"
+
+[[users]]
+name = "bench_support"
+database = "masking_bench"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"

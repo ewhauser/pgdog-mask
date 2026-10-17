@@ -25,7 +25,7 @@ Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdo
 cargo test                       # unit tests and canary leak tests
 bash integration/run.sh          # end-to-end, through PgDog
 bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, GORM) with every user masked
-bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog with the plugin
+bash integration/bench/bench.sh  # pgbench: masking overhead against Postgres and PgDog
 ```
 
 The integration scripts build PgDog from the commit `Cargo.toml` pins, in `.pgdog/<commit>`. Set `PGDOG_BIN` to use your own build.
@@ -33,7 +33,7 @@ The integration scripts build PgDog from the commit `Cargo.toml` pins, in `.pgdo
 - **Canary tests** seed masked columns with unique values, run an adversarial corpus through the analyzer as a masked user, execute the result in Postgres, and fail if a canary appears anywhere in rows, errors, notices or `COPY` output. They load the schema with PgDog's own catalog queries.
 - **End-to-end tests** run PgDog with the plugin, built with the `test-masks` feature, and check masked and exempt users over the simple and extended protocols.
 - **`compat.sh`** needs PgDog's integration databases (`integration/setup.sh` in PgDog's repository). Its results should match `integration/go/run.sh` there, which runs without the plugin.
-- **`bench.sh`** needs `pgbench -i -s 20 masking_bench` and `integration/bench/setup.sql`.
+- **`bench.sh`** is the [performance test](../../operate/performance/#run-the-benchmark): it loads its own data and writes a report to `integration/bench/results/`.
 
 CI runs formatting, clippy, the tests, the custom-mask example and the end-to-end suite on every push.
 

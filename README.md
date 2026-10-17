@@ -178,12 +178,12 @@ Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdo
 cargo test                       # unit tests + canary leak tests
 bash integration/run.sh          # end-to-end through PgDog
 bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, gorm) with every user masked
-bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin
+bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin (see integration/bench/README.md)
 ```
 
 The integration scripts build PgDog from the repository and commit `pgdog-plugin` is pinned to in `Cargo.toml`, in `.pgdog/<commit>`. Set `PGDOG_BIN` to use your own build instead.
 - `compat.sh` also uses PgDog's integration suites and needs its databases (`integration/setup.sh` in PgDog's repository).
-- `bench.sh` needs `pgbench -i -s 20 masking_bench` and `integration/bench/setup.sql`.
+- `bench.sh` loads its own data into a `masking_bench` database and writes reports to `integration/bench/results/`. See [integration/bench/README.md](integration/bench/README.md).
 
 `compat.sh` runs the Go integration suites through PgDog with every user masked, so every statement the drivers send is analyzed. Results should match `integration/go/run.sh`, which runs without the plugin.
 
@@ -200,7 +200,7 @@ Decisions are cached per statement and masking profile, and statements that diff
 | masked user, new literals (simple protocol) | 2–6µs |
 | masked user, new statement shape | 3–35µs (once per shape) |
 
-End to end, `integration/bench/bench.sh` runs pgbench against Postgres, PgDog, and PgDog with the plugin for exempt and masked users. Prepared statements and point queries show no measurable overhead. A 34-column `SELECT table.*` with masked columns over the simple protocol runs about 16% slower for masked users. Most of that is Postgres planning and evaluating the expanded, masked select list, which `*` expansion requires.
+End to end, `integration/bench/bench.sh` runs pgbench against Postgres directly, PgDog, and PgDog with the plugin for exempt and masked users, and for masked lookups with and without raw search (see [integration/bench/README.md](integration/bench/README.md)). Against PgDog without the plugin: exempt users are within noise; SQL masks cost 1–4% on point queries and joins; a 34-column `SELECT *` costs about 25% over the simple and extended protocols and 5% prepared, mostly Postgres planning the masked select list; masked lookups can't use the column's index unless the rule allows raw search; and proxy masks cost per value (about 15% for 20 rows, 73% for 500). Full results: [Performance](https://ewhauser.github.io/pgdog-mask/operate/performance/).
 
 ## Upgrading PgDog
 

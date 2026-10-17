@@ -1,6 +1,12 @@
+# Masking for bench.sh. bench_admin is exempt, bench_masked is masked, and
+# bench_support is masked but may search on logins by their real value.
 [[users]]
 name = "bench_admin"
 roles = ["pii_admin"]
+
+[[users]]
+name = "bench_support"
+roles = ["support"]
 
 [[policies]]
 name = "balance"
@@ -12,11 +18,6 @@ digits = -2
 roles = ["pii_admin"]
 mask = "none"
 
-[[masked_columns]]
-name = "pgbench_accounts"
-column = "abalance"
-policy = "balance"
-
 [[policies]]
 name = "email"
 data_type = "text"
@@ -25,6 +26,23 @@ mask = "email"
 [[policies.rules]]
 roles = ["pii_admin"]
 mask = "none"
+
+# Indexed: masked lookups can't use the index, raw searches can.
+[[policies]]
+name = "login"
+data_type = "text"
+mask = "partial"
+keep_suffix = 2
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies.rules]]
+roles = ["support"]
+mask = "partial"
+keep_suffix = 2
+search = "raw"
 
 [[policies]]
 name = "ssn"
@@ -36,6 +54,23 @@ keep_suffix = 4
 roles = ["pii_admin"]
 mask = "none"
 
+# A proxy mask: computed by the plugin on the rows Postgres returns.
+[[policies]]
+name = "tax_id"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+options = { key_env = "PGDOG_MASK_BENCH_HMAC_KEY" }
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[masked_columns]]
+name = "pgbench_accounts"
+column = "abalance"
+policy = "balance"
+
 [[masked_columns]]
 name = "customers"
 column = "email"
@@ -45,3 +80,13 @@ policy = "email"
 name = "customers"
 column = "ssn"
 policy = "ssn"
+
+[[masked_columns]]
+name = "customers"
+column = "tax_id"
+policy = "tax_id"
+
+[[masked_columns]]
+name = "customers"
+column = "login"
+policy = "login"

@@ -1,6 +1,0 @@
-[general]
-workers = 4
-
-[[databases]]
-name = "masking_bench"
-host = "127.0.0.1"

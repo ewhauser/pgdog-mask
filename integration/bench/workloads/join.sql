@@ -1,3 +1,4 @@
+-- A join returning a masked column (SQL mask).
 \set aid random(1, 100000 * :scale)
 SELECT a.aid, a.bid, a.abalance, b.bbalance
 FROM pgbench_accounts a
