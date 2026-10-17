@@ -155,7 +155,6 @@ data_type = "character varying"
 mask = "proxy"
 proxy = "ff1"
 options = { key_file = "{dir}/ff1.key" }
-fallback = "null"
 
 [[policies.rules]]
 roles = ["pii_admin"]
@@ -177,8 +176,6 @@ name = "note"
 data_type = "text"
 mask = "proxy"
 proxy = "fuzz.blocking"
-fallback = "constant"
-value = "hidden"
 
 [[policies.rules]]
 roles = ["pii_admin"]

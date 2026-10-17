@@ -10,8 +10,8 @@ use tracing::error;
 
 use crate::analyzer::lineage::{Lineage, view_lineage, view_relations};
 use crate::catalog::{Catalog, Relation, RelationKind};
-use crate::config::{Config, Error, General, MaskKind, Policy};
-use crate::mask::{Mask, compile};
+use crate::config::{Config, Error, General, MaskKind, MaskSpec, Policy};
+use crate::mask::{Mask, check_proxy, compile};
 use crate::proxy::{Options, ProxyMask, Registry};
 use crate::tags::{self, DatabaseTags};
 
@@ -78,26 +78,22 @@ impl Policies {
     /// Compile policies, building proxy masks from `registry`.
     pub fn with_registry(config: Config, registry: &Registry) -> Result<Self, Error> {
         let mut proxies = vec![];
-        let mut compile_spec = |policy: &Policy, spec: &crate::config::MaskSpec| {
-            let mut mask = compile(policy, spec)?;
-            if spec.kind == Some(MaskKind::Proxy) {
-                let name = spec.proxy.as_deref().unwrap_or_default();
-                let options = Options::new(spec.options.clone().unwrap_or_default());
-                let instance =
-                    registry
-                        .create(name, &options, &policy.data_type)
-                        .map_err(|err| {
-                            Error::Invalid(format!("policy \"{}\": {}", policy.name, err.0))
-                        })?;
-                proxies.push(ProxyInstance {
-                    name: name.to_owned(),
-                    mask: instance,
-                });
-                if let Mask::Masked { proxy, .. } = &mut mask {
-                    *proxy = Some(proxies.len() - 1);
-                }
+        let mut compile_spec = |policy: &Policy, spec: &MaskSpec| {
+            if spec.kind != Some(MaskKind::Proxy) {
+                return compile(policy, spec);
             }
-            Ok::<_, Error>(mask)
+            let name = check_proxy(policy, spec)?;
+            let options = Options::new(spec.options.clone().unwrap_or_default());
+            let instance = registry
+                .create(name, &options, &policy.data_type)
+                .map_err(|err| Error::Invalid(format!("policy \"{}\": {}", policy.name, err.0)))?;
+            proxies.push(ProxyInstance {
+                name: name.to_owned(),
+                mask: instance,
+            });
+            Ok(Mask::Proxy {
+                proxy: proxies.len() - 1,
+            })
         };
 
         let mut policies = vec![];
@@ -691,6 +687,88 @@ mask = "none"
         }
     }
 
+    #[test]
+    fn test_proxy_mask_index() {
+        let config = r#"
+[[users]]
+name = "analyst"
+roles = ["analyst"]
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "proxy"
+proxy = "test.stub"
+
+[[policies.rules]]
+roles = ["analyst"]
+mask = "null"
+
+[[policies]]
+name = "email"
+data_type = "text"
+mask = "email"
+
+[[policies]]
+name = "card"
+data_type = "text"
+mask = "proxy"
+proxy = "test.stub"
+options = { n = 1 }
+
+[[policies.rules]]
+roles = ["analyst"]
+mask = "partial"
+keep_suffix = 4
+"#;
+        let mut registry = Registry::default();
+        registry.register("test.stub", |_: &Options| Ok(Stub));
+        let policies =
+            Policies::with_registry(Config::from_toml(config).unwrap(), &registry).unwrap();
+        assert_eq!(policies.proxies.len(), 2);
+        assert!(policies.proxies.iter().all(|p| p.name == "test.stub"));
+
+        let anonymous = policies.profile("anonymous", "db");
+        assert_eq!(anonymous.masks[0], Mask::Proxy { proxy: 0 });
+        assert_eq!(anonymous.masks[2].proxy(), Some(1));
+        for proxy in [&anonymous.masks[0], &anonymous.masks[2]] {
+            assert!(proxy.is_masked());
+            assert!(proxy.sql().is_none());
+        }
+        assert!(anonymous.masks[1].sql().is_some());
+        assert_eq!(anonymous.masks[1].proxy(), None);
+        assert!(anonymous.proxies);
+        assert!(!anonymous.exempt);
+
+        // SQL masks only for this user.
+        let analyst = policies.profile("analyst", "db");
+        assert!(analyst.masks.iter().all(|mask| mask.proxy().is_none()));
+        assert!(!analyst.proxies);
+        assert!(!analyst.exempt);
+
+        // Proxy rules are checked when policies compile.
+        let err = Policies::with_registry(
+            Config::from_toml(&config.replace("options = { n = 1 }", "keep_suffix = 4")).unwrap(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("\"keep_suffix\" doesn't apply to mask = \"proxy\""),
+            "{err}"
+        );
+        let err = Policies::with_registry(
+            Config::from_toml(&config.replace(
+                "proxy = \"test.stub\"\noptions",
+                "proxy = \"nope\"\noptions",
+            ))
+            .unwrap(),
+            &registry,
+        )
+        .unwrap_err();
+        assert!(err.to_string().starts_with("policy \"card\": "), "{err}");
+    }
+
     const TAGS: &str = r#"
 [general]
 tag_source = "comment"
@@ -850,10 +928,9 @@ tag = "pii.ssn"
         assert!(!profile.exempt);
         assert_eq!(
             profile.masks[policies.unresolved],
-            crate::mask::Mask::Masked {
+            Mask::Sql {
                 template: "NULL".into(),
                 raw_search: Default::default(),
-                proxy: None,
             }
         );
         let none = Policies::new(

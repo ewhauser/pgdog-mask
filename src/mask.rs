@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 use pg_raw_parse::Node;
 use pg_raw_parse::walk::{Recurse, walk_manual};
 
-use crate::config::{Error, MaskKind, MaskSpec, Policy, Search};
+use crate::config::{Error, FALLBACK_REMOVED, MaskKind, MaskSpec, Policy, Search};
 
 /// Placeholder for the masked column in templates.
 pub const VALUE: &str = "val";
@@ -107,16 +107,17 @@ impl SearchOp {
 pub enum Mask {
     /// The column is not masked for this user.
     Unmasked,
-    Masked {
-        /// SQL expression over `val` and the policy arguments. For proxy
-        /// masks, the fallback for references the proxy mask can't cover.
+    /// Rewritten in the statement.
+    Sql {
+        /// SQL expression over `val` and the policy arguments.
         template: String,
         /// Operators usable on the raw value in predicates. Empty unless
         /// the rule sets `search = "raw"`.
         raw_search: HashSet<SearchOp>,
-        /// Index of the proxy mask in [`crate::profile::Policies::proxies`].
-        proxy: Option<usize>,
     },
+    /// Masked in the results by [`crate::profile::Policies::proxies`]`[proxy]`.
+    /// References are never rewritten.
+    Proxy { proxy: usize },
 }
 
 /// A SQL mask's parts, borrowed.
@@ -130,31 +131,29 @@ pub struct SqlMask<'a> {
 
 impl Mask {
     pub fn is_masked(&self) -> bool {
-        matches!(self, Self::Masked { .. })
+        !matches!(self, Self::Unmasked)
     }
 
-    /// The SQL mask, if the column is masked. For proxy masks, it's the
-    /// fallback.
+    /// The SQL mask, if the column is rewritten in statements.
     pub fn sql(&self) -> Option<SqlMask<'_>> {
         match self {
-            Self::Unmasked => None,
-            Self::Masked {
+            Self::Sql {
                 template,
                 raw_search,
-                ..
             } => Some(SqlMask {
                 template,
                 raw_search,
             }),
+            Self::Unmasked | Self::Proxy { .. } => None,
         }
     }
 
     /// Index of the proxy mask in [`crate::profile::Policies::proxies`], if
-    /// the column is proxy-masked.
+    /// the column is masked in the results.
     pub fn proxy(&self) -> Option<usize> {
         match self {
-            Self::Unmasked => None,
-            Self::Masked { proxy, .. } => *proxy,
+            Self::Proxy { proxy } => Some(*proxy),
+            Self::Unmasked | Self::Sql { .. } => None,
         }
     }
 }
@@ -164,7 +163,8 @@ pub fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Compile a mask for a policy.
+/// Compile a SQL mask, or `none`, for a policy. Proxy masks are checked with
+/// [`check_proxy`] and built from a [`crate::proxy::Registry`].
 pub fn compile(policy: &Policy, spec: &MaskSpec) -> Result<Mask, Error> {
     let context = |msg: String| Error::Invalid(format!("policy \"{}\": {msg}", policy.name));
     let family = TypeFamily::of(&policy.data_type);
@@ -172,35 +172,22 @@ pub fn compile(policy: &Policy, spec: &MaskSpec) -> Result<Mask, Error> {
         .kind
         .ok_or_else(|| context("every policy and rule needs a \"mask\"".into()))?;
 
-    if kind == MaskKind::Proxy {
-        if spec.proxy.is_none() {
-            return Err(context("mask \"proxy\" needs a \"proxy\"".into()));
-        }
-        let fallback = spec.fallback.unwrap_or(MaskKind::Null);
-        if matches!(fallback, MaskKind::Proxy | MaskKind::None) {
-            return Err(context("a proxy mask's fallback must be a SQL mask".into()));
-        }
-        // The fallback uses the rest of the spec, e.g. keep_suffix for "partial".
-        return compile(
-            policy,
-            &MaskSpec {
-                kind: Some(fallback),
-                proxy: None,
-                options: None,
-                fallback: None,
-                ..spec.clone()
-            },
-        );
+    if spec.fallback.is_some() {
+        return Err(context(FALLBACK_REMOVED.into()));
     }
-    if spec.proxy.is_some() || spec.options.is_some() || spec.fallback.is_some() {
+    if kind != MaskKind::Proxy && (spec.proxy.is_some() || spec.options.is_some()) {
         return Err(context(
-            "\"proxy\", \"options\" and \"fallback\" need mask = \"proxy\"".into(),
+            "\"proxy\" and \"options\" need mask = \"proxy\"".into(),
         ));
     }
 
     let template = match kind {
         MaskKind::None => return Ok(Mask::Unmasked),
-        MaskKind::Proxy => unreachable!("handled above"),
+        MaskKind::Proxy => {
+            return Err(context(
+                "mask \"proxy\" is built from a registry, not compiled".into(),
+            ));
+        }
         MaskKind::Null => "NULL".to_owned(),
         MaskKind::Constant => literal(
             spec.value
@@ -273,11 +260,48 @@ pub fn compile(policy: &Policy, spec: &MaskSpec) -> Result<Mask, Error> {
         },
     };
 
-    Ok(Mask::Masked {
+    Ok(Mask::Sql {
         template,
         raw_search,
-        proxy: None,
     })
+}
+
+/// Check a proxy rule, and return the name of its proxy mask. Proxy masks
+/// apply to results only, so the SQL mask keys and raw search don't apply.
+pub fn check_proxy<'s>(policy: &Policy, spec: &'s MaskSpec) -> Result<&'s str, Error> {
+    let context = |msg: String| Error::Invalid(format!("policy \"{}\": {msg}", policy.name));
+    if spec.kind != Some(MaskKind::Proxy) {
+        return Err(context("not a proxy mask".into()));
+    }
+    if spec.fallback.is_some() {
+        return Err(context(FALLBACK_REMOVED.into()));
+    }
+    let name = spec
+        .proxy
+        .as_deref()
+        .ok_or_else(|| context("mask \"proxy\" needs a \"proxy\"".into()))?;
+    if spec.search == Search::Raw {
+        return Err(context(
+            "search = \"raw\" doesn't apply to mask = \"proxy\": conditions on proxy-masked columns always compare real values".into(),
+        ));
+    }
+
+    let sql_keys = [
+        ("value", spec.value.is_some()),
+        ("keep_prefix", spec.keep_prefix.is_some()),
+        ("keep_suffix", spec.keep_suffix.is_some()),
+        ("fill", spec.fill.is_some()),
+        ("digits", spec.digits.is_some()),
+        ("unit", spec.unit.is_some()),
+        ("expression", spec.expression.is_some()),
+        ("search_operators", spec.search_operators.is_some()),
+    ];
+    match sql_keys.iter().find(|(_, set)| *set) {
+        Some((key, _)) => Err(context(format!(
+            "\"{key}\" doesn't apply to mask = \"proxy\""
+        ))),
+        None => Ok(name),
+    }
 }
 
 fn require(
@@ -361,10 +385,9 @@ keep_suffix = 4
 fill = "#"
 "##,
         );
-        let Mask::Masked {
+        let Mask::Sql {
             template,
             raw_search,
-            ..
         } = compile(&p, &p.mask_spec()).unwrap()
         else {
             panic!("masked");
@@ -456,7 +479,7 @@ expression = "other_column"
     }
 
     #[test]
-    fn test_raw_search_operators() {
+    fn test_raw_search_sql_still_allowed() {
         let p = policy(
             r#"
 [[policies]]
@@ -467,9 +490,130 @@ search = "raw"
 search_operators = ["=", "like"]
 "#,
         );
-        let Mask::Masked { raw_search, .. } = compile(&p, &p.mask_spec()).unwrap() else {
+        let Mask::Sql { raw_search, .. } = compile(&p, &p.mask_spec()).unwrap() else {
             panic!("masked");
         };
         assert_eq!(raw_search, [SearchOp::Equality, SearchOp::Like].into());
+
+        // A SQL rule of a proxy policy can still search on raw values.
+        let p = policy(
+            r#"
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+
+[[policies.rules]]
+roles = ["support"]
+mask = "null"
+search = "raw"
+"#,
+        );
+        assert_eq!(check_proxy(&p, &p.mask_spec()).unwrap(), "hmac_sha256");
+        let mask = compile(&p, &p.rules[0].mask_spec()).unwrap();
+        assert!(!mask.sql().unwrap().raw_search.is_empty());
+    }
+
+    /// A proxy policy with `extra` added to its keys.
+    fn proxy_policy(extra: &str) -> Policy {
+        policy(&format!(
+            r#"
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+{extra}
+"#
+        ))
+    }
+
+    #[test]
+    fn test_check_proxy() {
+        let p = proxy_policy("options = { length = 16 }");
+        assert_eq!(check_proxy(&p, &p.mask_spec()).unwrap(), "hmac_sha256");
+        // Proxy masks aren't SQL masks.
+        let err = compile(&p, &p.mask_spec()).unwrap_err().to_string();
+        assert!(err.contains("not compiled"), "{err}");
+
+        let mut spec = p.mask_spec();
+        spec.proxy = None;
+        let err = check_proxy(&p, &spec).unwrap_err().to_string();
+        assert!(err.contains("needs a \"proxy\""), "{err}");
+        spec.kind = Some(MaskKind::Null);
+        assert!(check_proxy(&p, &spec).is_err());
+    }
+
+    #[test]
+    fn test_proxy_rejects_raw_search() {
+        let p = proxy_policy("search = \"raw\"");
+        let err = check_proxy(&p, &p.mask_spec()).unwrap_err().to_string();
+        assert!(err.contains("search = \"raw\" doesn't apply"), "{err}");
+
+        let p = proxy_policy("search_operators = [\"=\"]");
+        let err = check_proxy(&p, &p.mask_spec()).unwrap_err().to_string();
+        assert!(
+            err.contains("\"search_operators\" doesn't apply to mask = \"proxy\""),
+            "{err}"
+        );
+
+        // On a rule too.
+        let p = proxy_policy(
+            "[[policies.rules]]\nroles = [\"support\"]\nmask = \"proxy\"\nproxy = \"ff1\"\nsearch = \"raw\"",
+        );
+        let err = check_proxy(&p, &p.rules[0].mask_spec())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("search = \"raw\" doesn't apply"), "{err}");
+    }
+
+    #[test]
+    fn test_proxy_rejects_sql_keys() {
+        for (key, line) in [
+            ("keep_suffix", "keep_suffix = 4"),
+            ("value", "value = \"x\""),
+            ("expression", "expression = \"val\""),
+            ("digits", "digits = 2"),
+            ("unit", "unit = \"day\""),
+            ("fill", "fill = \"#\""),
+            ("keep_prefix", "keep_prefix = 1"),
+        ] {
+            let p = proxy_policy(line);
+            let err = check_proxy(&p, &p.mask_spec()).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("\"{key}\" doesn't apply to mask = \"proxy\"")),
+                "{line}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_proxy_keys_need_proxy() {
+        for line in ["proxy = \"x\"", "options = { length = 16 }"] {
+            let p = policy(&format!(
+                "[[policies]]\nname = \"ssn\"\ndata_type = \"text\"\nmask = \"null\"\n{line}\n"
+            ));
+            let err = compile(&p, &p.mask_spec()).unwrap_err().to_string();
+            assert!(err.contains("need mask = \"proxy\""), "{line}: {err}");
+            assert!(!err.contains("fallback"), "{line}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_fallback_rejected() {
+        // Config::check rejects it first; a spec built in code is rejected too.
+        let p = proxy_policy("");
+        let mut spec = p.mask_spec();
+        spec.fallback = Some(toml::Value::String("null".into()));
+        for err in [
+            check_proxy(&p, &spec).unwrap_err(),
+            compile(&p, &spec).unwrap_err(),
+        ] {
+            assert!(
+                err.to_string().contains("\"fallback\" was removed"),
+                "{err}"
+            );
+        }
     }
 }

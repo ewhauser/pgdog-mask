@@ -96,8 +96,6 @@ data_type = "character varying"
 mask = "proxy"
 proxy = "ff1"
 options = { key_env = "PGDOG_MASK_E2E_FF1_KEY" }
-fallback = "partial"
-keep_suffix = 4
 
 [[policies.rules]]
 roles = ["pii_admin"]

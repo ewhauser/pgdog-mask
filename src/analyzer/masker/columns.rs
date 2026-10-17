@@ -45,15 +45,15 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
         let policy = &ctx.policies.policies[assignment.policy].policy;
         let catalog_column = relation.column(column);
-        // Proxy masks first: they may carry a SQL part until the mask types
-        // are split.
+        // A masked column has either a proxy mask or a SQL mask.
         let kind = match (mask.proxy(), mask.sql()) {
             (Some(proxy), _) => TargetKind::Proxy {
                 proxy,
                 type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
             },
             (None, sql) => TargetKind::Sql {
-                // A mask without a SQL part reads NULL wherever it's rewritten.
+                // Fail closed: a mask with neither reads NULL wherever it's
+                // rewritten.
                 template: sql.map_or("NULL", |sql| sql.template),
                 raw_search: sql.map_or(&*NO_RAW_SEARCH, |sql| sql.raw_search),
                 cast: catalog_column
