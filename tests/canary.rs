@@ -277,9 +277,12 @@ async fn run(conn: &Connection, sql: &str, view: View<'_>) -> Result<String, Str
         .iter()
         .map(|notice| format!("NOTICE {}\n", render(notice, view)))
         .collect();
-    let error = |err: tokio_postgres::Error| match err.as_db_error() {
-        Some(db) => render(db, view),
-        None => format!("{err:?}"),
+    let error = |err: Failure| match err {
+        Failure::Postgres(err) => match err.as_db_error() {
+            Some(db) => render(db, view),
+            None => format!("{err:?}"),
+        },
+        Failure::Masks(why) => why,
     };
     match result {
         Ok(out) => Ok(format!("{out}{notices}")),
@@ -287,7 +290,20 @@ async fn run(conn: &Connection, sql: &str, view: View<'_>) -> Result<String, Str
     }
 }
 
-async fn copy_out(client: &Client, sql: &str) -> Result<String, tokio_postgres::Error> {
+/// Why a statement fails: Postgres' error, or PgDog refusing its result
+/// masks.
+enum Failure {
+    Postgres(tokio_postgres::Error),
+    Masks(String),
+}
+
+impl From<tokio_postgres::Error> for Failure {
+    fn from(err: tokio_postgres::Error) -> Self {
+        Self::Postgres(err)
+    }
+}
+
+async fn copy_out(client: &Client, sql: &str) -> Result<String, Failure> {
     let stream = client.copy_out(sql).await?;
     pin_mut!(stream);
     let mut out = String::new();
@@ -298,16 +314,28 @@ async fn copy_out(client: &Client, sql: &str) -> Result<String, tokio_postgres::
 }
 
 /// Rows as `view` gets them. Like PgDog, results are numbered by
-/// statement: each statement ends with a CommandComplete.
-async fn query(
-    client: &Client,
-    sql: &str,
-    view: View<'_>,
-) -> Result<String, tokio_postgres::Error> {
+/// statement: each statement ends with a CommandComplete. Like PgDog, a
+/// result mask on a column the result doesn't have fails the statement.
+async fn query(client: &Client, sql: &str, view: View<'_>) -> Result<String, Failure> {
     let mut out = String::new();
     let mut result = 0;
+    let mut described = vec![];
     for message in client.simple_query(sql).await? {
         match message {
+            SimpleQueryMessage::RowDescription(columns) => {
+                if let View::Masked { results, .. } = view
+                    && let Some(mask) = results.columns.iter().find(|mask| {
+                        mask.result == result && usize::from(mask.column) >= columns.len()
+                    })
+                {
+                    return Err(Failure::Masks(format!(
+                        "masked column {} of result {result} doesn't exist: it has {}",
+                        mask.column,
+                        columns.len()
+                    )));
+                }
+                described.push(result);
+            }
             SimpleQueryMessage::Row(row) => {
                 for i in 0..row.len() {
                     out.push_str(&masked_value(view, result, i, row.get(i)));
@@ -319,7 +347,62 @@ async fn query(
             _ => (),
         }
     }
+    if let View::Masked { results, .. } = view
+        && let Some(mask) = results
+            .columns
+            .iter()
+            .find(|mask| !described.contains(&mask.result))
+    {
+        return Err(Failure::Masks(format!(
+            "result {} has masks but returns no rows",
+            mask.result
+        )));
+    }
     Ok(out)
+}
+
+/// Proxy masks on a column of another type, which PgDog refuses. Each
+/// statement with proxy masks is prepared on `types`, a connection of its
+/// own, to read its columns' types; a statement that can't be prepared on
+/// its own (it uses a cursor or table an earlier one creates) is skipped.
+async fn mistyped_masks(types: &Client, sql: &str, results: &Results) -> Vec<String> {
+    let Ok(parsed) = pg_raw_parse::parse(sql) else {
+        return vec![];
+    };
+    let mut problems = vec![];
+    for (index, stmt) in parsed.iter().enumerate() {
+        let masks: Vec<_> = results
+            .columns
+            .iter()
+            .filter_map(|mask| match mask.mask {
+                ResultMask::Proxy { type_oid, .. } if usize::from(mask.result) == index => {
+                    Some((usize::from(mask.column), type_oid))
+                }
+                _ => None,
+            })
+            .collect();
+        if masks.is_empty() {
+            continue;
+        }
+        let start = usize::try_from(stmt.stmt_location).unwrap_or(0);
+        let end = match usize::try_from(stmt.stmt_len) {
+            Ok(0) | Err(_) => sql.len(),
+            Ok(len) => start + len,
+        };
+        let Ok(prepared) = types.prepare(&sql[start..end]).await else {
+            continue;
+        };
+        for (column, type_oid) in masks {
+            match prepared.columns().get(column) {
+                Some(found) if found.type_().oid() == type_oid => (),
+                found => problems.push(format!(
+                    "result {index} column {column}: proxy mask for type {type_oid}, column {:?}",
+                    found.map(|found| found.type_().oid())
+                )),
+            }
+        }
+    }
+    problems
 }
 
 /// A value of column `column` of result `result`, as `view` gets it.
@@ -673,6 +756,15 @@ async fn check_corpus(
     corpus: &[(&str, &str, Expect)],
 ) -> Vec<String> {
     let mut failures = vec![];
+    let types = connect().await;
+    types
+        .client
+        .batch_execute(&format!(
+            "SET search_path TO {}",
+            ctx.search_path.join(", ")
+        ))
+        .await
+        .expect("set search_path");
     for ((id, sql, expect), path) in corpus
         .iter()
         .flat_map(|entry| [(entry, "full"), (entry, "shape")])
@@ -704,6 +796,11 @@ async fn check_corpus(
             continue;
         }
 
+        for problem in mistyped_masks(&types.client, &to_run, results).await {
+            failures.push(format!(
+                "[{path}] {id} {sql}\n  PgDog refuses the masks: {problem}\n  ran: {to_run}"
+            ));
+        }
         let view = View::Masked {
             results,
             proxies: &ctx.policies.proxies,
