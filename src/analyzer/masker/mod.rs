@@ -5,6 +5,7 @@ mod views;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::LazyLock;
 
 use pg_raw_parse::{
     Node, NodeMut,
@@ -19,7 +20,7 @@ use super::rules;
 use super::scope::{Cte, Frame, Item, ItemKind, find_cte, find_item, resolve_column};
 use crate::catalog::Relation;
 use crate::config::OnUnresolved;
-use crate::mask::{Mask, SearchOp, VALUE, castable};
+use crate::mask::{SearchOp, VALUE, castable};
 use functions::CallUse;
 
 /// Quote an identifier.
@@ -42,6 +43,9 @@ struct MaskTarget<'c> {
     /// Type OID of the column; 0 if unknown.
     type_oid: u32,
 }
+
+/// Raw search operators of masks without any.
+static NO_SEARCH: LazyLock<HashSet<SearchOp>> = LazyLock::new(HashSet::new);
 
 /// Functions that only normalize a value, allowed around a column in raw searches.
 const NORMALIZERS: &[&str] = &["lower", "upper", "btrim", "ltrim", "rtrim"];
@@ -402,14 +406,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let assignment = ctx
             .assignments
             .column(&relation.schema, &relation.name, column)?;
-        let Mask::Masked {
-            template,
-            raw_search,
-            proxy,
-        } = &ctx.profile.masks[assignment.policy]
-        else {
+        let mask = &ctx.profile.masks[assignment.policy];
+        if !mask.is_masked() {
             return None;
-        };
+        }
+        // Proxy masks have no SQL mask: other references read NULL.
+        let (template, raw_search) = mask
+            .sql()
+            .map_or(("NULL", &*NO_SEARCH), |sql| (sql.template, sql.raw_search));
         let policy = &ctx.policies.policies[assignment.policy].policy;
         let catalog_column = relation.column(column);
         let data_type = catalog_column
@@ -425,7 +429,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             qualifier: refname.to_owned(),
             arguments: &assignment.arguments,
             label: format!("{}.{}.{}", relation.schema, relation.name, column),
-            proxy: *proxy,
+            proxy: mask.proxy(),
             type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
         })
     }

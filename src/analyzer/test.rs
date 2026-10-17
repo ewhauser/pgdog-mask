@@ -1047,7 +1047,7 @@ fn test_ddl() {
     }
 }
 
-/// The ssn policy with a proxy mask, and a partial SQL fallback.
+/// The ssn policy with a proxy mask.
 const PROXY_CONFIG: &str = r#"
 [[users]]
 name = "admin"
@@ -1058,8 +1058,6 @@ name = "ssn"
 data_type = "character varying"
 mask = "proxy"
 proxy = "test.reverse"
-fallback = "partial"
-keep_suffix = 4
 
 [[policies.rules]]
 roles = ["pii_admin"]
@@ -1137,14 +1135,14 @@ fn test_proxy_outputs() {
         }]
     );
 
-    // Other references still get the fallback.
+    // Other references read NULL.
     let (columns, sql) = proxied("SELECT ssn FROM users WHERE ssn = '123'");
     assert_eq!(columns, [0]);
     assert!(
         sql.starts_with("SELECT ssn AS ssn FROM users WHERE"),
         "{sql}"
     );
-    assert!(sql.contains("repeat"), "{sql}");
+    assert!(sql.contains("NULL::"), "{sql}");
 
     // Stars over masked relations are expanded first.
     let (columns, _) = proxied("SELECT * FROM users");
@@ -1179,7 +1177,7 @@ fn test_proxy_fallbacks() {
         let (columns, rewritten) = proxied(sql);
         assert!(columns.is_empty(), "{sql}: {columns:?}");
         if sql.contains("ssn") && !sql.starts_with("INSERT") {
-            assert!(rewritten.contains("repeat"), "{sql} → {rewritten}");
+            assert!(rewritten.contains("NULL::"), "{sql} → {rewritten}");
         }
     }
 

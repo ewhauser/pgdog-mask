@@ -165,6 +165,9 @@ pub enum Search {
     Raw,
 }
 
+/// Why `fallback` is a config error.
+pub(crate) const FALLBACK_REMOVED: &str = "\"fallback\" was removed: proxy masks no longer rewrite other references to the column. Conditions, joins, grouping and ordering use real values, and outputs computed from it return NULL. Remove \"fallback\" and the keys it used (e.g. keep_suffix).";
+
 /// Mask settings, shared by policy defaults and rules.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MaskSpec {
@@ -182,8 +185,8 @@ pub struct MaskSpec {
     pub proxy: Option<String>,
     /// Options passed to the proxy mask.
     pub options: Option<toml::Table>,
-    /// SQL mask for references a proxy mask can't cover. Defaults to `null`.
-    pub fallback: Option<MaskKind>,
+    /// Removed; read only to report an error.
+    pub fallback: Option<toml::Value>,
 }
 
 /// Declares the flat mask keys on a config struct, so policies and rules
@@ -206,7 +209,8 @@ macro_rules! mask_fields {
             pub search_operators: Option<Vec<String>>,
             pub proxy: Option<String>,
             pub options: Option<toml::Table>,
-            pub fallback: Option<MaskKind>,
+            /// Removed; read only to report an error.
+            pub fallback: Option<toml::Value>,
         }
 
         impl $name {
@@ -224,7 +228,7 @@ macro_rules! mask_fields {
                     search_operators: self.search_operators.clone(),
                     proxy: self.proxy.clone(),
                     options: self.options.clone(),
-                    fallback: self.fallback,
+                    fallback: self.fallback.clone(),
                 }
             }
         }
@@ -333,6 +337,12 @@ impl Config {
             if !names.insert(policy.name.as_str()) {
                 return Err(Error::Invalid(format!(
                     "policy \"{}\" is defined more than once",
+                    policy.name
+                )));
+            }
+            if policy.fallback.is_some() || policy.rules.iter().any(|r| r.fallback.is_some()) {
+                return Err(Error::Invalid(format!(
+                    "policy \"{}\": {FALLBACK_REMOVED}",
                     policy.name
                 )));
             }
@@ -610,5 +620,51 @@ policy = \"b\"
 "
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn test_fallback_removed() {
+        let proxy = r#"
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+"#;
+        for config in [
+            format!("{proxy}fallback = \"partial\"\n"),
+            format!(
+                "{proxy}\n[[policies.rules]]\nroles = [\"support\"]\nmask = \"proxy\"\nproxy = \"ff1\"\nfallback = \"partial\"\nkeep_suffix = 4\n"
+            ),
+            "[[policies]]\nname = \"ssn\"\ndata_type = \"text\"\nmask = \"partial\"\nfallback = \"null\"\n"
+                .into(),
+            // Any value: the key itself is the error.
+            format!("{proxy}fallback = 1\n"),
+        ] {
+            let err = Config::from_toml(&config).unwrap_err().to_string();
+            assert!(err.starts_with("policy \"ssn\": "), "{err}");
+            assert!(err.contains("\"fallback\" was removed"), "{err}");
+            assert!(err.contains("return NULL"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_integration_config_loads() {
+        let config = Config::from_toml(include_str!("../integration/masking.toml")).unwrap();
+        // Proxy rules pass the proxy checks; SQL rules compile.
+        for policy in &config.policies {
+            let specs = std::iter::once(policy.mask_spec())
+                .chain(policy.rules.iter().map(|rule| rule.mask_spec()));
+            for spec in specs {
+                match spec.kind {
+                    Some(MaskKind::Proxy) => {
+                        crate::mask::check_proxy(policy, &spec).unwrap();
+                    }
+                    _ => {
+                        crate::mask::compile(policy, &spec).unwrap();
+                    }
+                }
+            }
+        }
     }
 }
