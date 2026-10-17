@@ -1,0 +1,1 @@
+SELECT ssn INTO TEMP copy FROM users

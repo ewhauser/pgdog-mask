@@ -1,0 +1,1 @@
+SELECT DISTINCT ON (ssn) ssn, email FROM users

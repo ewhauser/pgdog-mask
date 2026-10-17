@@ -1,0 +1,1 @@
+UPDATE masking_e2e.users SET name = $1 WHERE id = $2

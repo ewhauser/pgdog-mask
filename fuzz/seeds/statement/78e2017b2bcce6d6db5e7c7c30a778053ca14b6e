@@ -1,0 +1,1 @@
+SELECT leak_plpgsql()

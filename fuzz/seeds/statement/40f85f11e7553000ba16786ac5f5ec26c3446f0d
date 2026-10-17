@@ -1,0 +1,1 @@
+SELECT row_to_json(u) FROM users u

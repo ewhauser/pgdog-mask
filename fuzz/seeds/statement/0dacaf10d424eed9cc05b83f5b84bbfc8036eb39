@@ -1,0 +1,1 @@
+BEGIN; DELETE FROM users WHERE id = 1 RETURNING ssn, email; ROLLBACK

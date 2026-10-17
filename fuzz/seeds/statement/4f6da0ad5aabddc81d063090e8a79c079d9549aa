@@ -1,0 +1,1 @@
+UPDATE users SET name = 'x', salary = salary + 1 WHERE ssn = 'abc' RETURNING ssn

@@ -1,0 +1,1 @@
+SELECT id FROM masking_e2e.users WHERE ssn = 'CANARYSSN-1111'

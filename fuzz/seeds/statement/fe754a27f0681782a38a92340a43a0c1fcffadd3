@@ -1,0 +1,1 @@
+SELECT set_config('masking.leak', ssn, false) FROM users

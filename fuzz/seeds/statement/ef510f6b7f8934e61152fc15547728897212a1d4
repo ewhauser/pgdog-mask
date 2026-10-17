@@ -1,0 +1,1 @@
+ SELECT users.id, users.email AS mail, users.opted_in AS opted, users.ssn, users.ssn || users.name AS both FROM public.users;

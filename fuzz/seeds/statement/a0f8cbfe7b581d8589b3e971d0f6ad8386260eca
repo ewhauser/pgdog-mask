@@ -1,0 +1,1 @@
+SELECT * FROM user_ssn(1) AS s(x)

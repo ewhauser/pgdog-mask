@@ -1,0 +1,1 @@
+SELECT v.s FROM user_ssns AS v(i, s) WHERE v.i = 1

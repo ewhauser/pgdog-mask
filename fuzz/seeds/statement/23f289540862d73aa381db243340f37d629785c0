@@ -1,0 +1,1 @@
+SELECT x.ssn FROM (SELECT ssn, 1 AS one FROM users WHERE id = 2) x WHERE x.one = 1

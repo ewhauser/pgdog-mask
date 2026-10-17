@@ -1,0 +1,1 @@
+SELECT j.ssn FROM (users u JOIN orders o ON true) AS j

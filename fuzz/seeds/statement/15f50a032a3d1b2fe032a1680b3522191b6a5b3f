@@ -1,0 +1,1 @@
+SELECT (SELECT ssn FROM orders o WHERE o.user_id = u.id LIMIT 1) FROM users u

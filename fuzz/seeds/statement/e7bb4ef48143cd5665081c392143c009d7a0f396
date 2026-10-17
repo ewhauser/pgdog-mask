@@ -1,0 +1,1 @@
+SELECT get_ssn(id), get_ssn_atomic(id), get_ssn_positional(id) FROM users

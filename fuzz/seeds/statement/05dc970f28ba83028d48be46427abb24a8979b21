@@ -1,0 +1,1 @@
+SELECT tax_id, card, balance FROM masking_e2e.users ORDER BY id

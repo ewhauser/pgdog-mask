@@ -1,0 +1,1 @@
+MERGE INTO users u USING orders o ON u.id = o.user_id WHEN MATCHED THEN DELETE

@@ -1,0 +1,10 @@
+[general]
+
+[[plugins]]
+name = "pgdog_mask"
+config = "integration/masking.toml"
+required = true
+
+[[databases]]
+name = "pgdog"
+host = "127.0.0.1"

@@ -1,0 +1,1 @@
+SELECT format('%s %s', ssn, email) FROM users

@@ -1,0 +1,1 @@
+SELECT ssn FROM users UNION SELECT name FROM orders o, users ORDER BY 1

@@ -1,0 +1,1 @@
+SELECT first_value(ssn) OVER (ORDER BY ssn), lag(email) OVER () FROM users

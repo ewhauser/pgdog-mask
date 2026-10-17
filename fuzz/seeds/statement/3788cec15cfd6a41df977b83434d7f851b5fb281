@@ -1,0 +1,1 @@
+ SELECT users.id, users.ssn, upper((users.ssn)::text) AS loud FROM public.users;

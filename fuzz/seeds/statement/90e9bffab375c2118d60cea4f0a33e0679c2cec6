@@ -1,0 +1,1 @@
+WITH x AS (SELECT * FROM user_ssns) SELECT * FROM x

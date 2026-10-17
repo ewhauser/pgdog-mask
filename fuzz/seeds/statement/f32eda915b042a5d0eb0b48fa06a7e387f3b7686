@@ -1,0 +1,5 @@
+BEGIN ATOMIC
+ SELECT users.ssn
+    FROM public.users
+   WHERE (users.id = atomic_ssn.uid);
+END

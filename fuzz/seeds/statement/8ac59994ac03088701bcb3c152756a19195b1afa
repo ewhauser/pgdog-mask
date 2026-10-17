@@ -1,0 +1,1 @@
+SELECT CASE WHEN salary > 1000 THEN 'high' ELSE ssn END FROM users

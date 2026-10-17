@@ -1,0 +1,1 @@
+SELECT ssn FROM user_ssns WHERE id = 1

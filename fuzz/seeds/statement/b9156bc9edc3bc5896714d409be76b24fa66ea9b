@@ -1,0 +1,1 @@
+INSERT INTO users (id, ssn, name) VALUES (1, '123', 'n')

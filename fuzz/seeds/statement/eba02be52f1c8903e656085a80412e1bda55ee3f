@@ -1,0 +1,1 @@
+SELECT phone, secret_note FROM masking_e2e.users WHERE id = 1

@@ -1,0 +1,1 @@
+SELECT nickname, codename FROM masking_e2e.users WHERE id = 1

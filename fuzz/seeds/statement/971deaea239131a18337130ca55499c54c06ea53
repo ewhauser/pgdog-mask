@@ -1,0 +1,1 @@
+SELECT id, ssn FROM ssn_barrier WHERE id = 5

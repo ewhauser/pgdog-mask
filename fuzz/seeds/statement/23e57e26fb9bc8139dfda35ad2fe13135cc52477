@@ -1,0 +1,1 @@
+BEGIN; UPDATE user_ssns SET email = email; ROLLBACK

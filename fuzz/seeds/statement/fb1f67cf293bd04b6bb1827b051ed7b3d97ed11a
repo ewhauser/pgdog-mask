@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE ssn = '123-45-6789' AND id = 42

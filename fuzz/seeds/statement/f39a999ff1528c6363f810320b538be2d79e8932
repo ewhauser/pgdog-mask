@@ -1,0 +1,1 @@
+SELECT * FROM ssns() AS s(id bigint, ssn text) WHERE id = 1

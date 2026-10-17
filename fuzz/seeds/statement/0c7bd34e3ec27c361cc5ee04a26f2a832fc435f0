@@ -1,0 +1,1 @@
+SELECT s.ssn FROM ssns() s WHERE s.id = 1

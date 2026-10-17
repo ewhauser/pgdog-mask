@@ -1,0 +1,1 @@
+INSERT INTO orders (user_id, total) SELECT id, salary * 2 FROM users WHERE ssn = 'x'

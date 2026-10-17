@@ -1,0 +1,145 @@
+
+[general]
+udf_allowlist = ["public.safe_fn"]
+tag_source = "comment"
+# Small, so eviction runs and fuzzing long statements doesn't fill memory.
+cache_size = 1000
+
+[[users]]
+name = "admin"
+roles = ["pii_admin"]
+
+[[users]]
+name = "support"
+roles = ["support"]
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "sql"
+expression = "'XXX-XX-' || right(val, 4)"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies.rules]]
+roles = ["support"]
+mask = "null"
+search = "raw"
+
+[[policies]]
+name = "email"
+data_type = "text"
+arguments = ["opted_in"]
+mask = "sql"
+expression = "CASE WHEN opted_in THEN val ELSE NULL END"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "salary"
+data_type = "numeric"
+mask = "round"
+digits = -4
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "phone"
+data_type = "text"
+mask = "partial"
+keep_suffix = 2
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "token"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+options = { key_file = "{dir}/hmac.key", length = 16 }
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "card"
+data_type = "character varying"
+mask = "proxy"
+proxy = "ff1"
+options = { key_file = "{dir}/ff1.key" }
+fallback = "null"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "balance"
+data_type = "integer"
+mask = "proxy"
+proxy = "fuzz.offset"
+options = { offset = 1000 }
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[policies]]
+name = "note"
+data_type = "text"
+mask = "proxy"
+proxy = "fuzz.blocking"
+fallback = "constant"
+value = "hidden"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[tags]]
+name = "pii.phone"
+policy = "phone"
+
+[[masked_columns]]
+name = "users"
+column = "ssn"
+policy = "ssn"
+
+[[masked_columns]]
+name = "users"
+column = "email"
+policy = "email"
+arguments = ["opted_in"]
+
+[[masked_columns]]
+column = "salary"
+policy = "salary"
+
+[[masked_columns]]
+name = "accounts"
+column = "token"
+policy = "token"
+
+[[masked_columns]]
+name = "accounts"
+column = "card"
+policy = "card"
+
+[[masked_columns]]
+name = "accounts"
+column = "balance"
+policy = "balance"
+
+[[masked_columns]]
+name = "accounts"
+column = "note"
+policy = "note"

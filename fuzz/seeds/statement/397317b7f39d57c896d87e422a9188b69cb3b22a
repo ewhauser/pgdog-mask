@@ -1,0 +1,1 @@
+SELECT pg_notify('masking_canary', ssn) FROM users

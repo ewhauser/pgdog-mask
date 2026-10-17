@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE ssn = 'x''y' AND id > 7 LIMIT 1
