@@ -1,9 +1,16 @@
 //! Statement-level rules: DDL, shadowing, maintenance, COPY and EXECUTE.
-use pg_raw_parse::{Node, nodes, transform};
+use pg_raw_parse::{
+    Node, nodes,
+    raw::{AlterTableType, DropBehavior, ObjectType},
+    transform,
+};
 
 use super::{Masker, RESOLUTION_CHANGED, ident, names, range_vars, rules};
 use crate::analyzer::taint::Outputs;
 use crate::config::OnUnresolved;
+
+/// Why DDL that changes which relation or column a name means is blocked.
+const STALE_CATALOG: &str = "names would resolve differently in Postgres than in the plugin's catalog until PgDog reloads it";
 
 /// Why EXECUTE of a statement prepared elsewhere is blocked.
 const EXECUTE_UNKNOWN: &str = "EXECUTE of a statement prepared outside this query can't be checked for masked users; send the PREPARE in the same query";
@@ -49,103 +56,157 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
     /// DDL masked users may run can't touch relations with masked columns:
     /// expressions in ALTER TABLE or CREATE INDEX can leak values through errors,
-    /// renames would unmask them, and attaching or inheriting would expose their
-    /// rows through another table.
+    /// and attaching or inheriting would expose their rows through another
+    /// table. Nor can it change which relation or column a name means: the
+    /// catalog the plugin resolves names with is only reloaded after the
+    /// statement, and not before the transaction ends. A column reference
+    /// that no longer resolves in an inner query level resolves in an outer
+    /// one, where it may read masked values.
     pub(super) fn check_ddl(&mut self, node: Node<'_>) {
-        if !matches!(
-            node,
-            Node::AlterTableStmt(_) | Node::IndexStmt(_) | Node::RenameStmt(_)
-        ) {
-            return;
-        }
-
-        // The target relation, and relations attached or inherited by ALTER TABLE.
-        // (Postgres' expression walker doesn't handle DDL, so this reads the
-        // statements directly.)
-        let mut range_vars: Vec<&nodes::RangeVar> = vec![];
-        match node {
+        let range_vars: Vec<&nodes::RangeVar> = match node {
+            Node::RenameStmt(_) => {
+                self.block(format!(
+                    "masked users can't rename relations, columns or schemas: {STALE_CATALOG}"
+                ));
+                return;
+            }
+            Node::DropStmt(drop) => {
+                self.check_drop(drop);
+                return;
+            }
+            // The target relation, and relations attached or inherited by ALTER TABLE.
+            // (Postgres' expression walker doesn't handle DDL, so this reads the
+            // statements directly.)
             Node::AlterTableStmt(alter) => {
-                range_vars.extend(alter.relation());
+                let mut range_vars: Vec<_> = alter.relation().into_iter().collect();
                 for cmd in alter.cmds().iter() {
-                    if let Node::AlterTableCmd(cmd) = cmd {
-                        match cmd.def() {
-                            Node::PartitionCmd(partition) => range_vars.extend(partition.name()),
-                            Node::RangeVar(parent) => range_vars.push(parent),
-                            _ => (),
-                        }
+                    let Node::AlterTableCmd(cmd) = cmd else {
+                        continue;
+                    };
+                    if cmd.subtype == AlterTableType::AT_DropColumn {
+                        self.block(format!("masked users can't drop columns: {STALE_CATALOG}"));
+                        return;
+                    }
+                    match cmd.def() {
+                        Node::PartitionCmd(partition) => range_vars.extend(partition.name()),
+                        Node::RangeVar(parent) => range_vars.push(parent),
+                        _ => (),
                     }
                 }
+                range_vars
             }
-            Node::IndexStmt(index) => range_vars.extend(index.relation()),
-            Node::RenameStmt(rename) => range_vars.extend(rename.relation()),
-            _ => (),
-        }
-        let relations: Vec<_> = range_vars
-            .into_iter()
-            .filter_map(|range_var| {
-                range_var
-                    .relname()
-                    .map(|name| (range_var.schemaname().map(str::to_owned), name.to_owned()))
-            })
-            .collect();
-
-        // Renames of schemas and other objects without a relation could move
-        // masked tables out from under the configuration.
-        if relations.is_empty() {
-            self.block("this statement is not allowed for masked users");
-            return;
-        }
+            Node::IndexStmt(index) => index.relation().into_iter().collect(),
+            _ => return,
+        };
         if self.path_changed {
             self.block(RESOLUTION_CHANGED);
             return;
         }
 
-        for (schema, name) in relations {
-            if let Some(relation) =
-                self.ctx
-                    .catalog
-                    .resolve(schema.as_deref(), &name, &self.ctx.search_path)
+        for range_var in range_vars {
+            if let Some(name) = range_var.relname()
+                && let Some(relation) =
+                    self.ctx
+                        .catalog
+                        .resolve(range_var.schemaname(), name, &self.ctx.search_path)
                 && self.is_masked_relation(relation)
             {
                 self.block(format!(
-                    "masked users can't alter {}.{}, which has masked columns",
-                    relation.schema, relation.name
+                    "masked users can't alter {}, which has masked columns",
+                    relation.qualified_name()
                 ));
                 return;
             }
         }
     }
 
-    /// Masked users can't create tables that shadow masked relations.
-    pub(super) fn check_shadowing(&mut self, node: Node<'_>) {
+    /// DROP can't change which relation a name means: dropping a relation
+    /// whose name others share, or dropping with CASCADE, which can drop
+    /// columns and relations that depend on the object.
+    fn check_drop(&mut self, drop: &nodes::DropStmt) {
+        if drop.behavior == DropBehavior::DROP_CASCADE {
+            self.block(format!(
+                "masked users can't DROP ... CASCADE, which can drop columns and relations: {STALE_CATALOG}"
+            ));
+            return;
+        }
+        match drop.remove_type {
+            ObjectType::OBJECT_EXTENSION => {
+                self.block(format!(
+                    "masked users can't drop extensions, whose relations go with them: {STALE_CATALOG}"
+                ));
+                return;
+            }
+            ObjectType::OBJECT_TABLE
+            | ObjectType::OBJECT_VIEW
+            | ObjectType::OBJECT_MATVIEW
+            | ObjectType::OBJECT_FOREIGN_TABLE
+            | ObjectType::OBJECT_SEQUENCE => (),
+            _ => return,
+        }
+        for object in drop.objects().iter() {
+            let Node::NodeList(names) = object else {
+                continue;
+            };
+            if let Some(name) = names.iter().next_back().and_then(|name| name.as_str())
+                && self.ctx.catalog.relations_named(name).len() > 1
+            {
+                self.block(format!(
+                    "masked users can't drop \"{name}\", whose name other relations share: {STALE_CATALOG}"
+                ));
+                return;
+            }
+        }
+    }
+
+    /// Relations masked users create can't be temporary, nor take the name
+    /// of a relation in the catalog. Postgres resolves names to temporary
+    /// relations first, and the plugin can't see them; a relation in an
+    /// earlier schema of the search_path hides one of the same name until
+    /// PgDog reloads its catalog. Either way, a column reference that would
+    /// resolve to the hidden relation resolves in an outer query level
+    /// instead, where it may read masked values.
+    pub(super) fn check_created(&mut self, node: Node<'_>) {
         let node = match node {
             Node::ExplainStmt(explain) => explain.query(),
             node => node,
         };
         let created = match node {
-            Node::CreateStmt(create) => create.relation().and_then(|r| r.relname()),
-            Node::CreateTableAsStmt(ctas) => ctas
-                .into()
-                .and_then(|into| into.rel())
-                .and_then(|r| r.relname()),
-            Node::SelectStmt(select) => rules::into_clause(select)
-                .and_then(|into| into.rel())
-                .and_then(|r| r.relname()),
+            Node::CreateStmt(create) => create.relation(),
+            Node::CreateTableAsStmt(ctas) => ctas.into().and_then(|into| into.rel()),
+            Node::SelectStmt(select) => rules::into_clause(select).and_then(|into| into.rel()),
+            Node::CreateSeqStmt(seq) => seq.sequence(),
             _ => None,
         };
-        if created.is_some() && self.path_changed {
+        let Some(range_var) = created else {
+            return;
+        };
+        if self.path_changed {
             self.block(RESOLUTION_CHANGED);
             return;
         }
-        if let Some(name) = created
-            && self
+        if rules::temporary(range_var) {
+            self.block(
+                "masked users can't create temporary relations: names resolve to them first, and the plugin can't see them",
+            );
+            return;
+        }
+        let Some(name) = range_var.relname() else {
+            return;
+        };
+        let shadowed = self.ctx.catalog.relations_named(name).first();
+        if shadowed.is_some()
+            || self
                 .ctx
                 .assignments
                 .relation_names()
                 .any(|masked| masked == name)
         {
+            let what = shadowed.map_or("a relation with masked columns".to_owned(), |relation| {
+                relation.qualified_name()
+            });
             self.block(format!(
-                "creating \"{name}\" would shadow a relation with masked columns"
+                "creating \"{name}\" would shadow {what}: {STALE_CATALOG}; choose another name"
             ));
         }
     }

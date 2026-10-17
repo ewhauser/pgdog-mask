@@ -149,7 +149,8 @@ pub struct Operator {
 pub struct Catalog {
     /// Server default `search_path`.
     pub search_path: Vec<String>,
-    relations: HashMap<(String, String), Relation>,
+    /// Relations by name, in every schema.
+    relations: HashMap<String, Vec<Relation>>,
     /// User-defined functions by name.
     functions: HashMap<String, Vec<Function>>,
     /// User-defined operators by name.
@@ -254,12 +255,17 @@ impl Catalog {
 
     /// Build a catalog from relations.
     pub fn new(search_path: Vec<String>, relations: Vec<Relation>) -> Self {
+        let mut by_name: HashMap<String, Vec<Relation>> = HashMap::new();
+        for relation in relations {
+            let named = by_name.entry(relation.name.clone()).or_default();
+            match named.iter_mut().find(|r| r.schema == relation.schema) {
+                Some(existing) => *existing = relation,
+                None => named.push(relation),
+            }
+        }
         Self {
             search_path,
-            relations: relations
-                .into_iter()
-                .map(|relation| ((relation.schema.clone(), relation.name.clone()), relation))
-                .collect(),
+            relations: by_name,
             ..Default::default()
         }
     }
@@ -287,11 +293,18 @@ impl Catalog {
     }
 
     pub fn get(&self, schema: &str, name: &str) -> Option<&Relation> {
-        self.relations.get(&(schema.to_owned(), name.to_owned()))
+        self.relations_named(name)
+            .iter()
+            .find(|relation| relation.schema == schema)
     }
 
     pub fn relations(&self) -> impl Iterator<Item = &Relation> {
-        self.relations.values()
+        self.relations.values().flatten()
+    }
+
+    /// Relations with this name, in every schema.
+    pub fn relations_named(&self, name: &str) -> &[Relation] {
+        self.relations.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Find a relation the way Postgres would, using the `search_path` for

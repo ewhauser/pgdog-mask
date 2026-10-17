@@ -794,7 +794,7 @@ fn test_wrapped_statements() {
         "DECLARE c CURSOR FOR SELECT ssn FROM users",
         "PREPARE p AS SELECT ssn FROM users WHERE id = $1",
         "CREATE TABLE copy AS SELECT ssn FROM users",
-        "SELECT ssn INTO TEMP copy FROM users",
+        "SELECT ssn INTO copy FROM users",
     ] {
         assert!(rewritten("anonymous", sql).contains("'XXX-XX-'"), "{sql}");
     }
@@ -1264,7 +1264,9 @@ fn test_ddl() {
         "ALTER SEQUENCE s RESTART",
         "ALTER TABLE orders ADD COLUMN note text",
         "CREATE INDEX ON orders (user_id)",
-        "ALTER TABLE orders RENAME COLUMN total TO amount",
+        "CREATE TABLE scratch (id int)",
+        "DROP INDEX orders_idx",
+        "DROP FUNCTION f()",
     ] {
         match analyze_as("anonymous", sql) {
             Outcome::Unchanged { .. } => (),
@@ -1282,6 +1284,19 @@ fn test_ddl() {
         "ALTER SCHEMA public RENAME TO other",
         "ALTER TABLE users SET SCHEMA other",
         "COMMENT ON COLUMN users.ssn IS 'nothing to see'",
+        // Change what a name resolves to before PgDog reloads its catalog.
+        "ALTER TABLE orders RENAME COLUMN total TO amount",
+        "ALTER TABLE orders RENAME TO purchases",
+        "ALTER TABLE orders DROP COLUMN total",
+        "ALTER TABLE orders ADD COLUMN note text, DROP COLUMN total",
+        "DROP TABLE orders CASCADE",
+        "DROP TYPE mood CASCADE",
+        "DROP EXTENSION pgcrypto",
+        "CREATE TABLE archive (id bigint)",
+        "CREATE TABLE other.orders (id bigint)",
+        "CREATE SEQUENCE archive",
+        "SELECT 1 AS id INTO archive",
+        "CREATE TABLE user_ssns AS SELECT 1",
         // Expose rows through an unmasked table.
         "ALTER TABLE orders ATTACH PARTITION users FOR VALUES IN (1)",
         "ALTER TABLE orders INHERIT users",
@@ -1290,6 +1305,76 @@ fn test_ddl() {
         "GRANT SELECT ON users TO public",
     ] {
         blocked("anonymous", sql);
+    }
+}
+
+/// The test catalog with a second `archive`, in schema `other`.
+fn catalog_with_other_archive() -> Catalog {
+    let mut relations: Vec<Relation> = catalog().relations().cloned().collect();
+    relations.push(Relation::new(
+        "other",
+        "archive",
+        RelationKind::Table,
+        vec![column("id", "bigint")],
+    ));
+    let mut other = Catalog::new(vec!["$user".into(), "public".into()], relations);
+    other.full = true;
+    other.set_system_functions(include_str!("test_builtin_functions.txt").lines());
+    other.add_functions(functions());
+    other
+}
+
+/// Postgres resolves names to temporary relations first, and the plugin
+/// can't see them: `CREATE TEMP TABLE archive (id bigint)` would make `ssn`
+/// in `SELECT (SELECT ssn FROM archive) FROM users` read `users.ssn`, while
+/// the catalog says `archive.ssn`.
+#[test]
+fn test_temporary_relations_blocked() {
+    for sql in [
+        "CREATE TEMP TABLE scratch (id bigint)",
+        "CREATE TEMPORARY TABLE scratch (id bigint) ON COMMIT DROP",
+        "CREATE TABLE pg_temp.scratch (id bigint)",
+        "CREATE TABLE pg_temp_3.scratch (id bigint)",
+        "CREATE TEMP TABLE scratch AS SELECT 1 AS id",
+        "SELECT 1 AS id INTO TEMP scratch",
+        "SELECT 1 AS id INTO TEMP scratch UNION SELECT 2",
+        "CREATE TEMP TABLE scratch (LIKE orders)",
+        "CREATE TEMP SEQUENCE scratch",
+        "CREATE SEQUENCE pg_temp.scratch",
+        "EXPLAIN ANALYZE CREATE TEMP TABLE scratch AS SELECT 1",
+    ] {
+        for user in ["anonymous", "support"] {
+            let reason = blocked(user, sql);
+            assert!(reason.contains("temporary"), "{sql}: {reason}");
+        }
+    }
+}
+
+/// Dropping a relation whose name another schema shares makes the name
+/// resolve to that one in Postgres, while the catalog still has the first.
+#[test]
+fn test_drop_shared_name_blocked() {
+    let catalog = catalog_with_other_archive();
+    for sql in [
+        "DROP TABLE archive",
+        "DROP TABLE public.archive",
+        "DROP TABLE IF EXISTS orders, archive",
+        "DROP VIEW other.archive",
+    ] {
+        match analyze_in(&catalog, CONFIG, "anonymous", sql) {
+            Outcome::Blocked { reason } => assert!(reason.contains("drop"), "{sql}: {reason}"),
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    for sql in [
+        "DROP TABLE orders",
+        "DROP TABLE scratch",
+        "DROP INDEX archive",
+    ] {
+        match analyze_in(&catalog, CONFIG, "anonymous", sql) {
+            Outcome::Unchanged { .. } => (),
+            other => panic!("{sql}: {other:?}"),
+        }
     }
 }
 
@@ -1595,7 +1680,7 @@ fn test_search_path_change() {
             "name resolution",
         ),
         (
-            "ALTER TABLE archive RENAME TO old_archive; SELECT ssn FROM users",
+            "ALTER TABLE archive ADD COLUMN note text; SELECT ssn FROM users",
             "name resolution",
         ),
         (

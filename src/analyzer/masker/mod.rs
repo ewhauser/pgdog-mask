@@ -488,7 +488,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.block("a COPY option is missing its value or has one of the wrong type");
             return;
         }
-        self.check_shadowing(node);
+        self.check_created(node);
         self.check_ddl(node);
         self.check_maintenance(node);
         transform::transform_raw_stmt(stmt, self);

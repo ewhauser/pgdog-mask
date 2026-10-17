@@ -119,10 +119,13 @@ async fn setup(client: &Client) {
                 salary NUMERIC
              );
              CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT, total NUMERIC);
+             -- Unmasked, with a column named like a masked one.
+             CREATE TABLE contacts (id BIGINT, email TEXT);
              INSERT INTO users VALUES
                 (1, 'alice', 'CANARYSSN-1111', 'canaryemail-alice@example.com', 987654.32),
                 (2, 'bob', 'CANARYSSN-2222', 'canaryemail-bob@example.com', 987654.32);
              INSERT INTO orders VALUES (1, 1, 10), (2, 2, 20);
+             INSERT INTO contacts VALUES (1, 'contact-1');
 
              -- A trigger that puts a masked value in a notice's DETAIL.
              CREATE FUNCTION audit() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -608,6 +611,31 @@ const CORPUS: &[(&str, Expect)] = &[
     ),
     (
         "BEGIN; UPDATE user_names SET name = name WHERE id = 1 RETURNING *; ROLLBACK",
+        Expect::Runs,
+    ),
+    // A relation hiding `contacts`, or `contacts` losing its `email` column,
+    // would make `email` below read `users.email` while the catalog says
+    // `contacts.email`. Statements run on one connection, in order.
+    ("CREATE TEMP TABLE contacts (id BIGINT)", Expect::Blocked),
+    ("CREATE TABLE pg_temp.contacts (id BIGINT)", Expect::Blocked),
+    ("CREATE TEMP SEQUENCE contacts", Expect::Blocked),
+    ("SELECT 1 AS id INTO TEMP contacts", Expect::Blocked),
+    (
+        "CREATE TEMP TABLE contacts AS SELECT 1 AS id",
+        Expect::Blocked,
+    ),
+    ("CREATE TEMP TABLE contacts (LIKE orders)", Expect::Blocked),
+    ("ALTER TABLE contacts DROP COLUMN email", Expect::Blocked),
+    (
+        "ALTER TABLE contacts RENAME COLUMN email TO e",
+        Expect::Blocked,
+    ),
+    (
+        "SELECT (SELECT email FROM contacts LIMIT 1) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "SELECT x.email FROM users u, LATERAL (SELECT email FROM contacts) x",
         Expect::Runs,
     ),
 ];
@@ -1773,12 +1801,12 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ),
     (
         "L3",
-        "SELECT id, ssn INTO TEMP scratch FROM users",
+        "SELECT id, ssn INTO scratch FROM users",
         Expect::Blocked,
     ),
     (
         "L4",
-        "BEGIN; SELECT id INTO TEMP scratch FROM users WHERE ssn LIKE 'C%'; ROLLBACK",
+        "BEGIN; SELECT id INTO scratch FROM users WHERE ssn LIKE 'C%'; ROLLBACK",
         Expect::Runs,
     ),
     (
@@ -1819,7 +1847,7 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ("L12", "CREATE TABLE users AS SELECT 1", Expect::Blocked),
     (
         "L13",
-        "SELECT id::text INTO TEMP t FROM users UNION ALL SELECT ssn FROM users",
+        "SELECT id::text INTO t FROM users UNION ALL SELECT ssn FROM users",
         Expect::Blocked,
     ),
     // COPY.
@@ -2336,6 +2364,81 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ("W15", "BEGIN; LOCK TABLE users; ROLLBACK", Expect::Runs),
     ("W15", "BEGIN; TRUNCATE users; ROLLBACK", Expect::Runs),
     ("W16", "ANALYZE orders", Expect::Runs),
+    // A relation hiding `archive`, or `archive` losing its `ssn` column, would
+    // make `ssn` below read `users.ssn` while the catalog says `archive.ssn`.
+    // Statements run on one connection, in order.
+    (
+        "R-temp",
+        "CREATE TEMP TABLE archive (id BIGINT)",
+        Expect::Blocked,
+    ),
+    (
+        "R-temp",
+        "CREATE TABLE pg_temp.archive (id BIGINT)",
+        Expect::Blocked,
+    ),
+    ("R-temp", "CREATE TEMP SEQUENCE archive", Expect::Blocked),
+    (
+        "R-temp",
+        "SELECT 1 AS id INTO TEMP archive",
+        Expect::Blocked,
+    ),
+    (
+        "R-temp",
+        "CREATE TEMP TABLE archive AS SELECT 1 AS id",
+        Expect::Blocked,
+    ),
+    (
+        "R-temp",
+        "CREATE TEMP TABLE archive (LIKE orders)",
+        Expect::Blocked,
+    ),
+    (
+        "R-ddl",
+        "ALTER TABLE archive DROP COLUMN ssn",
+        Expect::Blocked,
+    ),
+    (
+        "R-ddl",
+        "ALTER TABLE archive RENAME COLUMN ssn TO s2",
+        Expect::Blocked,
+    ),
+    (
+        "R-ddl",
+        "ALTER TABLE archive DROP COLUMN ssn, ADD COLUMN note TEXT",
+        Expect::Blocked,
+    ),
+    (
+        "R-ddl",
+        "ALTER TABLE archive RENAME TO old",
+        Expect::Blocked,
+    ),
+    ("R-ddl", "CREATE TABLE archive (id BIGINT)", Expect::Blocked),
+    (
+        "R-temp",
+        "SELECT x.ssn FROM users u, LATERAL (SELECT ssn FROM archive) x",
+        Expect::Runs,
+    ),
+    (
+        "R-temp",
+        "SELECT x.ssn FROM users u JOIN LATERAL (SELECT ssn FROM archive) x ON true",
+        Expect::Runs,
+    ),
+    (
+        "R-temp",
+        "WITH c AS (SELECT x.ssn FROM users u, LATERAL (SELECT ssn FROM archive) x) SELECT * FROM c",
+        Expect::Runs,
+    ),
+    (
+        "R-temp",
+        "SELECT (SELECT ssn FROM archive LIMIT 1) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "R-temp",
+        "SELECT x.ssn FROM users u, LATERAL (SELECT ssn FROM archive WHERE id = 1) x",
+        Expect::Runs,
+    ),
     // The trigger raises the proxy-masked value in MESSAGE: the write redacts.
     (
         "I-3",

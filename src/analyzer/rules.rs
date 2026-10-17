@@ -263,6 +263,16 @@ pub(super) fn changes_resolution(node: Node<'_>) -> bool {
     }
 }
 
+/// Does a new relation go to the session's temporary schema: `TEMP`, or a
+/// `pg_temp` (or `pg_temp_N`) schema?
+pub(super) fn temporary(range_var: &nodes::RangeVar) -> bool {
+    range_var.relpersistence as u8 == b't'
+        || range_var.schemaname().is_some_and(|schema| {
+            let schema = schema.to_ascii_lowercase();
+            schema == "pg_temp" || schema.starts_with("pg_temp_")
+        })
+}
+
 /// DDL whose expressions are stored, or evaluated over rows: defaults,
 /// generated columns, checks, `ALTER ... TYPE ... USING` and indexes.
 pub(super) fn stores_expressions(node: Node<'_>) -> bool {

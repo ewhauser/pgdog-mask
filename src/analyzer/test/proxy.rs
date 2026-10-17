@@ -1311,12 +1311,12 @@ fn ctas_into_dml_ctes() -> Vec<Case> {
         ),
         case(
             "L3",
-            "SELECT id, ssn INTO TEMP scratch FROM users",
+            "SELECT id, ssn INTO scratch FROM users",
             Block("SELECT INTO"),
         ),
         case(
             "L4",
-            "SELECT id INTO TEMP scratch FROM users WHERE ssn LIKE '9%'",
+            "SELECT id INTO scratch FROM users WHERE ssn LIKE '9%'",
             Same(vec![], true),
         ),
         case(
@@ -1358,7 +1358,7 @@ fn ctas_into_dml_ctes() -> Vec<Case> {
         // The table gets the whole union.
         case(
             "L13",
-            "SELECT id::text INTO TEMP t FROM users UNION ALL SELECT ssn FROM users",
+            "SELECT id::text INTO t FROM users UNION ALL SELECT ssn FROM users",
             Block("SELECT INTO"),
         ),
     ]
