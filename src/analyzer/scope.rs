@@ -76,7 +76,7 @@ impl<'c> Item<'c> {
 
     /// Does this item belong to the recursive CTE being analyzed? Its
     /// columns aren't known yet, and reading them isn't a taint source.
-    fn pending_in(&self, current_cte: Option<&str>) -> bool {
+    pub(super) fn pending_in(&self, current_cte: Option<&str>) -> bool {
         self.pending.is_some() && self.pending.as_deref() == current_cte
     }
 

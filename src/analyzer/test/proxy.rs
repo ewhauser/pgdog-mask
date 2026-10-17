@@ -2317,9 +2317,8 @@ fn param_parses(sql: &str) -> (usize, Option<String>) {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, &ctx);
         for (index, stmt) in stmts.as_mut().into_iter().enumerate() {
-            let rows = returns_rows(stmt.stmt());
             masker.statement(stmt);
-            masker.finish_statement(index, rows);
+            masker.finish_statement(index);
         }
         result = Some((masker.param_parses(), masker.blocked.clone()));
         Ok::<_, pg_raw_parse::Error>(stmts)

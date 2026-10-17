@@ -292,8 +292,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     fn count_sources(&mut self, parts: &[Part]) {
         let current = self.ctes.last().map(String::as_str);
         let pending = |refname: &str| {
-            find_item(&self.frames, refname)
-                .is_some_and(|item| item.pending.is_some() && item.pending.as_deref() == current)
+            find_item(&self.frames, refname).is_some_and(|item| item.pending_in(current))
         };
         let sources = parts
             .iter()
@@ -493,7 +492,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
     /// End a top-level statement: deferred sinks, statement rules, result
     /// masks at position `result` and error redaction.
-    pub(in crate::analyzer) fn finish_statement(&mut self, result: usize, returns_rows: bool) {
+    pub(in crate::analyzer) fn finish_statement(&mut self, result: usize) {
         if self.state.select_into {
             // On a set operation, the table receives the whole result.
             let taint = self.outputs.as_ref().map_or(Taint::Unknown, Outputs::bound);
@@ -525,7 +524,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 self.prepared.insert(name);
             }
         }
-        if returns_rows {
+        // Statements of view and function bodies return no rows to PgDog.
+        if state.returns_rows && self.depth == 0 {
             self.result_masks(result, outputs.unwrap_or_else(Outputs::unknown), relevant);
         }
 

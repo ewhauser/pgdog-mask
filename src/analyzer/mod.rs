@@ -94,9 +94,8 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         // Each statement gets the result masks of its position, and may
         // change name resolution for the ones after it.
         for (index, stmt) in stmts.as_mut().into_iter().enumerate() {
-            let rows = returns_rows(stmt.stmt());
             masker.statement(stmt);
-            masker.finish_statement(index, rows);
+            masker.finish_statement(index);
         }
         result = Some((
             masker.blocked,
