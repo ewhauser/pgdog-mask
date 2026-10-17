@@ -4,9 +4,12 @@
 //! band, and those that store their arguments where they can be read back, when
 //! called with values of proxy-masked columns. A user-defined SQL function is
 //! analyzed: if its body reads no SQL-masked columns, the call is allowed as is
-//! (its result is NULL in results if the body reads proxy-masked columns). If
-//! it does, and the function can be inlined, the call is replaced by its body
-//! with masks applied:
+//! (its result is NULL in results if the body reads proxy-masked columns, or if
+//! it's called with their values). Called with values of proxy-masked columns,
+//! it's blocked if its body can move a parameter where PgDog can't mask it:
+//! the body is analyzed once more with parameters as sources. If the body
+//! reads SQL-masked columns, and the function can be inlined, the call is
+//! replaced by its body with masks applied:
 //!
 //! - a scalar call becomes
 //!   `(SELECT (<body value>)::<return type> FROM (SELECT <arg>::<type> AS <param>, ...) AS __pgdog_args)`;
@@ -81,6 +84,39 @@ enum CallTarget<'c> {
     Inline(&'c Function),
     /// User-defined SQL functions left as calls.
     Udf(Vec<&'c Function>),
+}
+
+/// A SQL function's body analyzed for where its parameters can go: they
+/// carry values of proxy-masked columns.
+#[derive(Debug)]
+pub(super) struct ParamMode {
+    /// Parameter names; positional parameters (`$1`) are sources too.
+    names: Vec<String>,
+    /// The function's name, which can qualify its parameters.
+    function: String,
+    /// A parameter can reach a sink.
+    pub(super) sinks: bool,
+}
+
+impl ParamMode {
+    fn new(function: &Function) -> Self {
+        Self {
+            names: param_names(function),
+            function: function.name.clone(),
+            sinks: false,
+        }
+    }
+
+    /// Is a name that resolves to no column a parameter: `param`,
+    /// `function.param`, or a field of a composite parameter?
+    pub(super) fn is_param(&self, names: &[&str]) -> bool {
+        let param = |name: &str| self.names.iter().any(|param| param == name);
+        match names {
+            [name, ..] if param(name) => true,
+            [function, name, ..] => *function == self.function && param(name),
+            _ => false,
+        }
+    }
 }
 
 /// What a function name resolves to.
@@ -206,7 +242,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
     /// After a call's arguments are transformed: built-ins that store their
     /// arguments are sinks, user-defined functions whose body reads
-    /// proxy-masked columns return values computed from them.
+    /// proxy-masked columns return values computed from them, and those
+    /// that can move a parameter to a sink can't be called with their
+    /// values.
     pub(super) fn call_post_check(&mut self, check: &CallCheck<'c>, args: Taint, name: &str) {
         if check.side_effect {
             self.sink(args, &format!("{name}()"));
@@ -216,30 +254,95 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         };
         if candidates
             .iter()
-            .any(|function| self.body_reads_proxies(function))
+            .any(|function| self.body_info(function, |info| info.reads_proxies))
         {
             self.note(Taint::Computed, false);
             self.state.reads_proxies = true;
         }
-        // Until bodies are checked for where their parameters go, tainted
-        // arguments can't be allowed.
-        let label = candidates
-            .first()
-            .map_or_else(|| name.to_owned(), |function| function.qualified_name());
-        self.check_taint(args, |_| {
-            format!(
-                "function {label}() is called with values of proxy-masked columns; this isn't supported yet"
-            )
-        });
+        if let Some(function) = candidates
+            .iter()
+            .find(|function| self.folds_proxies(function))
+        {
+            self.folds_proxies = true;
+            if self.explaining {
+                let why = if function.volatility == "immutable" {
+                    "reads proxy-masked columns and is IMMUTABLE"
+                } else {
+                    "calls an IMMUTABLE function that reads proxy-masked columns"
+                };
+                self.block(format!(
+                    "function {}() {why}: the planner can compute the result in advance, and EXPLAIN would show it",
+                    function.qualified_name()
+                ));
+            }
+        }
+        // Planning alone can call an operator's function on values from
+        // pg_statistic (RESTRICT = eqsel), so this applies under plain
+        // EXPLAIN too.
+        if !args.is_clean()
+            && let Some(function) = candidates
+                .iter()
+                .copied()
+                .find(|function| self.param_sinks(function))
+        {
+            self.sink_when_planned(args, &format!("calling {}()", function.qualified_name()));
+        }
     }
 
-    /// Does a function's body read proxy-masked columns?
-    fn body_reads_proxies(&self, function: &Function) -> bool {
+    /// Something about a user-defined function's body, once analyzed.
+    fn body_info(&self, function: &Function, f: impl FnOnce(&BodyInfo) -> bool) -> bool {
         self.memo
             .borrow()
             .functions
             .get(&function.oid)
-            .is_some_and(|info| info.reads_proxies)
+            .is_some_and(f)
+    }
+
+    /// Can the planner run a call that reads proxy-masked columns in advance,
+    /// when the arguments are constants? An IMMUTABLE function is evaluated
+    /// while planning, and a function whose body is inlined exposes the
+    /// calls in it.
+    fn folds_proxies(&self, function: &Function) -> bool {
+        self.body_info(function, |info| {
+            info.folds_proxies || (info.reads_proxies && function.volatility == "immutable")
+        })
+    }
+
+    /// Could a value passed to a user-defined SQL function reach a sink in
+    /// its body? Memoized; recursion and bodies that can't be analyzed
+    /// count as sinks.
+    fn param_sinks(&mut self, function: &'c Function) -> bool {
+        if let Some(sinks) = self.memo.borrow().param_sinks.get(&function.oid) {
+            return *sinks;
+        }
+        let active = format!("parameters of function {}", function.oid);
+        if self.memo.borrow().active.contains(&active) {
+            return true;
+        }
+        let sinks = match function_body(function) {
+            Some(body) if function.language == "sql" => {
+                let search_path = self.function_search_path(function);
+                self.memo.borrow_mut().active.push(active);
+                let sinks = self.body_param_sinks(&body, search_path, ParamMode::new(function));
+                self.memo.borrow_mut().active.pop();
+                sinks
+            }
+            _ => true,
+        };
+        self.memo
+            .borrow_mut()
+            .param_sinks
+            .insert(function.oid, sinks);
+        sinks
+    }
+
+    /// The search_path a function's body resolves names with: its own SET
+    /// option, or the caller's.
+    fn function_search_path(&self, function: &Function) -> Vec<String> {
+        function
+            .search_path()
+            .map(|path| parse_search_path(path, ""))
+            .unwrap_or_else(|| self.ctx.search_path.clone())
     }
 
     /// `set_config` changes settings out of PgDog's sight. PgDog only tracks
@@ -368,6 +471,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 verdict: Verdict::Safe,
                 touched: false,
                 reads_proxies: false,
+                folds_proxies: false,
             }
         } else if self.memo.borrow().active.contains(&active) {
             BodyInfo::blocked(format!("function {label}() is recursive"))
@@ -382,10 +486,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 function.language
             ))
         } else if let Some(body) = function_body(function) {
-            let search_path = function
-                .search_path()
-                .map(|path| parse_search_path(path, ""))
-                .unwrap_or_else(|| self.ctx.search_path.clone());
+            let search_path = self.function_search_path(function);
             self.memo.borrow_mut().active.push(active);
             let mut info = self.analyze_body(&body, search_path, |stmt| inlinable(function, stmt));
             self.memo.borrow_mut().active.pop();

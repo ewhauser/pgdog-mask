@@ -26,7 +26,7 @@ use super::shape::is_placeholder;
 use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::config::OnUnresolved;
 use crate::mask::SearchOp;
-use functions::{CallCheck, CallUse};
+use functions::{CallCheck, CallUse, ParamMode};
 use results::{OutputRef, StatementState};
 
 /// Why statements after one that may change name resolution are blocked.
@@ -148,6 +148,9 @@ struct BodyInfo {
     touched: bool,
     /// Reads proxy-masked columns.
     reads_proxies: bool,
+    /// Calls an IMMUTABLE function that reads proxy-masked columns, which
+    /// the planner may run in advance.
+    folds_proxies: bool,
 }
 
 impl BodyInfo {
@@ -156,6 +159,7 @@ impl BodyInfo {
             verdict: Verdict::Blocked(reason.into()),
             touched: false,
             reads_proxies: false,
+            folds_proxies: false,
         }
     }
 }
@@ -166,8 +170,13 @@ impl BodyInfo {
 struct Memo {
     views: HashMap<(String, String), BodyInfo>,
     functions: HashMap<i64, BodyInfo>,
+    /// Whether a parameter of a SQL function can reach a sink in its body.
+    param_sinks: HashMap<i64, bool>,
     /// Views and functions being analyzed, to stop recursion.
     active: Vec<String>,
+    /// Bodies parsed to find where their parameters go.
+    #[cfg(test)]
+    param_parses: usize,
 }
 
 pub(super) struct Masker<'c, 'mem> {
@@ -209,6 +218,17 @@ pub(super) struct Masker<'c, 'mem> {
     pub(super) results: super::Results,
     /// Some statement, or a body it uses, reads proxy-masked columns.
     pub(super) reads_proxies: bool,
+    /// Some statement calls an IMMUTABLE function that reads proxy-masked
+    /// columns, directly or through other functions.
+    folds_proxies: bool,
+    /// The statement runs: false inside a plain EXPLAIN, where only sinks
+    /// reached while planning apply.
+    executing: bool,
+    /// Inside an EXPLAIN, whose plan shows values the planner computes.
+    explaining: bool,
+    /// Analyzing a SQL function's body with parameters carrying values of
+    /// proxy-masked columns, to find where they can go.
+    params: Option<ParamMode>,
     /// Transforming a WINDOW clause, whose definitions are recorded by name.
     in_window_clause: bool,
     /// Transforming a set operation's ORDER BY, which sees only its outputs.
@@ -319,6 +339,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             state: StatementState::default(),
             results: super::Results::default(),
             reads_proxies: false,
+            folds_proxies: false,
+            executing: true,
+            explaining: false,
+            params: None,
             in_window_clause: false,
             setop_sort: false,
             writing: None,
@@ -346,6 +370,29 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         nested
     }
 
+    /// The context of a view or function body.
+    fn body_context(&self, search_path: Vec<String>) -> Context<'c> {
+        Context {
+            catalog: self.ctx.catalog,
+            assignments: self.ctx.assignments,
+            policies: self.ctx.policies,
+            profile: self.ctx.profile,
+            search_path,
+        }
+    }
+
+    /// Analyze the statements of a body, each on its own: deferred sinks
+    /// apply inside bodies too.
+    fn body_statements<'r>(
+        &mut self,
+        stmts: impl IntoIterator<Item = nodes::RawStmtMut<'mem, 'r>>,
+    ) {
+        for (i, stmt) in stmts.into_iter().enumerate() {
+            self.statement(stmt);
+            self.finish_statement(i, false);
+        }
+    }
+
     /// Analyze the statements of a view or function body for this user.
     fn analyze_body(
         &self,
@@ -360,31 +407,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             Ok(stmts) => stmts,
             Err(err) => return BodyInfo::blocked(format!("failed to parse: {err}")),
         };
-        let ctx = Context {
-            catalog: self.ctx.catalog,
-            assignments: self.ctx.assignments,
-            policies: self.ctx.policies,
-            profile: self.ctx.profile,
-            search_path,
-        };
+        let ctx = self.body_context(search_path);
         let mut nested = self.nested(&ctx);
         let shape = match stmts.as_ref().iter().collect::<Vec<_>>().as_slice() {
             [stmt] => inlinable(stmt),
             _ => Err("it has more than one statement".into()),
         };
-        let mut changes_resolution = false;
-        for (i, stmt) in stmts.as_mut().into_iter().enumerate() {
-            nested.statement(stmt);
-            changes_resolution |= nested.state.changes_resolution;
-            // Deferred sinks apply inside bodies too.
-            nested.finish_statement(i, false);
-        }
+        nested.body_statements(stmts.as_mut());
 
         // Only SQL masks make a body unsafe as is: star expansions are
         // plan-equivalent, and proxy-masked columns are never rewritten.
         let verdict = match nested.blocked {
             // The change would outlive the call, without PgDog seeing it.
-            _ if changes_resolution => Verdict::Blocked(
+            _ if nested.path_changed => Verdict::Blocked(
                 "it changes name resolution (search_path, role or DDL) beyond the call".into(),
             ),
             Some(reason) => Verdict::Blocked(reason),
@@ -400,7 +435,36 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             verdict,
             touched: nested.touched,
             reads_proxies: nested.reads_proxies,
+            folds_proxies: nested.folds_proxies,
         }
+    }
+
+    /// Could a function's parameters reach a sink in its body? The body is
+    /// analyzed with parameters carrying values of proxy-masked columns.
+    /// Anything that can't be analyzed counts as a sink.
+    fn body_param_sinks(&self, body: &str, search_path: Vec<String>, params: ParamMode) -> bool {
+        if self.depth >= MAX_DEPTH {
+            return true;
+        }
+        let Ok(mut stmts) = self.mem.parse(body) else {
+            return true;
+        };
+        #[cfg(test)]
+        {
+            self.memo.borrow_mut().param_parses += 1;
+        }
+        let ctx = self.body_context(search_path);
+        let mut nested = self.nested(&ctx);
+        nested.params = Some(params);
+        nested.body_statements(stmts.as_mut());
+        nested.blocked.is_some() || nested.params.is_some_and(|params| params.sinks)
+    }
+
+    /// How many function bodies were parsed to find where their parameters
+    /// go.
+    #[cfg(test)]
+    pub(super) fn param_parses(&self) -> usize {
+        self.memo.borrow().param_parses
     }
 
     fn block(&mut self, reason: impl Into<String>) {
@@ -410,8 +474,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// Mask a top-level statement. `finish_statement` ends it.
     pub(super) fn statement(&mut self, stmt: nodes::RawStmtMut<'mem, '_>) {
         let node = stmt.stmt();
+        // A plain EXPLAIN of SELECT INTO creates no table.
         let query = match node {
-            Node::ExplainStmt(explain) => explain.query(),
+            Node::ExplainStmt(explain) if rules::explain_executes(explain) => explain.query(),
+            Node::ExplainStmt(_) => Node::None,
             node => node,
         };
         self.state = StatementState {
@@ -1207,10 +1273,32 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             return;
         }
         self.state.runs_earlier = true;
-        // The statement was analyzed with clean parameters.
+        // The statement was analyzed with clean parameters. EXPLAIN EXECUTE
+        // evaluates them too, and plans the statement with their values.
+        let executing = std::mem::replace(&mut self.executing, true);
         let params = self.scoped(|masker| transform::transform_execute_stmt(node, masker));
         self.sink(params, "EXECUTE");
+        self.executing = executing;
         self.outputs = Some(Outputs::default());
+    }
+
+    fn transform_explain_stmt<'mutref>(&mut self, node: nodes::ExplainStmtMut<'mem, 'mutref>) {
+        // Without ANALYZE, the statement is only planned: values reach no
+        // sink, except those the planner itself evaluates.
+        let executing = self.executing;
+        let explaining = std::mem::replace(&mut self.explaining, true);
+        self.executing &= rules::explain_executes(&node);
+        transform::transform_explain_stmt(node, self);
+        self.executing = executing;
+        self.explaining = explaining;
+    }
+
+    fn transform_param_ref<'mutref>(&mut self, _node: nodes::ParamRefMut<'mem, 'mutref>) {
+        // A parameter of the function body being analyzed for where its
+        // parameters go. Anywhere else, parameters are the client's values.
+        if self.params.is_some() {
+            self.note(Taint::Computed, false);
+        }
     }
 
     fn transform_fetch_stmt<'mutref>(&mut self, node: nodes::FetchStmtMut<'mem, 'mutref>) {

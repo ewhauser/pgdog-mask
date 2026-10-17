@@ -1557,6 +1557,11 @@ fn side_effects() -> Vec<Case> {
             Block("pg_advisory_xact_lock"),
         ),
         case(
+            "O13",
+            "SELECT * FROM pg_logical_slot_get_changes('s', NULL, NULL)",
+            Block("not allowed"),
+        ),
+        case(
             "O14",
             "SELECT setseed(length(ssn) / 100.0) FROM users",
             Block("setseed"),
@@ -1592,18 +1597,19 @@ fn side_effects() -> Vec<Case> {
     ]
 }
 
-/// Stage A: functions called with values of proxy-masked columns are blocked
-/// until their bodies are checked for where parameters go (stage B).
 fn functions() -> Vec<Case> {
     use Expect::*;
-    const INTERIM: &str = "called with values of proxy-masked columns";
     vec![
         case(
             "P1",
             "SELECT my_func(ssn) FROM users",
             Block("isn't in the catalog"),
         ),
-        case("P2", "SELECT stash(ssn) FROM users", Block(INTERIM)),
+        case(
+            "P2",
+            "SELECT stash(ssn) FROM users",
+            Block("calling public.stash() would move values"),
+        ),
         case(
             "P3",
             "SELECT stash(name) FROM users WHERE ssn = $1",
@@ -1620,11 +1626,12 @@ fn functions() -> Vec<Case> {
             "SELECT digest(ssn, 'sha256') FROM users",
             Same(vec![n(0)], true),
         ),
-        case("P6", "SELECT last4(ssn) FROM users", Block(INTERIM)),
+        // Not inlined: its parameter reaches no sink.
+        case("P6", "SELECT last4(ssn) FROM users", Same(vec![n(0)], true)),
         case(
             "P7",
             "SELECT id FROM users WHERE last4(ssn) = $1",
-            Block(INTERIM),
+            Same(vec![], true),
         ),
         // Left as a call: the body reads proxy-masked columns.
         case(
@@ -1641,40 +1648,100 @@ fn functions() -> Vec<Case> {
         case("P10", "SELECT user_ssn_definer(1)", Same(vec![n(0)], true)),
         case("P10", "SELECT volatile_ssn(1)", Same(vec![n(0)], true)),
         case("P10", "SELECT atomic_ssn(1)", Same(vec![n(0)], true)),
+        case("P10+", "SELECT imm_ssn(1)", Same(vec![n(0)], true)),
         case("P11", "SELECT plpgsql_fn()", Block("plpgsql")),
         case("P12", "SELECT last4(name) FROM users", allow()),
         case("P13", "SELECT ssn_is(1, $1)", Same(vec![n(0)], true)),
-        case("P14", "SELECT notify_fn(ssn) FROM users", Block(INTERIM)),
-        case("P15", "SELECT wrap_stash(ssn) FROM users", Block(INTERIM)),
-        case("P16", "SELECT upper_safe(ssn) FROM users", Block(INTERIM)),
+        case(
+            "P16",
+            "SELECT upper_safe(ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
         case(
             "P17",
             "SELECT id FROM orders WHERE id @@@ user_id",
             Same(vec![], true),
         ),
-        case("P18", "SELECT ssn === 'x' FROM users", Block(INTERIM)),
+        case(
+            "P18",
+            "SELECT ssn === 'x' FROM users",
+            Same(vec![n(0)], true),
+        ),
         // A SQL-masked body is inlined, as before.
         case(
             "P19",
             "SELECT email_of(1)",
             Rewritten(vec!["__pgdog_args", "repeat("], vec![], false),
         ),
+        case("P21", "SELECT * FROM ssns()", Block("can't place masks")),
+        case("P22", "SELECT count_users()", allow()),
+    ]
+}
+
+/// User-defined functions called with values of proxy-masked columns: their
+/// bodies are analyzed for where parameters can go.
+fn param_sinks() -> Vec<Case> {
+    use Expect::*;
+    vec![
+        case(
+            "P14",
+            "SELECT notify_fn(ssn) FROM users",
+            Block("calling public.notify_fn() would move values"),
+        ),
+        case(
+            "P14+",
+            "SELECT id FROM users WHERE notify_fn(ssn) IS NULL",
+            Block("calling public.notify_fn()"),
+        ),
+        // Positional and qualified parameters.
+        case(
+            "P14+",
+            "SELECT notify_p(ssn) FROM users",
+            Block("calling public.notify_p()"),
+        ),
+        case(
+            "P14+",
+            "SELECT notify_q(upper(ssn)) FROM users",
+            Block("calling public.notify_q()"),
+        ),
+        // Clean arguments don't reach the body's sink.
+        case("P14+", "SELECT notify_fn(name) FROM users", allow()),
+        // Through a nested call whose parameter reaches a sink.
+        case(
+            "P15",
+            "SELECT wrap_stash(ssn) FROM users",
+            Block("calling public.wrap_stash()"),
+        ),
+        case(
+            "P16+",
+            "SELECT upper_safe(upper_safe(ssn)) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        // Parameters compared in the body's conditions go nowhere.
+        case(
+            "P16+",
+            "SELECT ssn_is(id, ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P16+",
+            "SELECT user_ssn_p(length(ssn)) FROM users",
+            Same(vec![n(0)], true),
+        ),
         case(
             "P20",
             "SELECT * FROM stash((SELECT ssn FROM users LIMIT 1)) s",
-            Block(INTERIM),
+            Block("calling public.stash()"),
         ),
-        case("P21", "SELECT * FROM ssns()", Block("can't place masks")),
-        case("P22", "SELECT count_users()", allow()),
         case(
             "P23",
             "SELECT id FROM users WHERE ssn ~~~ 'x'",
-            Block(INTERIM),
+            Block("calling public.noisy_eq()"),
         ),
         case(
             "P24",
             "SELECT recursive_fn(length(ssn)) FROM users",
-            Block(""),
+            Block("recursive"),
         ),
     ]
 }
@@ -1752,7 +1819,8 @@ fn views() -> Vec<Case> {
     ]
 }
 
-/// Stage A: plain EXPLAIN still applies sinks (stage B lifts them).
+/// Plain EXPLAIN only plans: values reach no sink but those the planner
+/// evaluates. EXPLAIN ANALYZE runs the statement.
 fn explain() -> Vec<Case> {
     use Expect::*;
     vec![
@@ -1789,7 +1857,7 @@ fn explain() -> Vec<Case> {
         case(
             "R7",
             "EXPLAIN UPDATE users SET name = ssn WHERE id = 1",
-            Block("UPDATE"),
+            Same(vec![], true),
         ),
         case(
             "R8",
@@ -1809,12 +1877,17 @@ fn explain() -> Vec<Case> {
         case(
             "R11",
             "EXPLAIN INSERT INTO audit (note) SELECT ssn FROM users",
+            allow(),
+        ),
+        case(
+            "R11+",
+            "EXPLAIN ANALYZE INSERT INTO audit (note) SELECT ssn FROM users",
             Block("INSERT"),
         ),
         case(
             "R12",
             "EXPLAIN (ANALYZE false) UPDATE users SET name = ssn",
-            Block("UPDATE"),
+            Same(vec![], true),
         ),
         case(
             "R13",
@@ -1829,7 +1902,7 @@ fn explain() -> Vec<Case> {
         case(
             "R15",
             "EXPLAIN SELECT set_config('x', ssn, false) FROM users",
-            Block("set_config"),
+            Same(vec![], true),
         ),
         case(
             "R16",
@@ -1837,6 +1910,48 @@ fn explain() -> Vec<Case> {
             Block("EXECUTE"),
         ),
         case("R16", "EXPLAIN ANALYZE EXECUTE p(1)", Block("EXECUTE")),
+        // Planning can call the operator's function on pg_statistic values.
+        case(
+            "R17",
+            "EXPLAIN SELECT id FROM users WHERE ssn ~~~ 'x'",
+            Block("calling public.noisy_eq()"),
+        ),
+        case(
+            "R17+",
+            "EXPLAIN SELECT notify_fn(ssn) FROM users",
+            Block("calling public.notify_fn()"),
+        ),
+        // The planner runs IMMUTABLE functions on constants, and the plan
+        // shows the result.
+        case("R18+", "EXPLAIN SELECT imm_ssn(1)", Block("IMMUTABLE")),
+        case(
+            "R18+",
+            "EXPLAIN ANALYZE SELECT id FROM orders WHERE imm_ssn(1) = 'x'",
+            Block("IMMUTABLE"),
+        ),
+        case(
+            "R18+",
+            "EXPLAIN SELECT wrap_imm(1)",
+            Block("calls an IMMUTABLE function"),
+        ),
+        case("R18+", "EXPLAIN SELECT user_ssn(1)", Same(vec![], true)),
+        // EXPLAIN EXECUTE evaluates the parameters and plans with them.
+        case(
+            "R19+",
+            "PREPARE p AS SELECT id FROM orders WHERE total::text = $1; EXPLAIN EXECUTE p(user_ssn(1))",
+            Block("EXECUTE would move values"),
+        ),
+        // A plain EXPLAIN of SELECT INTO creates no table.
+        case(
+            "R20+",
+            "EXPLAIN SELECT ssn INTO scratch FROM users",
+            allow(),
+        ),
+        case(
+            "R20+",
+            "EXPLAIN ANALYZE SELECT ssn INTO scratch FROM users",
+            Block("SELECT INTO"),
+        ),
     ]
 }
 
@@ -2059,6 +2174,11 @@ fn existing_blocks() -> Vec<Case> {
         ),
         case("W7", "SELECT lo_get(1)", Block("lo_get")),
         case(
+            "W8",
+            "SELECT pg_logical_slot_peek_changes('s', NULL, NULL)",
+            Block("not allowed"),
+        ),
+        case(
             "W9",
             "ALTER TABLE orders ADD COLUMN x text DEFAULT public.user_ssn(1)",
             Block(DDL),
@@ -2172,6 +2292,63 @@ fn test_proxy_functions() {
 }
 
 #[test]
+fn test_proxy_param_sinks() {
+    check(param_sinks());
+}
+
+/// Bodies parsed to find where parameters go by a masker analyzing `sql`
+/// as `engineer`, and why it blocked, if it did.
+fn param_parses(sql: &str) -> (usize, Option<String>) {
+    let policies =
+        Policies::with_registry(Config::from_toml(PROXY_CONFIG).unwrap(), &proxy_registry())
+            .unwrap();
+    let catalog = catalog();
+    let assignments = Assignments::new(&policies, "db", &catalog);
+    let profile = policies.profile("engineer", "db");
+    let ctx = Context {
+        catalog: &catalog,
+        assignments: &assignments,
+        policies: &policies,
+        profile: &profile,
+        search_path: vec!["public".into()],
+    };
+    let mut result = None;
+    make::try_owned(|mem| {
+        let mut stmts = mem.parse(sql)?;
+        let mut masker = Masker::new(mem, &ctx);
+        for (index, stmt) in stmts.as_mut().into_iter().enumerate() {
+            let rows = returns_rows(stmt.stmt());
+            masker.statement(stmt);
+            masker.finish_statement(index, rows);
+        }
+        result = Some((masker.param_parses(), masker.blocked.clone()));
+        Ok::<_, pg_raw_parse::Error>(stmts)
+    })
+    .unwrap();
+    result.unwrap()
+}
+
+#[test]
+fn test_param_sinks_memoized() {
+    // Each body is parsed once, however often the function is called.
+    assert_eq!(
+        param_parses(
+            "SELECT last4(ssn), upper_safe(ssn), last4(upper(ssn)) FROM users; SELECT last4(ssn) FROM users WHERE upper_safe(ssn) = $1"
+        ),
+        (2, None)
+    );
+    // Only calls with values of proxy-masked columns need it.
+    assert_eq!(
+        param_parses("SELECT last4(name), upper_safe($1) FROM users"),
+        (0, None)
+    );
+    // wrap_stash, and stash, which it calls with its parameter.
+    let (parses, blocked) = param_parses("SELECT wrap_stash(ssn) FROM users");
+    assert_eq!(parses, 2);
+    assert!(blocked.is_some_and(|reason| reason.contains("wrap_stash")));
+}
+
+#[test]
 fn test_proxy_views() {
     check(views());
 }
@@ -2244,6 +2421,7 @@ fn test_proxy_shape_parity() {
         cursors_prepare_execute(),
         side_effects(),
         functions(),
+        param_sinks(),
         views(),
         explain(),
         multi_statement(),

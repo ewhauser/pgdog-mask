@@ -380,7 +380,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     ) -> (Option<Unique<'mem, Node<'mem>>>, Taint) {
         let Some(item) = find_item(&self.frames, refname) else {
             // Not a column, nor a FROM item: e.g. a function parameter.
-            return (None, Taint::Unknown);
+            return (None, self.unresolved_taint(&[refname]));
         };
         let (relation, names) = match &item.kind {
             ItemKind::Relation { relation, names } => (*relation, names.clone()),
@@ -412,6 +412,21 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         // Mask the columns inside the row.
         self.transform_node(Assignable::new(&mut expr));
         (Some(expr), taint)
+    }
+
+    /// What a name that resolves to no column or FROM item carries: in a
+    /// function body analyzed for where its parameters go, a parameter
+    /// carries values of proxy-masked columns.
+    fn unresolved_taint(&self, names: &[&str]) -> Taint {
+        if self
+            .params
+            .as_ref()
+            .is_some_and(|params| params.is_param(names))
+        {
+            Taint::Computed
+        } else {
+            Taint::Unknown
+        }
     }
 
     /// The CTE being analyzed, whose pending columns aren't taint sources.
@@ -545,7 +560,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     forced = true;
                 }
                 // E.g. a field of a composite column.
-                (None, _) => add(Taint::Unknown),
+                (None, _) => add(self.unresolved_taint(names)),
             }
         }
         (row, taint.unwrap_or_default(), forced)

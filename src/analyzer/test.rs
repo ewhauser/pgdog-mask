@@ -189,6 +189,16 @@ pub(crate) fn functions() -> Vec<Function> {
     );
     upper_safe.volatility = "immutable".into();
 
+    // Mislabelled: it reads a table, so the planner may run it in advance.
+    let mut imm_ssn = sql_function(
+        25,
+        "imm_ssn",
+        &[("uid", "bigint")],
+        "text",
+        "SELECT ssn FROM public.users WHERE id = uid",
+    );
+    imm_ssn.volatility = "immutable".into();
+
     vec![
         last4,
         sql_function(
@@ -282,6 +292,28 @@ pub(crate) fn functions() -> Vec<Function> {
             &[("a", "text"), ("b", "text")],
             "boolean",
             "SELECT a = b FROM (SELECT pg_notify('c', a)) AS n",
+        ),
+        sql_function(
+            23,
+            "notify_p",
+            &[("", "text")],
+            "void",
+            "SELECT pg_notify('c', $1)",
+        ),
+        sql_function(
+            24,
+            "notify_q",
+            &[("v", "text")],
+            "void",
+            "SELECT pg_notify('c', notify_q.v)",
+        ),
+        imm_ssn,
+        sql_function(
+            26,
+            "wrap_imm",
+            &[("uid", "bigint")],
+            "text",
+            "SELECT public.imm_ssn(uid)",
         ),
     ]
 }

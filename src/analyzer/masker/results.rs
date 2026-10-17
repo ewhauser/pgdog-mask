@@ -454,8 +454,23 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// Values would move where PgDog can't mask them.
+    /// Values would move where PgDog can't mask them, if the statement runs:
+    /// a plain EXPLAIN only plans it.
     pub(super) fn sink(&mut self, taint: Taint, what: &str) {
+        if self.executing {
+            self.sink_when_planned(taint, what);
+        }
+    }
+
+    /// Values would move where PgDog can't mask them, even if the statement
+    /// is only planned. In a function body analyzed for where its
+    /// parameters go, records that they can reach a sink instead: any
+    /// non-Clean value may carry them.
+    pub(super) fn sink_when_planned(&mut self, taint: Taint, what: &str) {
+        if let Some(params) = &mut self.params {
+            params.sinks |= !taint.is_clean();
+            return;
+        }
         self.check_taint(taint, |masker| {
             let labels = &masker.state.proxy_labels;
             if labels.is_empty() {

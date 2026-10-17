@@ -29,6 +29,11 @@ const DENIED_FUNCTIONS: &[&str] = &[
     "lo_get",
     "lo_open",
     "loread",
+    // Logical decoding output: rows of every table, as of their changes.
+    "pg_logical_slot_get_changes",
+    "pg_logical_slot_peek_changes",
+    "pg_logical_slot_get_binary_changes",
+    "pg_logical_slot_peek_binary_changes",
 ];
 
 /// Built-ins that store or send their arguments where they can be read back.
@@ -171,6 +176,23 @@ pub(super) fn check_statement(node: Node<'_>) -> Result<(), String> {
     }
 }
 
+/// Does an EXPLAIN run its statement? `ANALYZE` with no value, or any value
+/// but a clearly false one, runs it. Postgres rejects values other than
+/// true, false, on, off, 1 and 0.
+pub(super) fn explain_executes(explain: &nodes::ExplainStmt) -> bool {
+    explain.options().iter().any(|option| {
+        option.defname() == Some("analyze")
+            && match option.arg() {
+                Node::Integer(nodes::Integer { ival, .. }) => *ival != 0,
+                arg => !arg.as_str().is_some_and(|value| {
+                    ["false", "off", "no", "0"]
+                        .iter()
+                        .any(|off| off.eq_ignore_ascii_case(value))
+                }),
+            }
+    })
+}
+
 /// Settings that change how names resolve.
 const RESOLUTION_SETTINGS: &[&str] = &["search_path", "role", "session_authorization"];
 
@@ -308,11 +330,38 @@ mod test {
         assert!(denied_function("lower").is_none());
         assert!(denied_function("query_to_xml").is_some());
         assert!(denied_function("dblink_exec").is_some());
+        assert!(denied_function("pg_logical_slot_peek_changes").is_some());
         let allowlist = ["public.my_func".to_owned()];
         assert!(allowlisted(None, "my_func", &allowlist));
         assert!(allowlisted(Some("public"), "my_func", &allowlist));
         assert!(!allowlisted(Some("other"), "my_func", &allowlist));
         assert!(!allowlisted(None, "lower", &allowlist));
+    }
+
+    #[test]
+    fn test_explain_executes() {
+        for (sql, executes) in [
+            ("EXPLAIN SELECT 1", false),
+            ("EXPLAIN (FORMAT JSON, VERBOSE) SELECT 1", false),
+            ("EXPLAIN ANALYZE SELECT 1", true),
+            ("EXPLAIN ANALYSE SELECT 1", true),
+            ("EXPLAIN (ANALYZE) SELECT 1", true),
+            ("EXPLAIN (ANALYZE true, BUFFERS) SELECT 1", true),
+            ("EXPLAIN (ANALYZE 1) SELECT 1", true),
+            ("EXPLAIN (ANALYZE false) SELECT 1", false),
+            ("EXPLAIN (ANALYZE OFF) SELECT 1", false),
+            ("EXPLAIN (ANALYZE 0) SELECT 1", false),
+            // Any option that may run it does.
+            ("EXPLAIN (ANALYZE false, ANALYZE) SELECT 1", true),
+            ("EXPLAIN (ANALYZE 'maybe') SELECT 1", true),
+        ] {
+            let parsed = pg_raw_parse::parse(sql).unwrap();
+            let stmt = parsed.into_iter().next().unwrap();
+            let Node::ExplainStmt(explain) = stmt.stmt() else {
+                panic!("{sql} isn't EXPLAIN");
+            };
+            assert_eq!(explain_executes(explain), executes, "{sql}");
+        }
     }
 
     #[test]
