@@ -232,7 +232,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let params = self.scoped(|masker| transform::transform_execute_stmt(node, masker));
         self.sink(params, "EXECUTE");
         self.executing = executing;
-        self.outputs = Some(Outputs::default());
+        self.set_outputs(Some(Outputs::default()));
     }
 
     /// COPY: `COPY t TO` reads the table's columns as a query would.
@@ -313,7 +313,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 copy.as_mut()
                     .set_options(self.mem.make_unique(node.options()));
             }
-            self.outputs = None;
+            self.expect_outputs();
             transform::transform_node(copy.as_mut().query_mut(), self);
             self.sink_outputs("COPY");
             node.replace(copy);
@@ -321,7 +321,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return;
         }
 
-        self.outputs = None;
+        self.expect_outputs();
         transform::transform_node(node.query_mut(), self);
         self.sink_outputs("COPY");
     }

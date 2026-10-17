@@ -210,6 +210,8 @@ pub(super) struct Masker<'c, 'mem> {
     output_refs: HashMap<usize, OutputRef>,
     /// Outputs of the query level that finished last; its caller takes them.
     outputs: Option<Outputs>,
+    /// `outputs` are a nested level's, and its caller hasn't taken them yet.
+    unclaimed: bool,
     /// What the statement being analyzed does with proxy-masked columns.
     state: StatementState,
     /// Result masks and redaction of the statements analyzed so far.
@@ -332,6 +334,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             passthrough: HashSet::new(),
             output_refs: HashMap::new(),
             outputs: None,
+            unclaimed: false,
             state: StatementState::default(),
             results: super::Results::default(),
             reads_proxies: false,
@@ -576,7 +579,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         target: Option<usize>,
     ) {
         let Some(mut returning) = returning else {
-            self.outputs = Some(Outputs::default());
+            self.set_outputs(Some(Outputs::default()));
             return;
         };
 
@@ -627,7 +630,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             let exprs: Vec<_> = exprs.into_iter().map(|e| e.uncast()).collect();
             returning.set_exprs(self.mem.make_list(&exprs));
         }
-        self.outputs = Some(outputs);
+        self.set_outputs(Some(outputs));
 
         if let Some(frame) = self.frames.last_mut() {
             frame.items.truncate(items);
@@ -645,6 +648,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let setop_sort = std::mem::replace(&mut self.setop_sort, false);
         let writing = self.writing.take();
         f(self);
+        // A nested level's outputs are its caller's to take.
+        self.unclaimed = self.frames.len() > 1 && self.outputs.is_some();
         self.predicate = predicate;
         self.from = from;
         self.taint = taint;
@@ -1004,11 +1009,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     .frames
                     .last_mut()
                     .map(|frame| std::mem::replace(&mut frame.lateral_only, !lateral));
-                self.outputs = None;
+                self.expect_outputs();
                 transform::transform_node(node, self);
                 let outputs = self
-                    .outputs
-                    .take()
+                    .take_outputs()
                     .unwrap_or_else(Outputs::unknown)
                     .renamed(&aliases);
                 if let Some(frame) = self.frames.last_mut() {
@@ -1289,9 +1293,9 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         } else {
             "CREATE TABLE AS"
         };
-        self.outputs = None;
+        self.expect_outputs();
         transform::transform_create_table_as_stmt(node, self);
-        let taint = self.outputs.take().map_or(Taint::Unknown, |o| o.bound());
+        let taint = self.take_outputs().map_or(Taint::Unknown, |o| o.bound());
         self.sink(taint, what);
     }
 
@@ -1426,14 +1430,25 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     fn transform_sub_link<'mutref>(&mut self, node: nodes::SubLinkMut<'mem, 'mutref>) {
         let exists = node.sub_link_type == SubLinkType::EXISTS_SUBLINK;
-        self.outputs = None;
+        self.expect_outputs();
         transform::transform_sub_link(node, self);
-        let outputs = self.outputs.take().unwrap_or_else(Outputs::unknown);
+        let outputs = self.take_outputs().unwrap_or_else(Outputs::unknown);
         // A scalar or array subquery is computed, even when it passes a
         // column through. EXISTS only says whether there are rows.
         if !exists {
             self.note_from(outputs.bound().computed(), false, false);
         }
+    }
+
+    fn transform_json_array_query_constructor<'mutref>(
+        &mut self,
+        node: nodes::JsonArrayQueryConstructorMut<'mem, 'mutref>,
+    ) {
+        // JSON_ARRAY(query) aggregates the query's rows, like ARRAY(query).
+        self.expect_outputs();
+        transform::transform_json_array_query_constructor(node, self);
+        let outputs = self.take_outputs().unwrap_or_else(Outputs::unknown);
+        self.note_from(outputs.bound().computed(), false, false);
     }
 
     fn transform_with_clause<'mutref>(&mut self, node: nodes::WithClauseMut<'mem, 'mutref>) {
@@ -1465,11 +1480,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         self.ctes.push(name.clone());
         // Deferred sinks aren't part of the snapshot: they must survive.
         let (sources, computes) = (self.sources, self.state.computes);
-        self.outputs = None;
+        self.expect_outputs();
         transform::transform_common_table_expr(node, self);
         let mut outputs = self
-            .outputs
-            .take()
+            .take_outputs()
             .unwrap_or_else(Outputs::unknown)
             .renamed(&aliases);
         // Nothing but its own pending rows entered it: it's provably clean.
@@ -1538,14 +1552,14 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 // branch's.
                 let mut outputs = Outputs::unknown();
                 if let Some(larg) = node.larg_mut() {
-                    masker.outputs = None;
+                    masker.expect_outputs();
                     masker.transform_select_stmt(larg);
-                    outputs = masker.outputs.take().unwrap_or_else(Outputs::unknown);
+                    outputs = masker.take_outputs().unwrap_or_else(Outputs::unknown);
                 }
                 if let Some(rarg) = node.rarg_mut() {
-                    masker.outputs = None;
+                    masker.expect_outputs();
                     masker.transform_select_stmt(rarg);
-                    let right = masker.outputs.take().unwrap_or_else(Outputs::unknown);
+                    let right = masker.take_outputs().unwrap_or_else(Outputs::unknown);
                     outputs = outputs.union(right);
                 }
                 // ORDER BY / LIMIT of a set operation refer to its outputs.
@@ -1565,7 +1579,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                     set_limit_offset
                 );
                 clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
-                masker.outputs = Some(outputs);
+                masker.set_outputs(Some(outputs));
                 return;
             }
 
@@ -1651,7 +1665,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 set_limit_offset
             );
             clause!(masker, node, limit_count, limit_count_mut, set_limit_count);
-            masker.outputs = outputs;
+            masker.set_outputs(outputs);
         });
     }
 
@@ -1661,10 +1675,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 masker.transform_with_clause(with);
             }
             // The source query doesn't see the target table.
-            masker.outputs = None;
+            masker.expect_outputs();
             transform::transform_node(node.select_stmt_mut(), masker);
             // DEFAULT VALUES has no source.
-            let source = masker.outputs.take().map_or(Taint::Clean, |o| o.bound());
+            let source = masker.take_outputs().map_or(Taint::Clean, |o| o.bound());
             masker.sink(source, "INSERT");
 
             let target = masker.add_target(node.relation());

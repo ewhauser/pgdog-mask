@@ -405,6 +405,32 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         Some(expanded)
     }
 
+    /// Start transforming a query level whose outputs the caller takes.
+    pub(super) fn expect_outputs(&mut self) {
+        self.check_unclaimed();
+        self.outputs = None;
+    }
+
+    /// The outputs of the query level that finished last.
+    pub(super) fn take_outputs(&mut self) -> Option<Outputs> {
+        self.unclaimed = false;
+        self.outputs.take()
+    }
+
+    /// Set the outputs of the query level being finished.
+    pub(super) fn set_outputs(&mut self, outputs: Option<Outputs>) {
+        self.check_unclaimed();
+        self.outputs = outputs;
+    }
+
+    /// A nested query level whose outputs nobody took is embedded in a node
+    /// this doesn't follow: what its values flow into is unknown.
+    fn check_unclaimed(&mut self) {
+        if std::mem::take(&mut self.unclaimed) {
+            self.block("a subquery is used in a way the plugin can't analyze");
+        }
+    }
+
     /// Record ORDER BY, DISTINCT ON and GROUP BY items that name output
     /// columns: they read the output, not an input column.
     pub(super) fn record_output_refs<'n>(
@@ -486,7 +512,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// The outputs of the query level that finished last would move where
     /// PgDog can't mask them.
     pub(super) fn sink_outputs(&mut self, what: &str) {
-        let taint = self.outputs.take().map_or(Taint::Unknown, |o| o.bound());
+        let taint = self.take_outputs().map_or(Taint::Unknown, |o| o.bound());
         self.sink(taint, what);
     }
 
@@ -500,7 +526,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
 
         let state = std::mem::take(&mut self.state);
-        let outputs = self.outputs.take();
+        let outputs = self.take_outputs();
         let relevant = state.relevant();
         let computes = state.computes.resolve(relevant);
 
@@ -570,5 +596,56 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 mask,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use pg_raw_parse::make;
+
+    use super::*;
+    use crate::analyzer::Context;
+    use crate::analyzer::test::{CONFIG, catalog};
+    use crate::config::Config;
+    use crate::profile::{Assignments, Policies};
+
+    /// A nested query level whose outputs no caller takes sits in a node the
+    /// masker doesn't follow: what its values flow into is unknown.
+    #[test]
+    fn test_unclaimed_outputs_block() {
+        let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+        let catalog = catalog();
+        let assignments = Assignments::new(&policies, "db", &catalog);
+        let profile = policies.profile("anonymous", "db");
+        let ctx = Context {
+            catalog: &catalog,
+            assignments: &assignments,
+            policies: &policies,
+            profile: &profile,
+            search_path: vec!["public".into()],
+        };
+        make::try_owned(|mem| {
+            let mut masker = Masker::new(mem, &ctx);
+            masker.with_frame(|masker| {
+                masker.with_frame(|masker| masker.set_outputs(Some(Outputs::default())));
+                masker.set_outputs(Some(Outputs::default()));
+            });
+            assert!(
+                masker
+                    .blocked
+                    .is_some_and(|reason| reason.contains("subquery"))
+            );
+
+            let mut masker = Masker::new(mem, &ctx);
+            masker.with_frame(|masker| {
+                masker.expect_outputs();
+                masker.with_frame(|masker| masker.set_outputs(Some(Outputs::default())));
+                masker.take_outputs();
+                masker.set_outputs(Some(Outputs::default()));
+            });
+            assert!(masker.blocked.is_none());
+            mem.parse("SELECT 1")
+        })
+        .unwrap();
     }
 }

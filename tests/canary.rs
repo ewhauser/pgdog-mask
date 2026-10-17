@@ -1707,6 +1707,52 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         Expect::Runs,
     ),
     ("I8", "SELECT EXISTS (SELECT ssn FROM users)", Expect::Runs),
+    // JSON_ARRAY(query) aggregates the query's rows, like ARRAY(query).
+    (
+        "I9",
+        "SELECT JSON_ARRAY(SELECT ssn FROM users)",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "SELECT JSON_ARRAY(SELECT ssn FROM users RETURNING text)",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "SELECT x FROM (SELECT JSON_ARRAY(SELECT ssn FROM users) AS x) s",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "SELECT JSON_OBJECT('k': JSON_ARRAY(SELECT ssn FROM users))",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "SELECT JSON_ARRAY(SELECT x FROM (SELECT ssn AS x FROM users) s)",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "WITH RECURSIVE r(n, v) AS (SELECT 1, ''::varchar UNION ALL SELECT n + 1, JSON_ARRAY(SELECT ssn FROM users)::varchar FROM r WHERE n < 2) SELECT v FROM r",
+        Expect::Runs,
+    ),
+    (
+        "I9",
+        "BEGIN; INSERT INTO audit (note) SELECT JSON_ARRAY(SELECT ssn FROM users)::text; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "I9",
+        "SELECT pg_notify('c', JSON_ARRAY(SELECT ssn FROM users)::text)",
+        Expect::Blocked,
+    ),
+    (
+        "I9",
+        "SELECT (JSON_ARRAY(SELECT ssn FROM users)::text)::int",
+        Expect::Fails("22P02"),
+    ),
     // RETURNING: the trigger raises the proxy-masked value on every update.
     (
         "J1",

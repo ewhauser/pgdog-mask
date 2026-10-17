@@ -1204,6 +1204,47 @@ fn target_sublinks() -> Vec<Case> {
             Same(vec![], true),
         ),
         case("I8", "SELECT EXISTS (SELECT ssn FROM users)", allow()),
+        // JSON_ARRAY(query) aggregates the query's rows, like ARRAY(query).
+        case(
+            "I9",
+            "SELECT JSON_ARRAY(SELECT ssn FROM users)",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "I9",
+            "SELECT JSON_ARRAY(SELECT ssn FROM users RETURNING text)",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "I9",
+            "SELECT x FROM (SELECT JSON_ARRAY(SELECT ssn FROM users) AS x) s",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "I9",
+            "SELECT JSON_OBJECT('k': JSON_ARRAY(SELECT ssn FROM users))",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "I9",
+            "SELECT JSON_ARRAY(SELECT x FROM (SELECT ssn AS x FROM users) s)",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "I9",
+            "SELECT id FROM orders WHERE JSON_ARRAY(SELECT ssn FROM users)::text <> ''",
+            Same(vec![], true),
+        ),
+        case(
+            "I9",
+            "INSERT INTO audit (note) SELECT JSON_ARRAY(SELECT ssn FROM users)::text",
+            Block("INSERT would move"),
+        ),
+        case(
+            "I9",
+            "SELECT pg_notify('c', JSON_ARRAY(SELECT ssn FROM users)::text)",
+            Block("pg_notify() would move"),
+        ),
     ]
 }
 
