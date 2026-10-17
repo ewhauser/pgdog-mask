@@ -1559,6 +1559,15 @@ fn test_search_path_change() {
             "name resolution",
         ),
         ("SELECT reroute()", "changes name resolution"),
+        // PgDog doesn't follow it while its query parser is off.
+        (
+            "SELECT set_config('search_path', 'other', false)",
+            "set_config",
+        ),
+        (
+            "SELECT pg_catalog.set_config('search_path', 'other', true)",
+            "set_config",
+        ),
     ] {
         let blocked = blocked("anonymous", sql);
         assert!(blocked.contains(reason), "{sql}: {blocked}");
@@ -1568,8 +1577,6 @@ fn test_search_path_change() {
         "RESET search_path; SELECT 1",
         "SET search_path TO other; SELECT 1",
         "SET ROLE someone; SELECT now()",
-        "SELECT set_config('search_path', 'other', false)",
-        "SELECT pg_catalog.set_config('search_path', 'other', true)",
         "SELECT set_config('app.tenant', '42', false)",
         "SELECT set_config('app.tenant', '42', false); SELECT id FROM orders",
         "CREATE TABLE t2 (id int); SELECT 1",

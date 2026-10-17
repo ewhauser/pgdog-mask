@@ -1,6 +1,6 @@
 //! Fail-closed rules for masked users.
 use pg_raw_parse::{
-    ConstValue, Node, nodes,
+    Node, nodes,
     raw::{DiscardMode, SetOperation, VariableSetKind},
 };
 
@@ -243,64 +243,6 @@ pub(super) fn into_clause(select: &nodes::SelectStmt) -> Option<&nodes::IntoClau
         leaf = leaf.larg()?;
     }
     select.into_clause().or_else(|| leaf.into_clause())
-}
-
-/// Is this the one form of `set_config` PgDog tracks, so the session's
-/// `search_path` follows it: `SELECT [pg_catalog.]set_config('<name>',
-/// '<value>' | NULL, <boolean>)` and nothing else?
-pub(super) fn tracked_set_config(node: Node<'_>) -> bool {
-    let Node::SelectStmt(select) = node else {
-        return false;
-    };
-    let plain = select.op == SetOperation::SETOP_NONE
-        && select.with_clause().is_none()
-        && select.into_clause().is_none()
-        && select.distinct_clause().is_empty()
-        && select.from_clause().is_empty()
-        && matches!(select.where_clause(), Node::None)
-        && select.group_clause().is_empty()
-        && matches!(select.having_clause(), Node::None)
-        && select.window_clause().is_empty()
-        && select.values_lists().is_empty()
-        && select.sort_clause().is_empty()
-        && matches!(select.limit_offset(), Node::None)
-        && matches!(select.limit_count(), Node::None)
-        && select.locking_clause().is_empty();
-    let targets: Vec<_> = select.target_list().iter().collect();
-    let [target] = targets.as_slice() else {
-        return false;
-    };
-    let Node::FuncCall(call) = target.val() else {
-        return false;
-    };
-    let name: Vec<_> = call.funcname().iter().filter_map(|n| n.as_str()).collect();
-    let args: Vec<_> = call
-        .args()
-        .iter()
-        .map(|arg| match arg {
-            Node::A_Const(constant) => Some(constant.val()),
-            _ => None,
-        })
-        .collect();
-    plain
-        && matches!(
-            name.as_slice(),
-            ["set_config"] | ["pg_catalog", "set_config"]
-        )
-        && !call.agg_star
-        && !call.agg_distinct
-        && !call.func_variadic
-        && call.over().is_none()
-        && call.agg_order().is_empty()
-        && matches!(call.agg_filter(), Node::None)
-        && matches!(
-            args.as_slice(),
-            [
-                Some(Some(ConstValue::String(_))),
-                Some(Some(ConstValue::String(_)) | None),
-                Some(Some(ConstValue::Boolean(_))),
-            ]
-        )
 }
 
 #[cfg(test)]

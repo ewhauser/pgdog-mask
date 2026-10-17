@@ -2040,7 +2040,7 @@ fn multi_statement() -> Vec<Case> {
         case(
             "S18",
             "SELECT set_config('search_path', 'other', false)",
-            allow(),
+            Block("set_config"),
         ),
         case(
             "S19",

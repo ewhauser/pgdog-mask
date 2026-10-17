@@ -90,10 +90,6 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
     let parsed = make::try_owned(|mem| {
         let mut stmts = mem.parse(sql)?;
         let mut masker = Masker::new(mem, ctx);
-        let all: Vec<_> = stmts.as_ref().iter().collect();
-        if matches!(all.as_slice(), [stmt] if rules::tracked_set_config(stmt.stmt())) {
-            masker.track_set_config();
-        }
         // Each statement gets the result masks of its position, and may
         // change name resolution for the ones after it.
         for (index, stmt) in stmts.as_mut().into_iter().enumerate() {

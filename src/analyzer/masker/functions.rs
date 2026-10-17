@@ -345,9 +345,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .unwrap_or_else(|| self.ctx.search_path.clone())
     }
 
-    /// `set_config` changes settings out of PgDog's sight. PgDog only tracks
-    /// `search_path` when the query is a single literal call, and a role
-    /// change alters `$user` for later statements.
+    /// `set_config` changes settings out of PgDog's sight: PgDog doesn't
+    /// always follow a `search_path` it sets (not at all while its query
+    /// parser is off), so names would resolve differently here and in
+    /// Postgres. A role change alters `$user` for later statements.
     fn check_set_config(&mut self, call: &nodes::FuncCall) -> Result<(), ()> {
         let setting = match call.args().iter().next() {
             Some(Node::A_Const(constant)) => match constant.val() {
@@ -357,14 +358,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             _ => None,
         };
         match setting {
-            Some(setting)
-                if !setting.eq_ignore_ascii_case("search_path") || self.tracked_set_config =>
-            {
+            Some(setting) if !setting.eq_ignore_ascii_case("search_path") => {
                 self.state.changes_resolution |= rules::changes_resolution_setting(setting);
                 Ok(())
             }
             _ => {
-                self.block("set_config() can only change search_path as a query of its own, SELECT set_config('search_path', '...', false); use SET search_path");
+                self.block("set_config() can't change search_path for masked users: PgDog may not follow the change; use SET search_path");
                 Err(())
             }
         }

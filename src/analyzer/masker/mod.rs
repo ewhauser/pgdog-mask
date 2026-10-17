@@ -244,8 +244,6 @@ pub(super) struct Masker<'c, 'mem> {
     prepared: HashSet<String>,
     /// An earlier statement of this query may change name resolution.
     path_changed: bool,
-    /// The query is the one `set_config` call PgDog tracks.
-    tracked_set_config: bool,
 }
 
 fn names(list: &pg_raw_parse::list::NodeList) -> Vec<String> {
@@ -350,14 +348,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             ctes: vec![],
             prepared: HashSet::new(),
             path_changed: false,
-            tracked_set_config: false,
         }
-    }
-
-    /// The query is the one `SELECT set_config(...)` PgDog tracks: it may
-    /// change `search_path`.
-    pub(super) fn track_set_config(&mut self) {
-        self.tracked_set_config = true;
     }
 
     /// A masker for the body of a view or function, sharing this one's
