@@ -2664,6 +2664,43 @@ fn test_proxy_unknown_type_oid() {
     ]);
 }
 
+/// Rewrites list the SQL-masked columns they rewrote: references to
+/// proxy-masked columns aren't rewritten.
+#[test]
+fn test_proxy_columns_not_listed_as_rewritten() {
+    let policies =
+        Policies::with_registry(Config::from_toml(PROXY_CONFIG).unwrap(), &proxy_registry())
+            .unwrap();
+    let catalog = catalog();
+    let assignments = Assignments::new(&policies, "db", &catalog);
+    let profile = policies.profile("engineer", "db");
+    let ctx = Context {
+        catalog: &catalog,
+        assignments: &assignments,
+        policies: &policies,
+        profile: &profile,
+        search_path: vec!["public".into()],
+    };
+    for (sql, expected) in [
+        (
+            "SELECT * FROM users WHERE ssn = $1",
+            vec!["public.users.email"],
+        ),
+        ("SELECT ssn FROM user_ssns", vec![]),
+        (
+            "SELECT s.*, upper(u.ssn) FROM (SELECT * FROM orders) s, users u",
+            vec![],
+        ),
+    ] {
+        let Outcome::Rewritten { masked, .. } = analyze(sql, &ctx) else {
+            panic!("{sql}: a rewrite");
+        };
+        let expected: std::collections::BTreeSet<String> =
+            expected.into_iter().map(str::to_owned).collect();
+        assert_eq!(masked, expected, "{sql}");
+    }
+}
+
 /// Every corpus row.
 fn corpus() -> Vec<Case> {
     [

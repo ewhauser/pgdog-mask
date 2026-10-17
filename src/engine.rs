@@ -1,5 +1,5 @@
 //! Plugin state: configuration, schemas, caches, and statement decisions.
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -708,7 +708,7 @@ fn outcome_decision(
             log_decision(
                 user,
                 original,
-                &format!("masked {masked:?}"),
+                &rewrite_what(&masked),
                 Decision::Rewrite(sql, settings.results(&results)),
                 shadow,
             )
@@ -732,6 +732,11 @@ fn denied(reason: String) -> Deny {
     }
 }
 
+/// What a rewrite masked, for its log message.
+fn rewrite_what(masked: &BTreeSet<String>) -> String {
+    format!("masked {masked:?}")
+}
+
 /// Log a decision. Statements are logged normalized, with literals replaced by
 /// placeholders, so searched values never end up in logs. Rewrites and result
 /// masks apply to every statement of masked users and are logged at debug,
@@ -743,12 +748,11 @@ fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: b
     if level == Level::DEBUG && !enabled!(Level::DEBUG) {
         return decision;
     }
-    if let Some((level, message)) = decision_log(user, sql, what, &decision, shadow) {
-        match level {
-            Level::WARN => warn!("{message}"),
-            Level::INFO => info!("{message}"),
-            _ => debug!("{message}"),
-        }
+    let message = decision_message(user, sql, what, &decision, shadow);
+    match level {
+        Level::WARN => warn!("{message}"),
+        Level::INFO => info!("{message}"),
+        _ => debug!("{message}"),
     }
     decision
 }
@@ -763,21 +767,20 @@ fn log_level(decision: &Decision, shadow: bool) -> Option<Level> {
     }
 }
 
-/// What [`log_decision`] logs, and at which level.
-fn decision_log(
+/// What [`log_decision`] logs.
+fn decision_message(
     user: &str,
     sql: &str,
     what: &str,
     decision: &Decision,
     shadow: bool,
-) -> Option<(Level, String)> {
-    let level = log_level(decision, shadow)?;
+) -> String {
     let prefix = if shadow {
         "[pgdog_mask] (shadow)"
     } else {
         "[pgdog_mask]"
     };
-    let message = match decision {
+    match decision {
         Decision::Continue(results) => {
             let verb = if shadow { "would mask" } else { "masked" };
             format!(
@@ -802,8 +805,7 @@ fn decision_log(
             "{prefix} blocked statement for user \"{user}\": {reason} [{what}{}]",
             normalized(sql)
         ),
-    };
-    Some((level, message))
+    }
 }
 
 /// The statement with literals replaced by placeholders.
@@ -1314,7 +1316,10 @@ policy = "ssn"
         );
         let log = |sql: &str, shadow_mode: bool| {
             let decision = decide(&shadow, "engineer", sql);
-            decision_log("engineer", sql, "", &decision, shadow_mode)
+            log_level(&decision, shadow_mode).map(|level| {
+                let message = decision_message("engineer", sql, "", &decision, shadow_mode);
+                (level, message)
+            })
         };
 
         let computed = "SELECT upper(ssn) FROM users";
@@ -1342,15 +1347,28 @@ policy = "ssn"
         assert_eq!(log("SELECT id FROM orders", true), None);
         assert_eq!(log("SELECT id FROM orders", false), None);
 
-        // Rewrites say how their results are masked; literals never show.
+        // Rewrites say which SQL-masked columns they rewrote (proxy-masked
+        // ones aren't), and how their results are masked; literals never show.
         let sql = "SELECT * FROM users WHERE ssn = '123-45-6789'";
         let decision = decide(&shadow, "engineer", sql);
+        let settings = shadow.settings.load();
+        let profile = settings.profile("engineer", "db");
+        let databases = shadow.databases.load();
+        let database = &databases["db"];
+        let ctx = Context {
+            catalog: &database.catalog,
+            assignments: &database.assignments,
+            policies: &settings.policies,
+            profile: &profile,
+            search_path: vec!["public".into()],
+        };
+        let Some(Outcome::Rewritten { masked, .. }) = analyzer::analyze_shape(sql, &ctx) else {
+            panic!("a rewrite");
+        };
+        assert_eq!(log_level(&decision, true), Some(Level::INFO));
         assert_eq!(
-            decision_log("engineer", sql, "masked {\"public.users.email\"}", &decision, true),
-            Some((
-                Level::INFO,
-                "[pgdog_mask] (shadow) would rewrite statement for user \"engineer\", masked {\"public.users.email\"}, results: 1 proxy, 0 NULL, errors redacted: yes: SELECT * FROM users WHERE ssn = $1".into()
-            ))
+            decision_message("engineer", sql, &rewrite_what(&masked), &decision, true),
+            "[pgdog_mask] (shadow) would rewrite statement for user \"engineer\", masked {\"public.users.email\"}, results: 1 proxy, 0 NULL, errors redacted: yes: SELECT * FROM users WHERE ssn = $1"
         );
         let (level, message) = log("UPDATE users SET name = ssn WHERE id = 7", false).unwrap();
         assert_eq!(level, Level::WARN);

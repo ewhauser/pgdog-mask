@@ -73,7 +73,8 @@ pub enum Outcome {
     /// Send this SQL instead.
     Rewritten {
         sql: String,
-        /// Masked columns, as `schema.table.column`.
+        /// SQL-masked columns rewritten in the statement, as
+        /// `schema.table.column`. Proxy-masked columns aren't rewritten.
         masked: BTreeSet<String>,
         raw: BTreeSet<String>,
         touches_masked: bool,

@@ -133,10 +133,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         taint
     }
 
-    /// A proxy-masked column is read.
+    /// A proxy-masked column is read. References to it aren't rewritten, so
+    /// it isn't one of the `masked` columns.
     pub(super) fn read_proxy(&mut self, label: String) {
         self.state.reads_proxies = true;
-        self.masked.insert(label.clone());
         self.state.proxy_labels.insert(label);
     }
 
