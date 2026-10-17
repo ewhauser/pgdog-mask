@@ -175,6 +175,9 @@ impl Catalog {
                     plugin::RelationKind::View => RelationKind::View,
                     plugin::RelationKind::MaterializedView => RelationKind::MaterializedView,
                     plugin::RelationKind::Other => RelationKind::Other,
+                    // A kind added after this plugin was built: assume it holds
+                    // data, so its columns are tagged and masked like a table's.
+                    _ => RelationKind::Table,
                 };
                 let columns = relation
                     .columns
@@ -387,63 +390,32 @@ mod test {
 
     #[test]
     fn test_from_plugin() {
-        let catalog = plugin::Catalog {
-            parts: CatalogParts::ALL,
-            search_path: vec!["$user".into(), "public".into()],
-            relations: vec![
-                plugin::Relation {
-                    schema: "public".into(),
-                    name: "users".into(),
-                    kind: plugin::RelationKind::Table,
-                    columns: vec![
-                        plugin::Column {
-                            name: "id".into(),
-                            data_type: "bigint".into(),
-                            ..Default::default()
-                        },
-                        plugin::Column {
-                            name: "ssn".into(),
-                            data_type: "text".into(),
-                            type_name: "text".into(),
-                            comment: Some("pgdog:tag=pii.ssn".into()),
-                            security_labels: vec![plugin::SecurityLabel {
-                                provider: "pgdog".into(),
-                                label: "pii.ssn".into(),
-                            }],
-                            ..Default::default()
-                        },
-                    ],
-                    parent: None,
-                    definition: None,
-                    options: vec![],
-                },
-                plugin::Relation {
-                    schema: "public".into(),
-                    name: "user_ssns".into(),
-                    kind: plugin::RelationKind::View,
-                    columns: vec![],
-                    parent: None,
-                    definition: Some(" SELECT users.ssn FROM public.users;".into()),
-                    options: vec!["security_barrier=true".into()],
-                },
-            ],
-            functions: vec![plugin::Function {
-                oid: 10,
-                schema: "public".into(),
-                name: "last4".into(),
-                kind: "function".into(),
-                argument_types: vec!["text".into()],
-                argument_names: vec!["value".into()],
-                return_type: "text".into(),
-                language: "sql".into(),
-                source: "SELECT right(value, 4)".into(),
-                volatility: "immutable".into(),
-                strict: true,
-                ..Default::default()
-            }],
-            system_functions: vec!["lower".into(), "right".into()],
-            operators: vec![],
-        };
+        let mut ssn = plugin::Column::new("ssn", "text");
+        ssn.type_name = "text".into();
+        ssn.comment = Some("pgdog:tag=pii.ssn".into());
+        ssn.security_labels = vec![plugin::SecurityLabel::new("pgdog", "pii.ssn")];
+        let mut users = plugin::Relation::new("public", "users", plugin::RelationKind::Table);
+        users.columns = vec![plugin::Column::new("id", "bigint"), ssn];
+
+        let mut view = plugin::Relation::new("public", "user_ssns", plugin::RelationKind::View);
+        view.definition = Some(" SELECT users.ssn FROM public.users;".into());
+        view.options = vec!["security_barrier=true".into()];
+
+        let mut last4 = plugin::Function::new(10, "public", "last4");
+        last4.kind = "function".into();
+        last4.argument_types = vec!["text".into()];
+        last4.argument_names = vec!["value".into()];
+        last4.return_type = "text".into();
+        last4.language = "sql".into();
+        last4.source = "SELECT right(value, 4)".into();
+        last4.volatility = "immutable".into();
+        last4.strict = true;
+
+        let mut catalog = plugin::Catalog::new(CatalogParts::ALL);
+        catalog.search_path = vec!["$user".into(), "public".into()];
+        catalog.relations = vec![users, view];
+        catalog.functions = vec![last4];
+        catalog.system_functions = vec!["lower".into(), "right".into()];
         let catalog = Catalog::from_plugin(&catalog);
         assert!(catalog.full);
         let users = catalog.resolve(None, "users", &["public".into()]).unwrap();
@@ -473,10 +445,7 @@ mod test {
     #[test]
     fn test_partial_catalog() {
         // Without every part, views and functions can't be analyzed.
-        let catalog = Catalog::from_plugin(&plugin::Catalog {
-            parts: CatalogParts::COLUMNS,
-            ..Default::default()
-        });
+        let catalog = Catalog::from_plugin(&plugin::Catalog::new(CatalogParts::COLUMNS));
         assert!(!catalog.full);
     }
 }

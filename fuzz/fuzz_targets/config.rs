@@ -66,14 +66,11 @@ fuzz_target!(|data: &[u8]| {
     engine.catalog(DATABASE, &CATALOG);
 
     let fields = [
-        ErrorField {
-            code: field::SQLSTATE,
-            value: "23514".into(),
-        },
-        ErrorField {
-            code: field::DETAIL,
-            value: "Failing row contains (1, 123-45-6789).".into(),
-        },
+        ErrorField::new(field::SQLSTATE, "23514".into()),
+        ErrorField::new(
+            field::DETAIL,
+            "Failing row contains (1, 123-45-6789).".into(),
+        ),
     ];
     let error = ErrorFields::new(false, &fields);
 

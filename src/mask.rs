@@ -119,9 +119,43 @@ pub enum Mask {
     },
 }
 
+/// A SQL mask's parts, borrowed.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlMask<'a> {
+    /// SQL expression over `val` and the policy arguments.
+    pub template: &'a str,
+    /// Operators usable on the raw value in predicates.
+    pub raw_search: &'a HashSet<SearchOp>,
+}
+
 impl Mask {
     pub fn is_masked(&self) -> bool {
         matches!(self, Self::Masked { .. })
+    }
+
+    /// The SQL mask, if the column is masked. For proxy masks, it's the
+    /// fallback.
+    pub fn sql(&self) -> Option<SqlMask<'_>> {
+        match self {
+            Self::Unmasked => None,
+            Self::Masked {
+                template,
+                raw_search,
+                ..
+            } => Some(SqlMask {
+                template,
+                raw_search,
+            }),
+        }
+    }
+
+    /// Index of the proxy mask in [`crate::profile::Policies::proxies`], if
+    /// the column is proxy-masked.
+    pub fn proxy(&self) -> Option<usize> {
+        match self {
+            Self::Unmasked => None,
+            Self::Masked { proxy, .. } => *proxy,
+        }
     }
 }
 
@@ -340,6 +374,35 @@ fill = "#"
             "left(val, 0) || repeat('#', greatest(length(val) - 4, 0)) || right(val, 4)"
         );
         assert!(raw_search.is_empty());
+    }
+
+    #[test]
+    fn test_accessors() {
+        let p = policy(
+            r#"
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "partial"
+keep_suffix = 4
+
+[[policies.rules]]
+roles = ["admin"]
+mask = "none"
+"#,
+        );
+        let mask = compile(&p, &p.mask_spec()).unwrap();
+        assert!(mask.is_masked());
+        let sql = mask.sql().expect("a SQL mask");
+        assert!(sql.template.contains("right(val, 4)"), "{}", sql.template);
+        assert!(sql.raw_search.is_empty());
+        assert_eq!(mask.proxy(), None);
+
+        let none = compile(&p, &p.rules[0].mask_spec()).unwrap();
+        assert_eq!(none, Mask::Unmasked);
+        assert!(!none.is_masked());
+        assert!(none.sql().is_none());
+        assert_eq!(none.proxy(), None);
     }
 
     #[test]

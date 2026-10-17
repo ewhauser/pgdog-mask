@@ -435,15 +435,11 @@ impl Engine {
 
             match (self.decide(session, sql, &settings, profile), mode) {
                 (Decision::Continue(proxies), Mode::Enforce) if !proxies.is_empty() => {
-                    Verdict::Rewrite {
-                        sql: sql.to_owned(),
-                        columns: proxies.to_vec(),
-                    }
+                    Verdict::rewrite_masked(sql, proxies.to_vec()).redact_errors(false)
                 }
-                (Decision::Rewrite(sql, proxies), Mode::Enforce) => Verdict::Rewrite {
-                    sql,
-                    columns: proxies.to_vec(),
-                },
+                (Decision::Rewrite(sql, proxies), Mode::Enforce) => {
+                    Verdict::rewrite_masked(sql, proxies.to_vec()).redact_errors(false)
+                }
                 (Decision::Block(reason), Mode::Enforce) => Verdict::Deny(denied(reason)),
                 // Shadow mode: decisions are logged when they're made.
                 _ => Verdict::Allow,
@@ -744,11 +740,7 @@ mod test {
     use crate::analyzer::test::{CONFIG, catalog};
 
     fn session(user: &str) -> Session<'_> {
-        Session {
-            user: user.into(),
-            database: "db".into(),
-            ..Default::default()
-        }
+        Session::new(user.into(), "db".into())
     }
 
     fn engine(config: &str) -> Engine {
@@ -968,18 +960,9 @@ mod test {
     #[test]
     fn test_redact_error() {
         let fields = [
-            ErrorField {
-                code: field::SQLSTATE,
-                value: "23514".into(),
-            },
-            ErrorField {
-                code: field::MESSAGE,
-                value: "check".into(),
-            },
-            ErrorField {
-                code: field::DETAIL,
-                value: "Failing row contains (1, secret).".into(),
-            },
+            ErrorField::new(field::SQLSTATE, "23514".into()),
+            ErrorField::new(field::MESSAGE, "check".into()),
+            ErrorField::new(field::DETAIL, "Failing row contains (1, secret).".into()),
         ];
         let error = ErrorFields::new(false, &fields);
 
@@ -1060,7 +1043,7 @@ policy = "ssn"
         );
         engine.databases.store(Arc::new(databases));
 
-        let Verdict::Rewrite { sql, columns } =
+        let Verdict::Rewrite { sql, columns, .. } =
             engine.statement(&session("anonymous"), "SELECT id, ssn FROM users")
         else {
             panic!("rewrite");

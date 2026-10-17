@@ -229,46 +229,44 @@ impl RelationInput {
             RelationKind::ForeignTable,
             RelationKind::Other,
         ];
-        Relation {
-            schema: self.schema.get(SCHEMAS),
-            name: self.name.get(RELATIONS),
-            kind: kinds[self.kind as usize % kinds.len()],
-            columns: self
-                .columns
-                .iter()
-                .take(MAX_ITEMS)
-                .map(ColumnInput::build)
-                .collect(),
-            parent: self
-                .parent
-                .as_ref()
-                .map(|(schema, name)| (schema.get(SCHEMAS), name.get(RELATIONS))),
-            definition: self.definition.as_ref().map(|d| d.text(DEFINITIONS)),
-            options: names(&self.options, OPTIONS),
-        }
+        let mut relation = Relation::new(
+            self.schema.get(SCHEMAS),
+            self.name.get(RELATIONS),
+            kinds[self.kind as usize % kinds.len()],
+        );
+        relation.columns = self
+            .columns
+            .iter()
+            .take(MAX_ITEMS)
+            .map(ColumnInput::build)
+            .collect();
+        relation.parent = self
+            .parent
+            .as_ref()
+            .map(|(schema, name)| (schema.get(SCHEMAS), name.get(RELATIONS)));
+        relation.definition = self.definition.as_ref().map(|d| d.text(DEFINITIONS));
+        relation.options = names(&self.options, OPTIONS);
+        relation
     }
 }
 
 impl ColumnInput {
     fn build(&self) -> Column {
         let data_type = self.data_type.get(DATA_TYPES);
-        Column {
-            name: self.name.get(COLUMNS),
-            type_name: data_type.clone(),
-            type_oid: self.type_oid.unwrap_or_else(|| type_oid(&data_type)),
-            data_type,
-            is_primary_key: self.is_primary_key,
-            comment: self.comment.as_ref().map(|c| c.text(COMMENTS)),
-            security_labels: self
-                .labels
-                .iter()
-                .take(MAX_ITEMS)
-                .map(|(provider, label)| SecurityLabel {
-                    provider: provider.get(PROVIDERS),
-                    label: label.text(LABELS),
-                })
-                .collect(),
-        }
+        let mut column = Column::new(self.name.get(COLUMNS), data_type.clone());
+        column.type_oid = self.type_oid.unwrap_or_else(|| type_oid(&data_type));
+        column.type_name = data_type;
+        column.is_primary_key = self.is_primary_key;
+        column.comment = self.comment.as_ref().map(|c| c.text(COMMENTS));
+        column.security_labels = self
+            .labels
+            .iter()
+            .take(MAX_ITEMS)
+            .map(|(provider, label)| {
+                SecurityLabel::new(provider.get(PROVIDERS), label.text(LABELS))
+            })
+            .collect();
+        column
     }
 }
 
@@ -277,76 +275,75 @@ impl FunctionInput {
         let arguments = &self.arguments[..self.arguments.len().min(MAX_ITEMS)];
         let outputs = &self.outputs[..self.outputs.len().min(MAX_ITEMS)];
         let return_type = self.return_type.get(DATA_TYPES);
-        Function {
-            oid: self.oid.into(),
-            schema: self.schema.get(SCHEMAS),
-            name: self.name.get(FUNCTIONS),
-            kind: self.kind.get(KINDS),
-            argument_types: arguments.iter().map(|(_, t)| t.get(DATA_TYPES)).collect(),
-            argument_names: arguments.iter().map(|(n, _)| n.get(COLUMNS)).collect(),
-            argument_defaults: self.argument_defaults.into(),
-            variadic: self.variadic,
-            result: return_type.clone(),
-            return_type,
-            returns_set: self.returns_set,
-            output_names: outputs.iter().map(|(n, _)| n.get(COLUMNS)).collect(),
-            output_types: outputs.iter().map(|(_, t)| t.get(DATA_TYPES)).collect(),
-            language: self.language.get(LANGUAGES),
-            source: self.source.text(SOURCES),
-            sql_body: self.sql_body.as_ref().map(|b| b.text(BODIES)),
-            volatility: self.volatility.get(VOLATILITIES),
-            security_definer: self.security_definer,
-            strict: self.strict,
-            config: vec![],
-            extension: self.extension.clone(),
-        }
+        let mut function = Function::new(
+            self.oid.into(),
+            self.schema.get(SCHEMAS),
+            self.name.get(FUNCTIONS),
+        );
+        function.kind = self.kind.get(KINDS);
+        function.argument_types = arguments.iter().map(|(_, t)| t.get(DATA_TYPES)).collect();
+        function.argument_names = arguments.iter().map(|(n, _)| n.get(COLUMNS)).collect();
+        function.argument_defaults = self.argument_defaults.into();
+        function.variadic = self.variadic;
+        function.result = return_type.clone();
+        function.return_type = return_type;
+        function.returns_set = self.returns_set;
+        function.output_names = outputs.iter().map(|(n, _)| n.get(COLUMNS)).collect();
+        function.output_types = outputs.iter().map(|(_, t)| t.get(DATA_TYPES)).collect();
+        function.language = self.language.get(LANGUAGES);
+        function.source = self.source.text(SOURCES);
+        function.sql_body = self.sql_body.as_ref().map(|b| b.text(BODIES));
+        function.volatility = self.volatility.get(VOLATILITIES);
+        function.security_definer = self.security_definer;
+        function.strict = self.strict;
+        function.extension = self.extension.clone();
+        function
     }
 }
 
 impl OperatorInput {
     fn build(&self) -> Operator {
-        Operator {
-            oid: self.oid.into(),
-            schema: self.schema.get(SCHEMAS),
-            name: self.name.get(OPERATORS),
-            left_type: self.left_type.as_ref().map(|t| t.get(DATA_TYPES)),
-            right_type: self.right_type.as_ref().map(|t| t.get(DATA_TYPES)),
-            result_type: "boolean".into(),
-            function_oid: self.function_oid.into(),
-            function_schema: self.function_schema.get(SCHEMAS),
-            function_name: self.function_name.get(FUNCTIONS),
-        }
+        let mut operator = Operator::new(
+            self.oid.into(),
+            self.schema.get(SCHEMAS),
+            self.name.get(OPERATORS),
+        );
+        operator.left_type = self.left_type.as_ref().map(|t| t.get(DATA_TYPES));
+        operator.right_type = self.right_type.as_ref().map(|t| t.get(DATA_TYPES));
+        operator.result_type = "boolean".into();
+        operator.function_oid = self.function_oid.into();
+        operator.function_schema = self.function_schema.get(SCHEMAS);
+        operator.function_name = self.function_name.get(FUNCTIONS);
+        operator
     }
 }
 
 fuzz_target!(|input: Input| {
-    let catalog = Catalog {
-        parts: if input.full {
-            CatalogParts::ALL
-        } else {
-            CatalogParts::NONE
-        },
-        search_path: names(&input.search_path, SCHEMAS),
-        relations: input
-            .relations
-            .iter()
-            .take(MAX_ITEMS)
-            .map(RelationInput::build)
-            .collect(),
-        functions: input
-            .functions
-            .iter()
-            .take(MAX_ITEMS)
-            .map(FunctionInput::build)
-            .collect(),
-        system_functions: system_functions(),
-        operators: input
-            .operators
-            .iter()
-            .take(MAX_ITEMS)
-            .map(OperatorInput::build)
-            .collect(),
-    };
+    let mut catalog = Catalog::new(if input.full {
+        CatalogParts::ALL
+    } else {
+        CatalogParts::NONE
+    });
+    catalog.search_path = names(&input.search_path, SCHEMAS);
+    catalog.relations = input
+        .relations
+        .iter()
+        .take(MAX_ITEMS)
+        .map(RelationInput::build)
+        .collect();
+    catalog.functions = input
+        .functions
+        .iter()
+        .take(MAX_ITEMS)
+        .map(FunctionInput::build)
+        .collect();
+    catalog.system_functions = system_functions();
+    catalog.operators = input
+        .operators
+        .iter()
+        .take(MAX_ITEMS)
+        .map(OperatorInput::build)
+        .collect();
 
     let plugin = plugin();
     let before = plugin.generation();

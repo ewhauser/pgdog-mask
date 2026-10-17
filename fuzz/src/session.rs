@@ -71,12 +71,8 @@ impl Owned {
     }
 
     pub fn session(&self) -> Session<'_> {
-        Session {
-            user: self.user.as_str().into(),
-            database: self.database.as_str().into(),
-            search_path: self.search_path.as_str().into(),
-            ..Default::default()
-        }
+        Session::new(self.user.as_str().into(), self.database.as_str().into())
+            .with_search_path(self.search_path.as_str().into())
     }
 
     pub fn exempt(&self) -> bool {

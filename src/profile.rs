@@ -188,6 +188,9 @@ impl Policies {
             // The policy for unresolved tags masks everyone; users that no
             // configured policy masks are still exempt.
             exempt: !masks[..self.unresolved].iter().any(Mask::is_masked),
+            proxies: masks[..self.unresolved]
+                .iter()
+                .any(|mask| mask.proxy().is_some()),
             hash: hasher.finish(),
             masks,
         }
@@ -203,6 +206,8 @@ pub struct Profile {
     pub hash: u64,
     /// No policy masks anything for this user.
     pub exempt: bool,
+    /// Some policy masks this user's results with a proxy mask.
+    pub proxies: bool,
 }
 
 /// A masked column's policy.
@@ -594,6 +599,7 @@ impl Assignments {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::proxy::{Datum, MaskError};
 
     const CONFIG: &str = r#"
 [[users]]
@@ -634,6 +640,55 @@ keep_suffix = 4
         assert_ne!(support.hash, anonymous.hash);
         assert_ne!(support.masks, anonymous.masks);
         assert_eq!(policies.profile("support", "db").hash, support.hash);
+    }
+
+    struct Stub;
+
+    impl ProxyMask for Stub {
+        fn accepts(&self, _data_type: &str) -> bool {
+            true
+        }
+
+        fn mask(&self, value: Datum) -> Result<Datum, MaskError> {
+            Ok(value)
+        }
+    }
+
+    #[test]
+    fn test_profile_proxies() {
+        let config = r#"
+[[users]]
+name = "admin"
+roles = ["pii_admin"]
+
+[[policies]]
+name = "ssn"
+data_type = "text"
+mask = "proxy"
+proxy = "test.stub"
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+"#;
+        let mut registry = Registry::default();
+        registry.register("test.stub", |_: &Options| Ok(Stub));
+        let policies =
+            Policies::with_registry(Config::from_toml(config).unwrap(), &registry).unwrap();
+        assert_eq!(policies.proxies.len(), 1);
+
+        let anonymous = policies.profile("anonymous", "db");
+        assert_eq!(anonymous.masks[0].proxy(), Some(0));
+        assert!(anonymous.proxies);
+        let admin = policies.profile("admin", "db");
+        assert!(admin.exempt);
+        assert!(!admin.proxies);
+
+        // SQL masks only.
+        let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+        for user in ["anonymous", "support", "admin"] {
+            assert!(!policies.profile(user, "db").proxies, "{user}");
+        }
     }
 
     const TAGS: &str = r#"

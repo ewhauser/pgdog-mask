@@ -44,10 +44,7 @@ fuzz_target!(|input: Input| {
         .collect();
     let error_fields: Vec<ErrorField<'_>> = fields
         .iter()
-        .map(|(code, value)| ErrorField {
-            code: *code,
-            value: value.as_str().into(),
-        })
+        .map(|(code, value)| ErrorField::new(*code, value.as_str().into()))
         .collect();
     let error = ErrorFields::new(input.notice, &error_fields);
 

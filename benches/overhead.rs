@@ -81,22 +81,12 @@ policy = "tax_id"
 "#;
 
 fn relation(name: &str, columns: &[(&str, &str)]) -> Relation {
-    Relation {
-        schema: "public".into(),
-        name: name.into(),
-        kind: RelationKind::Table,
-        columns: columns
-            .iter()
-            .map(|(column, data_type)| Column {
-                name: (*column).into(),
-                data_type: (*data_type).into(),
-                ..Default::default()
-            })
-            .collect(),
-        parent: None,
-        definition: None,
-        options: vec![],
-    }
+    let mut relation = Relation::new("public", name, RelationKind::Table);
+    relation.columns = columns
+        .iter()
+        .map(|(column, data_type)| Column::new(*column, *data_type))
+        .collect();
+    relation
 }
 
 fn catalog() -> Catalog {
@@ -112,45 +102,43 @@ fn catalog() -> Catalog {
     let mut payments = relation("payments", &[("id", "bigint"), ("tax_id", "text")]);
     payments.columns[1].type_oid = 25;
 
-    Catalog {
-        parts: CatalogParts::ALL,
-        search_path: vec!["$user".into(), "public".into()],
-        relations: vec![
-            relation(
-                "pgbench_accounts",
-                &[
-                    ("aid", "integer"),
-                    ("bid", "integer"),
-                    ("abalance", "integer"),
-                    ("filler", "character"),
-                ],
-            ),
-            relation(
-                "pgbench_branches",
-                &[
-                    ("bid", "integer"),
-                    ("bbalance", "integer"),
-                    ("filler", "character"),
-                ],
-            ),
-            relation("customers", &customers),
-            payments,
-            relation(
-                "orders",
-                &[
-                    ("id", "bigint"),
-                    ("customer_id", "bigint"),
-                    ("total", "numeric"),
-                    ("created_at", "timestamp with time zone"),
-                ],
-            ),
-        ],
-        system_functions: include_str!("../src/analyzer/test_builtin_functions.txt")
-            .lines()
-            .map(str::to_owned)
-            .collect(),
-        ..Default::default()
-    }
+    let mut catalog = Catalog::new(CatalogParts::ALL);
+    catalog.search_path = vec!["$user".into(), "public".into()];
+    catalog.relations = vec![
+        relation(
+            "pgbench_accounts",
+            &[
+                ("aid", "integer"),
+                ("bid", "integer"),
+                ("abalance", "integer"),
+                ("filler", "character"),
+            ],
+        ),
+        relation(
+            "pgbench_branches",
+            &[
+                ("bid", "integer"),
+                ("bbalance", "integer"),
+                ("filler", "character"),
+            ],
+        ),
+        relation("customers", &customers),
+        payments,
+        relation(
+            "orders",
+            &[
+                ("id", "bigint"),
+                ("customer_id", "bigint"),
+                ("total", "numeric"),
+                ("created_at", "timestamp with time zone"),
+            ],
+        ),
+    ];
+    catalog.system_functions = include_str!("../src/analyzer/test_builtin_functions.txt")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    catalog
 }
 
 const POINT: &str = "SELECT abalance FROM pgbench_accounts WHERE aid = $1";
@@ -160,11 +148,7 @@ const PROXY: &str = "SELECT id, tax_id FROM payments";
 const ORM: &str = r#"SELECT "customers".* FROM "customers" INNER JOIN "orders" ON "orders"."customer_id" = "customers"."id" WHERE "customers"."id" IN ($1, $2, $3) AND "orders"."created_at" > $4 AND ("customers"."email" ILIKE $5 OR "customers"."ssn" = $6) ORDER BY "customers"."created_at" DESC LIMIT $7 OFFSET $8"#;
 
 fn session(user: &str) -> Session<'_> {
-    Session {
-        user: user.into(),
-        database: "bench".into(),
-        ..Default::default()
-    }
+    Session::new(user.into(), "bench".into())
 }
 
 fn engine() -> Engine {
