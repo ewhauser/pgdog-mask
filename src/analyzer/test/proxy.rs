@@ -2207,6 +2207,27 @@ fn multi_statement() -> Vec<Case> {
             "DROP TABLE archive; SELECT ssn FROM users",
             Block("name resolution"),
         ),
+        // Redaction depends on the relation COPY FROM, VACUUM and ANALYZE name.
+        case(
+            "S17",
+            "DROP TABLE archive; COPY users FROM STDIN",
+            Block("name resolution"),
+        ),
+        case(
+            "S17",
+            "DROP TABLE archive; VACUUM users",
+            Block("name resolution"),
+        ),
+        case(
+            "S17",
+            "DROP TABLE archive; ANALYZE users",
+            Block("name resolution"),
+        ),
+        case(
+            "S17",
+            "CREATE TABLE t2 (id int); VACUUM",
+            Same(vec![], true),
+        ),
         // The form PgDog tracks.
         case(
             "S18",

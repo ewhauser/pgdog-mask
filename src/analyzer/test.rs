@@ -1719,7 +1719,12 @@ fn test_search_path_change() {
         "EXPLAIN EXECUTE p(1)",
         "SELECT 'a' === 'b'",
         "COPY orders TO STDOUT",
+        "COPY orders FROM STDIN",
+        "VACUUM orders",
+        "ANALYZE orders",
+        "VACUUM ANALYZE orders",
         "TRUNCATE orders",
+        "LOCK orders",
         "CREATE TABLE t (id int)",
         "ALTER TABLE orders ADD COLUMN x int",
         "SELECT ssn FROM user_ssns",
@@ -1808,6 +1813,8 @@ fn test_search_path_change() {
         "CREATE TABLE t2 (id int); SELECT 1",
         "SET statement_timeout TO 1000; SELECT id FROM orders",
         "DISCARD TEMP; SELECT id FROM orders",
+        // Without a list, VACUUM names nothing.
+        "CREATE TABLE t2 (id int); VACUUM",
     ] {
         unchanged("anonymous", sql);
     }

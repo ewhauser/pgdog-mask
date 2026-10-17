@@ -36,6 +36,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             }
             _ => return,
         };
+        // Postgres resolves the names with the new path.
+        if !range_vars.is_empty() && self.path_changed {
+            self.block(RESOLUTION_CHANGED);
+            return;
+        }
         for range_var in range_vars {
             if self.resolves_to_proxy_relation(range_var) {
                 self.state.touches_proxies = true;
@@ -232,6 +237,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
     /// COPY: `COPY t TO` reads the table's columns as a query would.
     pub(super) fn copy_stmt(&mut self, mut node: nodes::CopyStmtMut<'mem, '_>) {
+        // Postgres resolves the name with the new path.
+        if self.path_changed && node.relation().is_some() {
+            self.block(RESOLUTION_CHANGED);
+            return;
+        }
         if node.is_from {
             // Triggers and constraints of the table see real values.
             if node
@@ -251,10 +261,6 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if let Some(range_var) = node.relation()
             && let Some(name) = range_var.relname()
         {
-            if self.path_changed {
-                self.block(RESOLUTION_CHANGED);
-                return;
-            }
             let Some(relation) = self.resolve_relation(range_var.schemaname(), name) else {
                 if self.ctx.policies.config.general.on_unresolved == OnUnresolved::Block {
                     self.block(format!(
