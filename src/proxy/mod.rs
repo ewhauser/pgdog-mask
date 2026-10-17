@@ -55,8 +55,11 @@
 //! options = { offset = 5000 }
 //! fallback = "null"
 //! ```
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use pgdog_plugin::{MaskColumn, MaskOutput};
 
 pub use pgdog_plugin::MaskError;
 pub use pgdog_plugin::types::{DataType, Datum, Format};
@@ -83,6 +86,19 @@ pub trait ProxyMask: Send + Sync {
 
     /// Mask one value. It must return a value of the same type, or NULL.
     fn mask(&self, value: Datum) -> Result<Datum, MaskError>;
+
+    /// Mask one value of a text column, appending the masked text to `out`,
+    /// which is empty. Optional, and faster than [`ProxyMask::mask`]: values
+    /// aren't copied into [`Datum`]s, and `out` is reused across a batch.
+    ///
+    /// Return `None`, the default, to mask text columns with
+    /// [`ProxyMask::mask_batch`] instead. A mask returning `Some` must return
+    /// it for every value, with the text [`ProxyMask::mask`] returns. NULLs
+    /// stay NULL and aren't passed in.
+    fn mask_text(&self, value: &str, out: &mut String) -> Option<Result<(), MaskError>> {
+        let _ = (value, out);
+        None
+    }
 
     /// Mask a batch of values from one column, in row order. NULLs are
     /// [`Datum::Null`]. Override this to batch remote calls; by default, NULLs
@@ -209,6 +225,50 @@ impl Registry {
     }
 }
 
+/// Mask a column of text values with [`ProxyMask::mask_text`]. Returns
+/// false, with nothing written, if the mask doesn't implement it or every
+/// value is NULL: the column then goes through [`ProxyMask::mask_batch`].
+pub(crate) fn mask_text_column(
+    mask: &dyn ProxyMask,
+    column: &MaskColumn<'_>,
+    out: &mut MaskOutput,
+) -> Result<bool, MaskError> {
+    if data_type(column.type_oid) != DataType::Text {
+        return Ok(false);
+    }
+    let mut masked = String::new();
+    // NULLs before the first value, written once the mask has taken it.
+    let mut nulls = 0;
+    let mut started = false;
+    for value in column.values() {
+        let Some(value) = value else {
+            match started {
+                true => out.push(None),
+                false => nulls += 1,
+            }
+            continue;
+        };
+        let value = std::str::from_utf8(value)
+            .map_err(|err| MaskError::new(format!("failed to decode a value: {err}")))?;
+        masked.clear();
+        match mask.mask_text(value, &mut masked) {
+            Some(result) => result?,
+            None if !started => return Ok(false),
+            None => {
+                return Err(MaskError::new(
+                    "mask_text returned None after masking other values",
+                ));
+            }
+        }
+        if !started {
+            (0..nulls).for_each(|_| out.push(None));
+            started = true;
+        }
+        out.push(Some(masked.as_bytes()));
+    }
+    Ok(started)
+}
+
 /// Decode a value of a column of type `type_oid`.
 pub(crate) fn decode(
     value: Option<&[u8]>,
@@ -227,7 +287,7 @@ pub(crate) fn encode(
     value: &Datum,
     type_oid: u32,
     format: Format,
-) -> Result<Option<Vec<u8>>, MaskError> {
+) -> Result<Option<Cow<'_, [u8]>>, MaskError> {
     if value.is_null() {
         return Ok(None);
     }
@@ -238,10 +298,14 @@ pub(crate) fn encode(
             value.data_type()
         )));
     }
-    value
-        .encode(format)
-        .map(|bytes| Some(bytes.to_vec()))
-        .map_err(|err| MaskError::new(format!("failed to encode a value: {err}")))
+    match value {
+        // Text is its own encoding, in both formats.
+        Datum::Text(text) => Ok(Some(Cow::Borrowed(text.as_bytes()))),
+        value => value
+            .encode(format)
+            .map(|bytes| Some(Cow::Owned(bytes.into())))
+            .map_err(|err| MaskError::new(format!("failed to encode a value: {err}"))),
+    }
 }
 
 /// Type of values of a column. Types with the same representation as text
@@ -297,6 +361,82 @@ mod test {
                 .create("missing", &Options::default(), "text")
                 .is_err()
         );
+    }
+
+    /// Reverse, with the text fast path.
+    struct FastReverse;
+
+    impl ProxyMask for FastReverse {
+        fn accepts(&self, _data_type: &str) -> bool {
+            true
+        }
+
+        fn mask(&self, value: Datum) -> Result<Datum, MaskError> {
+            Reverse.mask(value)
+        }
+
+        fn mask_text(&self, value: &str, out: &mut String) -> Option<Result<(), MaskError>> {
+            out.extend(value.chars().rev());
+            Some(Ok(()))
+        }
+    }
+
+    #[test]
+    fn test_mask_text_column() {
+        use pgdog_plugin::{ColumnMask, MaskId, Value};
+
+        let column_of = |type_oid, values| {
+            MaskColumn::new(
+                &ColumnMask::new(0, MaskId(0), type_oid),
+                Format::Text,
+                values,
+            )
+        };
+        let masked = |mask: &dyn ProxyMask, column: &MaskColumn<'_>| {
+            let mut out = MaskOutput::default();
+            let fast = mask_text_column(mask, column, &mut out).unwrap();
+            (fast, format!("{out:?}"))
+        };
+        let values = [
+            Value::new(None),
+            Value::new(Some(b"abc")),
+            Value::new(None),
+            Value::new(Some(b"")),
+            Value::new(Some("d\u{e9}f".as_bytes())),
+        ];
+
+        // Same output as masking through mask_batch.
+        let text = column_of(25, &values);
+        let mut expected = MaskOutput::default();
+        let decoded = text
+            .values()
+            .map(|value| decode(value, 25, Format::Text).unwrap());
+        for value in FastReverse.mask_batch(decoded.collect()).unwrap() {
+            expected.push(encode(&value, 25, Format::Text).unwrap().as_deref());
+        }
+        assert_eq!(masked(&FastReverse, &text), (true, format!("{expected:?}")));
+        assert_eq!(
+            masked(&FastReverse, &column_of(1043, &values)),
+            masked(&FastReverse, &text)
+        );
+
+        // Falls back to mask_batch, with nothing written.
+        let empty = format!("{:?}", MaskOutput::default());
+        assert_eq!(masked(&Reverse, &text), (false, empty.clone()));
+        let nulls = [Value::new(None), Value::new(None)];
+        assert_eq!(
+            masked(&FastReverse, &column_of(25, &nulls)),
+            (false, empty.clone())
+        );
+        assert_eq!(
+            masked(&FastReverse, &column_of(23, &values)),
+            (false, empty)
+        );
+
+        // Not UTF-8.
+        let invalid = [Value::new(Some(b"\xff"))];
+        let mut out = MaskOutput::default();
+        assert!(mask_text_column(&FastReverse, &column_of(25, &invalid), &mut out).is_err());
     }
 
     #[test]

@@ -89,6 +89,17 @@ impl ProxyMask for Tokenize {
 
 The default `mask_batch` keeps NULLs and calls `mask` for every other value. Don't block in a mask that isn't declared `blocking`: it would stall one of PgDog's async workers.
 
+A mask of text columns that computes each value locally, like a keyed hash, can also implement `mask_text`. It gets the text and appends the masked text to a buffer that's reused across the batch, so no `Datum` is allocated per value. Text columns then use it instead of `mask_batch`; NULLs stay NULL. It must give the same text as `mask`:
+
+```rust
+fn mask_text(&self, value: &str, out: &mut String) -> Option<Result<(), MaskError>> {
+    out.extend(value.chars().rev());
+    Some(Ok(()))
+}
+```
+
+The default returns `None`, and values go through `mask_batch`. Leave it that way for masks that batch remote calls.
+
 ## 4. Register and build the plugin
 
 A factory builds the mask from the policy's `options` when the configuration loads:

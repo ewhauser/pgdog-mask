@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use pgdog_mask::config::Config;
 use pgdog_mask::engine::Engine;
 use pgdog_plugin::{
-    Catalog, CatalogParts, Session,
+    Catalog, CatalogParts, MaskBatch, MaskColumn, MaskOutput, Session, Value, Verdict,
     catalog::{Column, Relation, RelationKind},
+    types::Format,
 };
 
 const CONFIG: &str = r#"
@@ -61,6 +62,22 @@ policy = "email"
 name = "customers"
 column = "ssn"
 policy = "ssn"
+
+[[policies]]
+name = "tax_id"
+data_type = "text"
+mask = "proxy"
+proxy = "hmac_sha256"
+options = { key_env = "PGDOG_MASK_BENCH_HMAC_KEY" }
+
+[[policies.rules]]
+roles = ["pii_admin"]
+mask = "none"
+
+[[masked_columns]]
+name = "payments"
+column = "tax_id"
+policy = "tax_id"
 "#;
 
 fn relation(name: &str, columns: &[(&str, &str)]) -> Relation {
@@ -91,6 +108,9 @@ fn catalog() -> Catalog {
     ];
     let extra: Vec<String> = (0..30).map(|i| format!("attr_{i}")).collect();
     customers.extend(extra.iter().map(|c| (c.as_str(), "text")));
+    // Proxy masks need the column's type OID.
+    let mut payments = relation("payments", &[("id", "bigint"), ("tax_id", "text")]);
+    payments.columns[1].type_oid = 25;
 
     Catalog {
         parts: CatalogParts::ALL,
@@ -114,6 +134,7 @@ fn catalog() -> Catalog {
                 ],
             ),
             relation("customers", &customers),
+            payments,
             relation(
                 "orders",
                 &[
@@ -135,6 +156,7 @@ fn catalog() -> Catalog {
 const POINT: &str = "SELECT abalance FROM pgbench_accounts WHERE aid = $1";
 const UNMASKED: &str = "SELECT bid FROM pgbench_accounts WHERE aid = $1";
 const JOIN: &str = "SELECT a.aid, a.bid, a.abalance, b.bbalance FROM pgbench_accounts a JOIN pgbench_branches b ON b.bid = a.bid WHERE a.aid = $1 ORDER BY a.aid LIMIT 10";
+const PROXY: &str = "SELECT id, tax_id FROM payments";
 const ORM: &str = r#"SELECT "customers".* FROM "customers" INNER JOIN "orders" ON "orders"."customer_id" = "customers"."id" WHERE "customers"."id" IN ($1, $2, $3) AND "orders"."created_at" > $4 AND ("customers"."email" ILIKE $5 OR "customers"."ssn" = $6) ORDER BY "customers"."created_at" DESC LIMIT $7 OFFSET $8"#;
 
 fn session(user: &str) -> Session<'_> {
@@ -152,7 +174,7 @@ fn engine() -> Engine {
 }
 
 /// Average time per call.
-fn measure(name: &str, mut f: impl FnMut(u64)) {
+fn measure(name: &str, mut f: impl FnMut(u64)) -> Duration {
     let warmup = Instant::now();
     let mut i = 0;
     while warmup.elapsed() < Duration::from_millis(200) {
@@ -166,9 +188,12 @@ fn measure(name: &str, mut f: impl FnMut(u64)) {
     }
     let per = start.elapsed() / iterations as u32;
     println!("{name:<48} {:>10.2?}/op", per);
+    per
 }
 
 fn main() {
+    // SAFETY: set before the engine reads it, and before any other thread starts.
+    unsafe { std::env::set_var("PGDOG_MASK_BENCH_HMAC_KEY", "bench-hmac-key") };
     let engine = Arc::new(engine());
 
     println!("-- cache hits");
@@ -198,6 +223,24 @@ fn main() {
             black_box(engine.statement(&session("masked"), &sql));
         });
     }
+
+    println!("-- proxy masks");
+    let Verdict::Rewrite { columns, .. } = engine.statement(&session("masked"), PROXY) else {
+        panic!("{PROXY} should have a proxy mask");
+    };
+    let tax_ids: Vec<String> = (0..500).map(|i| format!("TAX-{i:08}")).collect();
+    let values: Vec<Value<'_>> = tax_ids
+        .iter()
+        .map(|tax_id| Value::new(Some(tax_id.as_bytes())))
+        .collect();
+    let batch_columns = [MaskColumn::new(&columns[0], Format::Text, &values)];
+    let batch = MaskBatch::new(values.len() as u32, &batch_columns);
+    let per = measure("hmac_sha256, a batch of 500 values", |_| {
+        let mut out = MaskOutput::default();
+        engine.mask_rows(&batch, &mut out).unwrap();
+        black_box(out);
+    });
+    println!("{:<48} {:>10.2?}/value", "", per / values.len() as u32);
 
     println!("-- building blocks");
     for (name, sql) in [("point", POINT), ("orm", ORM)] {

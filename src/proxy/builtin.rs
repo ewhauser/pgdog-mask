@@ -1,7 +1,7 @@
 //! Built-in proxy masks.
 use aes::{Aes128, Aes192, Aes256};
 use fpe::ff1::{FF1, FlexibleNumeralString};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use super::{Datum, MaskError, Options, ProxyMask, Registry};
@@ -29,7 +29,8 @@ fn text(value: Datum) -> Result<String, MaskError> {
 /// Options: `key_env` or `key_file`; `length`, to keep only the first
 /// `length` hex digits.
 pub struct HmacSha256 {
-    key: Vec<u8>,
+    /// Keyed once: cloning it per value skips the key schedule.
+    mac: Hmac<Sha256>,
     length: Option<usize>,
 }
 
@@ -44,7 +45,24 @@ impl HmacSha256 {
             Some(length @ 1..=64) => Some(length as usize),
             Some(_) => return Err(MaskError::new("length must be between 1 and 64")),
         };
-        Ok(Self { key, length })
+        let mac =
+            Hmac::<Sha256>::new_from_slice(&key).map_err(|err| MaskError::new(err.to_string()))?;
+        Ok(Self { mac, length })
+    }
+
+    /// Append the (truncated) hex digest of `value` to `out`.
+    fn digest(&self, value: &str, out: &mut String) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut mac = self.mac.clone();
+        mac.update(value.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut hex = [0; 64];
+        for (pair, byte) in hex.chunks_exact_mut(2).zip(digest.iter()) {
+            pair[0] = DIGITS[usize::from(byte >> 4)];
+            pair[1] = DIGITS[usize::from(byte & 0xf)];
+        }
+        let hex = &hex[..self.length.unwrap_or(hex.len())];
+        out.push_str(std::str::from_utf8(hex).expect("hex digits are ASCII"));
     }
 }
 
@@ -54,15 +72,14 @@ impl ProxyMask for HmacSha256 {
     }
 
     fn mask(&self, value: Datum) -> Result<Datum, MaskError> {
-        let value = text(value)?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key)
-            .map_err(|err| MaskError::new(err.to_string()))?;
-        mac.update(value.as_bytes());
-        let mut digest = hex::encode(mac.finalize().into_bytes());
-        if let Some(length) = self.length {
-            digest.truncate(length);
-        }
+        let mut digest = String::with_capacity(64);
+        self.digest(&text(value)?, &mut digest);
         Ok(Datum::Text(digest))
+    }
+
+    fn mask_text(&self, value: &str, out: &mut String) -> Option<Result<(), MaskError>> {
+        self.digest(value, out);
+        Some(Ok(()))
     }
 }
 
@@ -189,6 +206,11 @@ mod test {
         let c = mask.mask(Datum::Text("123-45-6780".into())).unwrap();
         assert_eq!(a, b, "deterministic");
         assert_ne!(a, c);
+        // Python: hmac.new(key, b"123-45-6789", hashlib.sha256).hexdigest()
+        assert_eq!(
+            a,
+            Datum::Text("de8dd57a246d43c3ebc4413fb37f58ddcb461ad40dccd386b672ba1cc64acd08".into())
+        );
         let Datum::Text(digest) = a else { panic!() };
         assert_eq!(digest.len(), 64);
 
@@ -197,6 +219,14 @@ mod test {
             panic!()
         };
         assert_eq!(digest.len(), 12);
+        for mask in [&mask, &short] {
+            let mut text = String::new();
+            mask.mask_text("123-45-6789", &mut text).unwrap().unwrap();
+            assert_eq!(
+                mask.mask(Datum::Text("123-45-6789".into())).unwrap(),
+                Datum::Text(text)
+            );
+        }
         assert!(mask.mask(Datum::Integer(1)).is_err());
         assert!(mask.accepts("character varying"));
         assert!(!mask.accepts("bigint"));

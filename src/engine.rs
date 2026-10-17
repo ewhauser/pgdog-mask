@@ -485,6 +485,9 @@ impl Engine {
                 .get(column.mask.0 as usize)
                 .ok_or_else(|| MaskError::new(format!("unknown mask ID {}", column.mask.0)))?;
             let failed = |err: MaskError| MaskError::new(format!("{}: {}", instance.name, err.0));
+            if proxy::mask_text_column(instance.mask.as_ref(), column, out).map_err(failed)? {
+                continue;
+            }
 
             let values = column
                 .values()
