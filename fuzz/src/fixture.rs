@@ -64,9 +64,23 @@ pub const MASKED_FUNCTIONS: &[&str] = &[
     "ssn_eq",
 ];
 
+/// Of [`MASKED_COLUMNS`], those `anonymous` sees through proxy masks:
+/// masked in the results only, read raw by the statement.
+pub const PROXY_COLUMNS: &[(&str, &str)] = &[
+    ("accounts", "token"),
+    ("accounts", "card"),
+    ("accounts", "balance"),
+    ("accounts", "note"),
+];
+
 /// Is this column of this fixture relation masked for `anonymous`?
 pub fn masked(relation: &str, column: &str) -> bool {
     MASKED_COLUMNS.contains(&(relation, column))
+}
+
+/// Is this column of this fixture relation masked by a proxy mask for `anonymous`?
+pub fn proxy_masked(relation: &str, column: &str) -> bool {
+    PROXY_COLUMNS.contains(&(relation, column))
 }
 
 /// Selects every column with a proxy mask, so their masks can be fuzzed.

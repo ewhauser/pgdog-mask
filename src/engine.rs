@@ -212,6 +212,16 @@ impl Results {
     fn is_empty(&self) -> bool {
         self.columns.is_empty() && !self.redact_errors
     }
+
+    /// For logs: `N proxy, M NULL, errors redacted: yes|no`.
+    fn summary(&self) -> String {
+        let nulls = self.columns.iter().filter(|mask| mask.is_null()).count();
+        format!(
+            "{} proxy, {nulls} NULL, errors redacted: {}",
+            self.columns.len() - nulls,
+            if self.redact_errors { "yes" } else { "no" }
+        )
+    }
 }
 
 /// Cached decision for a statement shape.
@@ -499,6 +509,14 @@ impl Engine {
     pub fn mask_rows(&self, batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
         let proxies = self.proxies.load();
         for column in batch.columns() {
+            // PgDog applies NULL masks itself; never mask with whatever has
+            // that ID if one arrives anyway.
+            if column.mask == MaskId::NULL {
+                for _ in column.values() {
+                    out.push(None);
+                }
+                continue;
+            }
             let instance = proxies
                 .get(column.mask.0 as usize)
                 .ok_or_else(|| MaskError::new(format!("unknown mask ID {}", column.mask.0)))?;
@@ -531,19 +549,19 @@ impl Engine {
 
     /// Remove `DETAIL` from the errors and notices masked users get: it can
     /// hold the values of masked columns, e.g. a `CHECK` violation's
-    /// `Failing row contains (1, 123-45-6789, ...)`.
+    /// `Failing row contains (1, 123-45-6789, ...)`. Users with proxy masks
+    /// always lose it, whatever `scrub_error_detail` says: their statements
+    /// read the real values of proxy-masked columns.
     pub fn redact_error(&self, session: &Session<'_>, error: &ErrorFields<'_>) -> Redaction {
         let settings = self.settings.load();
         let general = &settings.policies.config.general;
-        if general.mode != Mode::Enforce
-            || !general.scrub_error_detail
-            || error.get(DETAIL).is_none()
-        {
+        if general.mode != Mode::Enforce || error.get(DETAIL).is_none() {
             return Redaction::Keep;
         }
+        let scrub = general.scrub_error_detail;
 
         Self::with_profile(&settings, session, |profile| {
-            if profile.exempt {
+            if profile.exempt || !(scrub || profile.proxies) {
                 Redaction::Keep
             } else {
                 Redaction::Replace(error.without(&[DETAIL]))
@@ -666,7 +684,13 @@ fn outcome_decision(
                     user, raw
                 );
             }
-            Decision::Continue(settings.results(&results))
+            log_decision(
+                user,
+                original,
+                "",
+                Decision::Continue(settings.results(&results)),
+                shadow,
+            )
         }
         Outcome::Rewritten {
             sql,
@@ -709,38 +733,77 @@ fn denied(reason: String) -> Deny {
 }
 
 /// Log a decision. Statements are logged normalized, with literals replaced by
-/// placeholders, so searched values never end up in logs. Rewrites happen for
-/// every statement of masked users and are logged at debug, except in shadow
-/// mode, where logging them is the point.
+/// placeholders, so searched values never end up in logs. Rewrites and result
+/// masks apply to every statement of masked users and are logged at debug,
+/// except in shadow mode, where logging them is the point.
 fn log_decision(user: &str, sql: &str, what: &str, decision: Decision, shadow: bool) -> Decision {
+    let Some(level) = log_level(&decision, shadow) else {
+        return decision;
+    };
+    if level == Level::DEBUG && !enabled!(Level::DEBUG) {
+        return decision;
+    }
+    if let Some((level, message)) = decision_log(user, sql, what, &decision, shadow) {
+        match level {
+            Level::WARN => warn!("{message}"),
+            Level::INFO => info!("{message}"),
+            _ => debug!("{message}"),
+        }
+    }
+    decision
+}
+
+/// The level a decision is logged at, `None` if it isn't logged.
+fn log_level(decision: &Decision, shadow: bool) -> Option<Level> {
+    match decision {
+        Decision::Continue(results) if results.is_empty() => None,
+        Decision::Block(_) => Some(Level::WARN),
+        _ if shadow => Some(Level::INFO),
+        _ => Some(Level::DEBUG),
+    }
+}
+
+/// What [`log_decision`] logs, and at which level.
+fn decision_log(
+    user: &str,
+    sql: &str,
+    what: &str,
+    decision: &Decision,
+    shadow: bool,
+) -> Option<(Level, String)> {
+    let level = log_level(decision, shadow)?;
     let prefix = if shadow {
         "[pgdog_mask] (shadow)"
     } else {
         "[pgdog_mask]"
     };
-    match &decision {
-        Decision::Rewrite(..) => {
-            if shadow {
-                info!(
-                    "{prefix} would rewrite statement for user \"{user}\", {what}: {}",
-                    normalized(sql)
-                );
-            } else if enabled!(Level::DEBUG) {
-                debug!(
-                    "{prefix} rewrote statement for user \"{user}\", {what}: {}",
-                    normalized(sql)
-                );
-            }
-        }
-        Decision::Block(reason) => {
-            warn!(
-                "{prefix} blocked statement for user \"{user}\": {reason} [{what}{}]",
+    let message = match decision {
+        Decision::Continue(results) => {
+            let verb = if shadow { "would mask" } else { "masked" };
+            format!(
+                "{prefix} {verb} results for user \"{user}\": {}: {}",
+                results.summary(),
                 normalized(sql)
             )
         }
-        Decision::Continue(_) => (),
-    }
-    decision
+        Decision::Rewrite(_, results) => {
+            let verb = if shadow { "would rewrite" } else { "rewrote" };
+            let results = if results.is_empty() {
+                String::new()
+            } else {
+                format!(", results: {}", results.summary())
+            };
+            format!(
+                "{prefix} {verb} statement for user \"{user}\", {what}{results}: {}",
+                normalized(sql)
+            )
+        }
+        Decision::Block(reason) => format!(
+            "{prefix} blocked statement for user \"{user}\": {reason} [{what}{}]",
+            normalized(sql)
+        ),
+    };
+    Some((level, message))
 }
 
 /// The statement with literals replaced by placeholders.
@@ -756,18 +819,28 @@ fn normalized(sql: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use pgdog_plugin::{ErrorField, redact::field};
+    use std::collections::HashSet;
+
+    use pgdog_plugin::{ErrorField, MaskColumn, Value, redact::field, types::Format};
 
     use super::*;
+    use crate::analyzer::test::proxy::{PROXY_CONFIG, proxy_registry, rows};
     use crate::analyzer::test::{CONFIG, catalog};
+    use crate::catalog::Catalog;
+    use crate::proxy::{Datum, Options, ProxyMask};
 
     fn session(user: &str) -> Session<'_> {
         Session::new(user.into(), "db".into())
     }
 
     fn engine(config: &str) -> Engine {
-        let engine = Engine::new(Config::from_toml(config).unwrap()).unwrap();
-        let catalog = catalog();
+        engine_with(config, Registry::default(), catalog())
+    }
+
+    /// An engine with this configuration and these proxy masks, and the
+    /// catalog of database "db" loaded.
+    fn engine_with(config: &str, registry: Registry, catalog: Catalog) -> Engine {
+        let engine = Engine::with_registry(Config::from_toml(config).unwrap(), registry).unwrap();
         let settings = engine.settings.load();
         let mut databases = HashMap::new();
         databases.insert(
@@ -1017,10 +1090,57 @@ mod test {
         );
     }
 
+    /// Upper-cases text.
+    struct Upper;
+
+    impl ProxyMask for Upper {
+        fn accepts(&self, _data_type: &str) -> bool {
+            true
+        }
+
+        fn mask(&self, value: Datum) -> Result<Datum, MaskError> {
+            match value {
+                Datum::Text(text) => Ok(Datum::Text(text.to_uppercase())),
+                _ => Err(MaskError::new("not text")),
+            }
+        }
+    }
+
+    /// Returns values unchanged, and may block.
+    struct Blocking;
+
+    impl ProxyMask for Blocking {
+        fn accepts(&self, _data_type: &str) -> bool {
+            true
+        }
+
+        fn blocking(&self) -> bool {
+            true
+        }
+
+        fn mask(&self, value: Datum) -> Result<Datum, MaskError> {
+            Ok(value)
+        }
+    }
+
+    /// Mask `values` with each of `masks`, as PgDog batches them.
+    fn mask_rows(
+        engine: &Engine,
+        masks: &[ColumnMask],
+        format: Format,
+        values: &[Value<'_>],
+    ) -> Result<MaskOutput, MaskError> {
+        let columns: Vec<_> = masks
+            .iter()
+            .map(|mask| MaskColumn::new(mask, format, values))
+            .collect();
+        let batch = MaskBatch::new(values.len() as u32, &columns);
+        let mut out = MaskOutput::default();
+        engine.mask_rows(&batch, &mut out).map(|_| out)
+    }
+
     #[test]
     fn test_proxy_masks() {
-        use pgdog_plugin::{MaskColumn, Value, types::Format};
-
         const CONFIG: &str = r#"
 [[policies]]
 name = "ssn"
@@ -1033,37 +1153,9 @@ name = "users"
 column = "ssn"
 policy = "ssn"
 "#;
-        struct Upper;
-        impl crate::proxy::ProxyMask for Upper {
-            fn accepts(&self, _data_type: &str) -> bool {
-                true
-            }
-            fn mask(&self, value: crate::proxy::Datum) -> Result<crate::proxy::Datum, MaskError> {
-                match value {
-                    crate::proxy::Datum::Text(text) => {
-                        Ok(crate::proxy::Datum::Text(text.to_uppercase()))
-                    }
-                    _ => Err(MaskError::new("not text")),
-                }
-            }
-        }
         let mut registry = Registry::default();
-        registry.register("test.upper", |_: &crate::proxy::Options| Ok(Upper));
-
-        let engine = Engine::with_registry(Config::from_toml(CONFIG).unwrap(), registry).unwrap();
-        let catalog = catalog();
-        let settings = engine.settings.load();
-        let mut databases = HashMap::new();
-        databases.insert(
-            "db".to_owned(),
-            Arc::new(Database {
-                assignments: Assignments::new(&settings.policies, "db", &catalog),
-                catalog: Arc::new(catalog),
-                schema_epoch: 1,
-                settings_epoch: settings.epoch,
-            }),
-        );
-        engine.databases.store(Arc::new(databases));
+        registry.register("test.upper", |_: &Options| Ok(Upper));
+        let engine = engine_with(CONFIG, registry, catalog());
 
         let Verdict::Rewrite { sql, columns, .. } =
             engine.statement(&session("anonymous"), "SELECT id, ssn FROM users")
@@ -1075,27 +1167,299 @@ policy = "ssn"
         let mask = columns[0];
         assert_eq!((mask.column, mask.type_oid), (1, 1043));
 
-        let mask_rows = |engine: &Engine, format| {
-            let values = [Value::new(Some(b"abc")), Value::new(None)];
-            let batch_columns = [MaskColumn::new(&mask, format, &values)];
-            let batch = MaskBatch::new(2, &batch_columns);
-            let mut out = MaskOutput::default();
-            engine.mask_rows(&batch, &mut out).map(|_| out)
-        };
+        let values = [Value::new(Some(b"abc")), Value::new(None)];
         for format in [Format::Text, Format::Binary] {
-            let out = mask_rows(&engine, format).unwrap();
+            let out = mask_rows(&engine, &[mask], format, &values).unwrap();
             assert_eq!(out.len(), 2);
             assert!(format!("{out:?}").contains("[65, 66, 67]"), "{out:?}");
         }
 
-        // A reload doesn't invalidate mask IDs already handed out.
+        // A reload doesn't invalidate mask IDs already handed out: statements
+        // prepared before it keep masking with them.
         engine.apply(Config::from_toml(CONFIG).unwrap()).unwrap();
-        assert!(mask_rows(&engine, Format::Text).is_ok());
+        let out = mask_rows(&engine, &[mask], Format::Text, &values).unwrap();
+        assert!(format!("{out:?}").contains("[65, 66, 67]"), "{out:?}");
         let Verdict::Rewrite { columns, .. } =
             engine.statement(&session("anonymous"), "SELECT ssn FROM users")
         else {
             panic!("rewrite");
         };
         assert_ne!(columns[0].mask, mask.mask, "new settings, new mask IDs");
+        assert!(mask_rows(&engine, &columns, Format::Text, &values).is_ok());
+    }
+
+    /// Engine verdicts for proxy-masked results (X2, X7, X9).
+    #[test]
+    fn test_proxy_results_verdicts() {
+        let engine = engine_with(PROXY_CONFIG, proxy_registry(), catalog());
+        let engineer = session("engineer");
+
+        // Nothing to mask or redact.
+        assert_eq!(
+            engine.statement(&engineer, "SELECT id FROM orders"),
+            Verdict::Allow
+        );
+
+        // A1: the original SQL, with a proxy mask.
+        assert_eq!(
+            engine.statement(&engineer, "SELECT ssn FROM users"),
+            Verdict::rewrite_masked(
+                "SELECT ssn FROM users",
+                vec![ColumnMask::new(0, MaskId(0), 1043)]
+            )
+        );
+
+        // S4: each statement's masks in its own result.
+        let sql =
+            "UPDATE users SET name = 'x' WHERE id = 1 RETURNING ssn; SELECT upper(ssn) FROM users";
+        let verdict = engine.statement(&engineer, sql);
+        assert_eq!(
+            verdict,
+            Verdict::rewrite_masked(
+                sql,
+                vec![
+                    ColumnMask::new(0, MaskId(0), 1043),
+                    ColumnMask::null(0).in_result(1)
+                ]
+            )
+            .redact_errors(true)
+        );
+        let Verdict::Rewrite { columns, .. } = verdict else {
+            panic!("rewrite");
+        };
+        let null = columns[1];
+        assert!(null.is_null());
+        assert_eq!((null.mask, null.type_oid), (MaskId::NULL, 0));
+        let pairs: HashSet<_> = columns.iter().map(|m| (m.result, m.column)).collect();
+        assert_eq!(pairs.len(), columns.len(), "one mask per result column");
+
+        // Masks that may block say so; NULL masks never do: PgDog applies them.
+        let mut registry = proxy_registry();
+        registry.register("test.hmac", |_: &Options| Ok(Blocking));
+        let blocking = engine_with(PROXY_CONFIG, registry, catalog());
+        assert_eq!(
+            blocking.statement(&engineer, "SELECT ssn, upper(ssn) FROM users"),
+            Verdict::rewrite_masked(
+                "SELECT ssn, upper(ssn) FROM users",
+                vec![
+                    ColumnMask::new(0, MaskId(0), 1043).blocking(),
+                    ColumnMask::null(1)
+                ]
+            )
+            .redact_errors(true)
+        );
+        assert_eq!(
+            blocking.statement(&engineer, "SELECT mrn FROM patients"),
+            Verdict::rewrite_masked(
+                "SELECT mrn FROM patients",
+                vec![ColumnMask::new(0, MaskId(1), 25)]
+            )
+        );
+    }
+
+    /// X1: a statement that only computes on proxy-masked columns is sent as
+    /// is, with its errors redacted.
+    #[test]
+    fn test_redaction_only_rewrite() {
+        let engine = engine_with(PROXY_CONFIG, proxy_registry(), catalog());
+        let sql = "SELECT id FROM users WHERE ssn = $1";
+        assert_eq!(
+            engine.statement(&session("engineer"), sql),
+            Verdict::rewrite_masked(sql, vec![]).redact_errors(true)
+        );
+    }
+
+    /// X3: result masks are logged at info in shadow mode, at debug otherwise.
+    #[test]
+    fn test_proxy_decision_logs() {
+        let shadow = engine_with(
+            &PROXY_CONFIG.replacen("[general]", "[general]\nmode = \"shadow\"", 1),
+            proxy_registry(),
+            catalog(),
+        );
+        let log = |sql: &str, shadow_mode: bool| {
+            let decision = decide(&shadow, "engineer", sql);
+            decision_log("engineer", sql, "", &decision, shadow_mode)
+        };
+
+        let computed = "SELECT upper(ssn) FROM users";
+        assert_eq!(
+            log(computed, true),
+            Some((
+                Level::INFO,
+                "[pgdog_mask] (shadow) would mask results for user \"engineer\": 0 proxy, 1 NULL, errors redacted: yes: SELECT upper(ssn) FROM users".into()
+            ))
+        );
+        assert_eq!(
+            log(computed, false),
+            Some((
+                Level::DEBUG,
+                "[pgdog_mask] masked results for user \"engineer\": 0 proxy, 1 NULL, errors redacted: yes: SELECT upper(ssn) FROM users".into()
+            ))
+        );
+        assert_eq!(
+            log("SELECT ssn FROM users", true),
+            Some((
+                Level::INFO,
+                "[pgdog_mask] (shadow) would mask results for user \"engineer\": 1 proxy, 0 NULL, errors redacted: no: SELECT ssn FROM users".into()
+            ))
+        );
+        assert_eq!(log("SELECT id FROM orders", true), None);
+        assert_eq!(log("SELECT id FROM orders", false), None);
+
+        // Rewrites say how their results are masked; literals never show.
+        let sql = "SELECT * FROM users WHERE ssn = '123-45-6789'";
+        let decision = decide(&shadow, "engineer", sql);
+        assert_eq!(
+            decision_log("engineer", sql, "masked {\"public.users.email\"}", &decision, true),
+            Some((
+                Level::INFO,
+                "[pgdog_mask] (shadow) would rewrite statement for user \"engineer\", masked {\"public.users.email\"}, results: 1 proxy, 0 NULL, errors redacted: yes: SELECT * FROM users WHERE ssn = $1".into()
+            ))
+        );
+        let (level, message) = log("UPDATE users SET name = ssn WHERE id = 7", false).unwrap();
+        assert_eq!(level, Level::WARN);
+        assert!(
+            message.contains("blocked statement for user \"engineer\""),
+            "{message}"
+        );
+        assert!(!message.contains(" 7"), "{message}");
+    }
+
+    /// Shadow mode never changes what runs.
+    #[test]
+    fn test_shadow_mode_allows() {
+        let shadow = engine_with(
+            &PROXY_CONFIG.replacen("[general]", "[general]\nmode = \"shadow\"", 1),
+            proxy_registry(),
+            catalog(),
+        );
+        for sql in [
+            "SELECT upper(ssn) FROM users",
+            "SELECT ssn FROM users",
+            "UPDATE users SET name = ssn WHERE id = 1",
+        ] {
+            assert_eq!(
+                shadow.statement(&session("engineer"), sql),
+                Verdict::Allow,
+                "{sql}"
+            );
+        }
+    }
+
+    /// PgDog applies NULL masks itself; one passed to `mask_rows` anyway
+    /// still comes out NULL.
+    #[test]
+    fn test_mask_rows_null_defensive() {
+        let engine = engine_with(PROXY_CONFIG, proxy_registry(), catalog());
+        let values = [
+            Value::new(Some(b"123-45-6789")),
+            Value::new(None),
+            Value::new(Some(b"x")),
+        ];
+        let masks = [ColumnMask::null(0), ColumnMask::new(1, MaskId(0), 1043)];
+        let out = mask_rows(&engine, &masks, Format::Text, &values).unwrap();
+        assert_eq!(out.len(), 6);
+        let debug = format!("{out:?}");
+        assert!(
+            debug.contains("lengths: [-1, -1, -1, 11, -1, 1]"),
+            "{debug}"
+        );
+    }
+
+    /// X13: users with proxy masks lose DETAIL even when the scrub is off.
+    #[test]
+    fn test_detail_scrub_forced_for_proxy_users() {
+        let engine = engine_with(
+            &PROXY_CONFIG.replacen("[general]", "[general]\nscrub_error_detail = false", 1),
+            proxy_registry(),
+            catalog(),
+        );
+        let fields = [
+            ErrorField::new(field::SQLSTATE, "23514".into()),
+            ErrorField::new(field::MESSAGE, "check".into()),
+            ErrorField::new(field::DETAIL, "Failing row contains (1, secret).".into()),
+        ];
+        let error = ErrorFields::new(false, &fields);
+        assert_eq!(
+            engine.redact_error(&session("engineer"), &error),
+            Redaction::Replace(vec![
+                (field::SQLSTATE, "23514".into()),
+                (field::MESSAGE, "check".into())
+            ])
+        );
+        // SQL masks only: the setting applies.
+        assert_eq!(
+            engine.redact_error(&session("analyst"), &error),
+            Redaction::Keep
+        );
+        assert_eq!(
+            engine.redact_error(&session("admin"), &error),
+            Redaction::Keep
+        );
+    }
+
+    /// X10: decisions depend only on the session and the SQL, so PgDog can
+    /// ask again at any time: every corpus row decided twice, by a fresh
+    /// engine, and with other literals, gets the same decision.
+    #[test]
+    fn test_proxy_determinism() {
+        // The decision with literals as placeholders, comparable across literals.
+        let shaped = |decision: Decision| match decision {
+            Decision::Rewrite(sql, results) => Decision::Rewrite(normalized(&sql), results),
+            other => other,
+        };
+
+        let mut failures = vec![];
+        let mut changed = 0;
+        for row in rows() {
+            let engine = || engine_with(&row.config, proxy_registry(), (row.catalog)());
+            let first = engine();
+            let decision = decide(&first, row.user, row.sql);
+            let again = decide(&first, row.user, row.sql);
+            let fresh = decide(&engine(), row.user, row.sql);
+            if decision != again || decision != fresh {
+                failures.push(format!(
+                    "{} {:?}\n    {decision:?}\n    {again:?}\n    {fresh:?}",
+                    row.id, row.sql
+                ));
+                continue;
+            }
+
+            let Some(literals) = shape::literals(row.sql) else {
+                continue;
+            };
+            let values: Vec<String> = literals.values.iter().map(|v| other_literal(v)).collect();
+            let other = shape::Template::new(&literals.shape, values.len())
+                .and_then(|template| template.render(&values))
+                .expect("render the shape with other literals");
+            changed += 1;
+            let decided = decide(&engine(), row.user, &other);
+            if shaped(decided.clone()) != shaped(decision.clone()) {
+                failures.push(format!(
+                    "{} {:?} with other literals: {other:?}\n    {decision:?}\n    {decided:?}",
+                    row.id, row.sql
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+        assert!(changed > 90, "most of the corpus has literals: {changed}");
+    }
+
+    /// Another literal of the same kind, as the deparser writes literals.
+    fn other_literal(value: &str) -> String {
+        if let Some(text) = value.strip_prefix('\'') {
+            return format!("'z{text}");
+        }
+        match value {
+            "true" => "false".into(),
+            "false" => "true".into(),
+            _ => match value.parse::<i64>() {
+                // Same sign: rendering parenthesizes negative literals.
+                Ok(n) if n < 0 => (n - 1).to_string(),
+                Ok(n) => (n + 1).to_string(),
+                Err(_) => value.into(),
+            },
+        }
     }
 }

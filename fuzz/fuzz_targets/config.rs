@@ -80,7 +80,8 @@ fuzz_target!(|data: &[u8]| {
             let verdict = engine.statement(&session, sql);
             check_rewrite(sql, &verdict);
 
-            // Mask a row for every proxy column the statement got.
+            // Mask a row for every proxy column the statement got. PgDog
+            // replaces NULL masks' values itself: they're never in a batch.
             if let Verdict::Rewrite { columns, .. } = &verdict {
                 let values = [
                     Value::new(Some(b"123-45-6789")),
@@ -90,6 +91,7 @@ fuzz_target!(|data: &[u8]| {
                 for format in [Format::Text, Format::Binary] {
                     let batch_columns: Vec<_> = columns
                         .iter()
+                        .filter(|mask| !mask.is_null())
                         .map(|mask| MaskColumn::new(mask, format, &values))
                         .collect();
                     let batch = MaskBatch::new(values.len() as u32, &batch_columns);

@@ -2399,12 +2399,9 @@ fn test_proxy_unknown_type_oid() {
     ]);
 }
 
-/// Every corpus row with literals gets the same decision through its shape.
-/// Statements calling `set_config` have no shape: whether they're allowed
-/// depends on their literals.
-#[test]
-fn test_proxy_shape_parity() {
-    let corpus = [
+/// Every corpus row.
+fn corpus() -> Vec<Case> {
+    [
         plain_outputs(),
         stars(),
         subqueries_ctes(),
@@ -2430,8 +2427,38 @@ fn test_proxy_shape_parity() {
         parameters_literals(),
         existing_blocks(),
     ]
-    .concat();
+    .concat()
+}
 
+/// A corpus row, for the engine tests.
+pub(crate) struct Row {
+    pub id: &'static str,
+    pub user: &'static str,
+    pub sql: &'static str,
+    pub config: String,
+    pub catalog: fn() -> Catalog,
+}
+
+/// Every corpus row, for the engine tests.
+pub(crate) fn rows() -> Vec<Row> {
+    corpus()
+        .into_iter()
+        .map(|case| Row {
+            id: case.id,
+            user: case.user,
+            sql: case.sql,
+            config: case.config.unwrap_or_else(|| PROXY_CONFIG.to_owned()),
+            catalog: case.catalog,
+        })
+        .collect()
+}
+
+/// Every corpus row with literals gets the same decision through its shape.
+/// Statements calling `set_config` have no shape: whether they're allowed
+/// depends on their literals.
+#[test]
+fn test_proxy_shape_parity() {
+    let corpus = corpus();
     let mut checked = 0;
     let mut failures = vec![];
     for case in &corpus {

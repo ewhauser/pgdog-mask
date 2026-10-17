@@ -1,4 +1,6 @@
 //! Fuzzed sessions and the checks every hook result must pass.
+use std::collections::HashSet;
+
 use arbitrary::Arbitrary;
 use pgdog_mask::pgdog_plugin::{Session, Verdict};
 
@@ -127,8 +129,10 @@ pub fn check_verdict(owned: &Owned, sql: &str, verdict: &Verdict) {
     check_rewrite(sql, verdict);
 }
 
-/// Rewrites are deparsed from a parse tree, so they must parse again.
+/// Rewrites are deparsed from a parse tree, so they must parse again, and
+/// their result masks must be ones PgDog can apply.
 pub fn check_rewrite(sql: &str, verdict: &Verdict) {
+    check_masks(sql, verdict);
     if let Verdict::Rewrite { sql: rewritten, .. } = verdict
         && rewritten != sql
         && !has_param_zero(sql)
@@ -137,6 +141,34 @@ pub fn check_rewrite(sql: &str, verdict: &Verdict) {
         && let Err(err) = pg_raw_parse::parse(rewritten)
     {
         panic!("rewrite doesn't parse: {err}\n  statement: {sql}\n  rewrite: {rewritten}");
+    }
+}
+
+/// One mask per result column; proxy masks carry the column's type, which
+/// PgDog checks; NULL masks are applied by PgDog, so they never block.
+fn check_masks(sql: &str, verdict: &Verdict) {
+    let Verdict::Rewrite { columns, .. } = verdict else {
+        return;
+    };
+    let mut seen = HashSet::new();
+    for mask in columns {
+        assert!(
+            seen.insert((mask.result, mask.column)),
+            "two masks for result {} column {}\n  statement: {sql}\n  masks: {columns:?}",
+            mask.result,
+            mask.column
+        );
+        if mask.is_null() {
+            assert!(
+                !mask.blocking,
+                "NULL mask marked blocking\n  statement: {sql}\n  masks: {columns:?}"
+            );
+        } else {
+            assert_ne!(
+                mask.type_oid, 0,
+                "proxy mask without a type\n  statement: {sql}\n  masks: {columns:?}"
+            );
+        }
     }
 }
 
