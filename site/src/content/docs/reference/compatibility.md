@@ -13,7 +13,7 @@ Besides the API, pgdog-mask relies on PgDog behavior at that commit:
 
 - results of a query with several statements are numbered by statement, including statements PgDog answers itself, such as `SET`;
 - with a statement plugin loaded, a `Bind` or `Describe` of a prepared statement the client didn't prepare through PgDog is refused with `26000`, so a client can't run another client's server-side statement without the plugin's decision;
-- `SET search_path`, and a query that's only a `SELECT set_config('search_path', '…', false)` with literal arguments, update the session's `search_path`, which the plugin analyzes statements with.
+- `SET search_path`, sent as a query of its own, updates the session's `search_path`, which the plugin analyzes statements with. PgDog doesn't follow every other change to it, and can leave one on a pooled server connection: the plugin blocks the changes it misses, and resolves unqualified relation names only when they read the same in every schema (see [Security model](../security/#known-limits)).
 
 ## Rust
 

@@ -15,7 +15,7 @@ ERROR:  duplicate key value violates unique constraint "users_ssn_key"
 DETAIL:  Key (ssn)=(123-45-6789) already exists.
 ```
 
-In `enforce` mode, the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` Postgres sends a masked user, not only those of statements on masked tables: triggers and functions can raise errors about other tables. The severity and SQLSTATE reach the client unchanged, so applications keep handling errors correctly. Exempt users keep `DETAIL`, and so does everyone in `shadow` mode, which doesn't change what clients receive.
+In `enforce` mode, the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` Postgres sends a masked user, not only those of statements on masked tables: triggers and functions can raise errors about other tables. This session-wide scrub removes `DETAIL` only; for users with proxy masks, [per-statement redaction](#per-statement-redaction) replaces the whole message of some statements. The severity and SQLSTATE reach the client unchanged, so applications keep handling errors correctly. Exempt users keep `DETAIL`, and so does everyone in `shadow` mode, which doesn't change what clients receive.
 
 To keep `DETAIL` for masked users, turn it off:
 
@@ -42,11 +42,11 @@ PgDog keeps the severity, the SQLSTATE, the position in the statement, and the n
 
 For a user with proxy masks, a statement's errors are redacted when it:
 
-- **computes with a proxy-masked column**: uses it anywhere other than as a whole output column, such as in a condition, a join, `GROUP BY`, `ORDER BY`, `LIMIT`, a function argument, a cast, `ROW(…)`, a subquery's value or an `UPDATE … SET` value, or references the whole row of a table with proxy-masked columns;
-- **calls a function or reads a view** whose body reads proxy-masked columns;
-- **writes or maintains a table with proxy-masked columns**: `INSERT`, `UPDATE` and `DELETE` on it, including in CTEs and under `EXPLAIN`, `COPY … FROM`, `TRUNCATE`, `VACUUM`, `ANALYZE` and `LOCK`. A `VACUUM` or `ANALYZE` without a table list counts too. Triggers, constraints, index expressions and row security policies of the table run on real values, and can put them in a message;
+- **computes with a proxy-masked column**: uses it anywhere other than as a whole output column, such as in a condition, a join, a `GROUP BY`, `ORDER BY` or `DISTINCT ON` that names it (or an output alias of it) or an expression over it, `LIMIT`, a function argument, a cast, `ROW(…)`, a subquery's value or an `UPDATE … SET` value, or references the whole row of a table with proxy-masked columns;
+- **calls a function or reads a view** whose body reads proxy-masked columns, or writes;
+- **writes, maintains, alters or commits**, whatever the table: `INSERT`, `UPDATE`, `DELETE` and `COPY … FROM`, directly, through a view, in a CTE, under `EXPLAIN`, or in the body of a SQL function the statement calls; `TRUNCATE`, `VACUUM`, `ANALYZE`, `LOCK` and DDL; `COMMIT` and `PREPARE TRANSACTION`. Triggers, constraints, defaults, index expressions, row security policies and event triggers run on real values, of any table, and can put them in a message. Deferred constraint triggers fire at `COMMIT`;
 - is a **`FETCH` or `MOVE`**, or contains an **`EXECUTE`**. Their rows come from a statement checked earlier.
 
-Plain `EXPLAIN` follows the same rules: planning can raise errors on constants, such as a cast in a condition. In a query with several statements, the errors of all of them are redacted if one needs it. A statement that only returns proxy-masked columns, such as `SELECT id, ssn FROM users WHERE id = $1`, keeps its messages.
+A position such as `ORDER BY 1`, `GROUP BY 1` or `DISTINCT ON (1)` refers to the output column and doesn't count, and neither does plain `DISTINCT`. Plain `EXPLAIN` follows the same rules: planning can raise errors on constants, such as a cast in a condition. In a query with several statements, the errors of all of them are redacted if one needs it, so `BEGIN; …; COMMIT` sent as one query is redacted. A read-only statement that only returns proxy-masked columns, such as `SELECT id, ssn FROM users WHERE id = $1`, keeps its messages.
 
 Redaction needs no configuration. Exempt users, users with only SQL masks, and `shadow` mode aren't affected.

@@ -46,7 +46,7 @@ Admins see real values, engineers get HMAC tokens computed in the plugin, and ev
 - **Output columns that pass the column through get the proxy mask.** That's a plain reference, optionally aliased, or `*`, at any depth: through subqueries, CTEs, views, and `UNION` branches that all pass the same column.
 - **Outputs computed from the column return `NULL`**: function calls, operators, casts, aggregates, window functions, `CASE`, scalar subqueries, and `UNION` with a branch that returns something else.
 - **Statements that would move values where PgDog can't mask them are blocked**: writes from the column, `CREATE TABLE AS`, `COPY … TO`, cursors, and side effects such as `set_config`. Writing new values into the column, from parameters or literals, is allowed.
-- **Errors are redacted** for statements that compute with the column or write a table with proxy-masked columns. See [Error and notice redaction](../errors/#per-statement-redaction).
+- **Errors are redacted** for statements that compute with the column, and for every statement that writes, maintains, alters or commits. See [Error and notice redaction](../errors/#per-statement-redaction).
 
 | Statement | What happens |
 | --- | --- |
@@ -62,7 +62,8 @@ Admins see real values, engineers get HMAC tokens computed in the plugin, and ev
 | `SELECT (SELECT ssn FROM users WHERE id = 1)` | `NULL`: a scalar subquery is treated as a computation. |
 | `SELECT id FROM users WHERE ssn = $1` | Sent unchanged. The condition compares real values and finds the matching rows. Errors are redacted. |
 | `SELECT ssn FROM users ORDER BY ssn DESC LIMIT 5 OFFSET 2` | Sorted by real values; `ssn` gets the proxy mask. Errors are redacted. |
-| `UPDATE users SET name = $1 WHERE id = $2 RETURNING ssn` | `ssn` gets the proxy mask. Errors are redacted, because the statement writes a table with proxy-masked columns. |
+| `UPDATE users SET name = $1 WHERE id = $2 RETURNING ssn` | `ssn` gets the proxy mask. Errors are redacted, because the statement writes: triggers and constraints run on real values. |
+| `SELECT JSON_ARRAY(SELECT ssn FROM users)` | `NULL`: aggregated from `ssn`, like `ARRAY(SELECT ssn FROM users)`. |
 | `SELECT 1; SELECT ssn FROM users` | Each statement's results are masked separately: `ssn` in the second result gets the proxy mask. |
 | `UPDATE users SET name = ssn WHERE id = 1` | Blocked: it would copy `ssn` into a column PgDog can't mask. |
 | `CREATE TABLE scratch AS SELECT id, ssn FROM users` | Blocked. |
@@ -74,6 +75,8 @@ Admins see real values, engineers get HMAC tokens computed in the plugin, and ev
 | `SELECT user_ssn(o.user_id) FROM orders o`, a SQL function that reads `users.ssn` | The function is called as is, not inlined, and its result is `NULL`. |
 | `EXPLAIN SELECT ssn FROM users WHERE ssn = $1` | Sent unchanged: Postgres shows the real plan. Errors are redacted. |
 | `EXPLAIN ANALYZE UPDATE users SET name = ssn WHERE id = 1` | Blocked: `EXPLAIN ANALYZE` runs the statement. Plain `EXPLAIN` doesn't, so the same statement under `EXPLAIN` alone is allowed. |
+| `EXPLAIN SELECT imm_ssn(1)`, an `IMMUTABLE` function reading `users.ssn` | Blocked: the planner can compute the call in advance, and the plan would show its result. `SELECT imm_ssn(1)` without `EXPLAIN` returns `NULL`. |
+| `PREPARE p(text) AS SELECT $1; EXPLAIN EXECUTE p(user_ssn(1))` | Blocked: `EXECUTE` arguments are checked like writes, even under plain `EXPLAIN`, which evaluates them and plans with their values. |
 
 ## Conditions and ordering use real values
 
@@ -101,14 +104,14 @@ PgDog masks result columns by position, so the plugin places every mask at a pos
 
 - `*` over a table with masked columns is expanded into column names, as for SQL masks.
 - For users with proxy masks, `*` over any table inside a subquery, CTE or other nested query is expanded too. In `SELECT s.*, upper(u.ssn) FROM (SELECT * FROM orders) s, users u`, the inner `*` is sent as `orders.id AS id, orders.user_id AS user_id, orders.total AS total`. Expanding `*` doesn't change the plan, but it changes the statement's text, so [shadow mode](../../start/shadow-mode/) logs these statements as rewrites.
-- A `*` whose width the plugin can't know blocks the statement when it comes before, or covers, a column carrying proxy-masked values: `*` over a function in `FROM`, over a catalog table such as `pg_class`, over `(expression).*`, or over a join with `USING` or `NATURAL`, which merges columns. `SELECT * FROM pg_class c, users u` and `SELECT f.*, u.ssn FROM users u, generate_series(1, 2) f` fail with `can't place masks on the results: …`. List the columns instead.
+- A `*` whose width the plugin can't know blocks the statement when it comes before, or covers, a column carrying proxy-masked values: `*` over a function in `FROM`, over a catalog table such as `pg_class`, over `(expression).*`, over a join with `USING` or `NATURAL`, which merges columns, or over an aliased join of tables, `(a JOIN b ON …) AS j`, which can only be expanded as `j.*`. `SELECT * FROM pg_class c, users u` and `SELECT f.*, u.ssn FROM users u, generate_series(1, 2) f` fail with `can't place masks on the results: …`. List the columns instead.
 
 ## Statements that run later
 
 PgDog attaches masks to the statement the plugin checked. A statement prepared or declared under a name could run later, through another message, without them:
 
 - **Cursors and SQL `PREPARE`.** For users with proxy masks, `DECLARE` and `PREPARE` are blocked when the statement uses a proxy-masked column anywhere, in its results or only in a condition: `DECLARE c CURSOR FOR SELECT id FROM users WHERE ssn::int > 5` and `PREPARE p AS SELECT id FROM users WHERE ssn = $1` are both blocked. A protocol-level `Execute` of the cursor, or `Bind` of the name, would get neither masks nor redaction.
-- **SQL `EXECUTE`** only runs a statement prepared by a `PREPARE` earlier in the same query, such as `PREPARE p AS SELECT id, name FROM users WHERE id = $1; EXECUTE p(1)`. `EXECUTE p(1)` on its own is blocked, for every masked user, with SQL masks too: the plugin can't know what a name prepared elsewhere runs. It could even be a statement PgDog prepared for another client.
+- **SQL `EXECUTE`** only runs a statement prepared by a `PREPARE` earlier in the same query, such as `PREPARE p AS SELECT id, name FROM users WHERE id = $1; EXECUTE p(1)`. Its arguments must not carry proxy-masked values, even under plain `EXPLAIN`, which evaluates them and shows them in the plan. `EXECUTE p(1)` on its own is blocked, for every masked user, with SQL masks too: the plugin can't know what a name prepared elsewhere runs. It could even be a statement PgDog prepared for another client.
 - **`FETCH`, `MOVE` and `EXECUTE`** always get error redaction for users with proxy masks.
 
 Prepare statements through your driver, with the extended protocol, instead. Those are checked when they're prepared, and masked at every execution. PgDog refuses a `Bind` or `Describe` of a statement name the client didn't prepare through it, with `26000`.

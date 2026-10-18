@@ -27,4 +27,15 @@ This version changes what [proxy masks](../../configure/proxy-masks/) do. Before
 
 Errors of statements that compute with proxy-masked columns are now [redacted](../../configure/errors/#per-statement-redaction), and `scrub_error_detail = false` no longer applies to users with proxy masks.
 
-This version also tightens rules for every masked user: statements after a `search_path`, role or DDL change in the same query, `set_config` of `search_path` outside a query of its own, attribute notation on tables with masked columns, column alias lists over masked columns, and SQL functions that change `search_path` are blocked. See [What masked users can’t do](../../reference/limitations/).
+For users with proxy masks, every statement that writes, maintains, alters or commits now has its errors redacted too, whatever table it writes: triggers, constraints and defaults of any table run on real values.
+
+This version also tightens rules for every masked user. These are blocked now:
+
+- statements after DDL, or a `set_config` of `role`, in the same query;
+- a change to `search_path` or the role that isn't a query of its own starting with `SET`, `RESET` or `DISCARD`, such as `BEGIN; SET LOCAL search_path TO app; …` sent as one query: send the `SET` on its own;
+- `set_config` of `search_path` in any form, including a query of its own such as `SELECT pg_catalog.set_config('search_path', '', false)`, which `pg_dump` output contains: use `SET search_path`;
+- unqualified relation names that refer to relations with different columns or masks in different schemas: qualify them;
+- temporary tables and sequences, tables or sequences named like a relation in the catalog, dropping columns, renames, `DROP … CASCADE`, and dropping a relation whose name another schema shares;
+- attribute notation on tables with masked columns, column alias lists over masked columns, and SQL functions that change `search_path`.
+
+See [What masked users can’t do](../../reference/limitations/).

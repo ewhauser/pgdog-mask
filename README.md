@@ -167,14 +167,15 @@ All of these fail closed with SQLSTATE `42501`:
 - call functions that aren't in the catalog;
 - call SQL-executing built-ins such as `query_to_xml`, `dblink*` and `lo_*`;
 - query `pg_stats`, `pg_statistic` or `pg_stat_statements`;
-- run `DO`, `MERGE` (anywhere, including under `EXPLAIN`), `COPY … TO PROGRAM/file`, or DDL other than creating tables, `DROP`, sequences, and `ALTER TABLE`/`CREATE INDEX`/renames of relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, renames would unmask columns, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
+- run `DO`, `MERGE` (anywhere, including under `EXPLAIN`), `COPY … TO PROGRAM/file`, or DDL other than creating tables and sequences, `DROP`, and `ALTER TABLE`/`CREATE INDEX` on relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
+- run DDL that changes what a name resolves to before PgDog reloads its catalog: create temporary relations, or relations named like one in the catalog; drop columns; rename anything; `DROP … CASCADE`; drop a relation whose name another schema shares;
 - write through views that read masked columns, or read columns of table-like views computed from masked columns;
 - query views missing from the catalog's view definitions;
 - query relations missing from the catalog;
 - expand `*` across `JOIN … USING`/`NATURAL`, or alias a join, over masked columns;
 - alias a masked table's columns in `FROM` (`users AS x(a, b, c)`), or use attribute notation on it (`u.row_to_json`);
-- create tables that shadow a masked table;
-- send a statement after one that changes `search_path`, the role or the schema in the same query, or set `search_path` with `set_config` other than as a query of its own;
+- send a statement after DDL in the same query; change `search_path` or the role other than in a query of its own that starts with `SET`, `RESET` or `DISCARD`; or call `set_config` on `search_path` (use `SET search_path`);
+- use an unqualified relation name whose namesakes in other schemas have different columns or masks (qualify it);
 - `EXECUTE` a statement that wasn't `PREPARE`d in the same query;
 - make fast-path function calls.
 

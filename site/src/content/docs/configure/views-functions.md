@@ -18,7 +18,7 @@ Some views are queried **like tables** instead:
 
 Columns of a table-like view that pass a masked column through unchanged get its mask, SQL or proxy. Columns computed from masked columns are blocked, unless you assign them a policy. When every masked column one is computed from has a proxy mask for the user, it returns `NULL` instead, and conditions on it use real values.
 
-Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked.
+Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked. For users with proxy masks, every write has its [errors redacted](../errors/#per-statement-redaction), through a view or not: the triggers and constraints of the tables it writes run on real values.
 
 `view_allowlist` lists views masked users may query without analysis. Listing one attests that it doesn't return masked data.
 
@@ -28,8 +28,9 @@ SQL-language functions are analyzed:
 
 - A function that reads no masked columns is called as is.
 - One that reads SQL-masked columns is **inlined** with masks applied, if both the function and the call allow it (below). Otherwise the statement is blocked.
-- One that reads only proxy-masked columns is called as is, never inlined, since inlining could change the plan. Its result is `NULL`, and the statement's [errors are redacted](../errors/#per-statement-redaction). Volatility, `SECURITY DEFINER` and `SET` options don't matter for these.
-- A call that passes proxy-masked values as arguments, such as `last4(ssn)`, returns `NULL`. The plugin also checks the function's body, and blocks the call if an argument could reach a write or a side effect, such as an `INSERT` or `pg_notify`, directly or through another function. This check applies under plain `EXPLAIN` too: the planner can call an operator's function on values from the column's statistics.
+- One that reads only proxy-masked columns is called as is, never inlined, since inlining could change the plan. Its result is `NULL`, and the statement's [errors are redacted](../errors/#per-statement-redaction). `SECURITY DEFINER` and `SET` options don't matter for these. Volatility matters only under `EXPLAIN`: `EXPLAIN [ANALYZE]` of a call to one that is `IMMUTABLE`, or to a function that calls one, is blocked, because the planner can compute the result in advance and the plan would show it. Declare such functions `STABLE`.
+- One whose body writes, such as an `UPDATE`, makes the statement's errors redacted for users with proxy masks, as the write itself would.
+- A call that passes proxy-masked values as arguments, such as `last4(ssn)`, returns `NULL`. The plugin also checks the function's body, and blocks calls with proxy-masked arguments if any of the function's parameters could reach a write or a side effect, such as an `INSERT` or `pg_notify`, directly or through another function. This check applies under plain `EXPLAIN` too: the planner can call an operator's function on values from the column's statistics.
 - A function whose body changes name resolution, with `SET search_path`, `SET ROLE`, `RESET ALL`, `DISCARD ALL`, or `set_config` of `search_path` or `role`, is blocked for every masked user. The change would outlive the call without the plugin seeing it. A function's own `SET search_path` option is fine: Postgres restores it when the function returns.
 
 User-defined operators are treated as calls to their functions.
@@ -41,7 +42,7 @@ These conditions only concern functions whose body reads SQL-masked columns. The
 - have a body that's a single `SELECT`, not selecting `*`;
 - be `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, with no `SET` options;
 - not be polymorphic, `VARIADIC` or recursive;
-- be the only function the call could resolve to: if several overloads match the name and number of arguments, and one reads masked columns, the call is blocked.
+- be the only function the call could resolve to: if several overloads match the name and number of arguments, and one reads masked columns, the call is blocked. Functions of the same name in schemas outside the `search_path` count, since Postgres may resolve the call with another `search_path` than the one PgDog reports.
 
 The call must be a plain call:
 
