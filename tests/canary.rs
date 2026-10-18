@@ -1933,6 +1933,141 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         "SELECT (JSON_ARRAY(SELECT ssn FROM users)::text)::int",
         Expect::Fails("22P02"),
     ),
+    // Other expressions that embed queries or take proxy-masked values.
+    (
+        "J14",
+        "SELECT JSON_OBJECT('k': (SELECT ssn FROM users LIMIT 1))",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT JSON_OBJECT('k': ssn) FROM users",
+        Expect::Runs,
+    ),
+    ("J14", "SELECT JSON_OBJECT(ssn: 1) FROM users", Expect::Runs),
+    (
+        "J14",
+        "SELECT JSON_ARRAYAGG(ssn ORDER BY ssn RETURNING jsonb) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT JSON_OBJECTAGG(ssn: id) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT ssn::text IS JSON, ssn::text IS JSON SCALAR FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT JSON_ARRAY(ssn, name) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT JSON_ARRAY(VALUES ((SELECT ssn FROM users LIMIT 1)))",
+        Expect::Runs,
+    ),
+    ("J14", "SELECT JSON_ARRAY(TABLE nested_v)", Expect::Runs),
+    (
+        "J14",
+        "SELECT XMLEXISTS('//x' PASSING BY REF (SELECT xmlelement(name x, ssn) FROM users LIMIT 1))",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT xmlforest(ssn, name), xmlpi(name x, ssn) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT xmlserialize(content xmlelement(name x, ssn) AS text) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT xmlagg(xmlelement(name x, ssn)), xmlagg(xmlparse(content ssn)) FROM users",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT ARRAY(SELECT ssn FROM users), ROW((SELECT ssn FROM users LIMIT 1))",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT (SELECT ROW(ssn) FROM users LIMIT 1)",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT v.x FROM LATERAL (VALUES ((SELECT ssn FROM users LIMIT 1))) v(x)",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "SELECT x.a FROM XMLTABLE('/r' PASSING (SELECT xmlelement(name r, ssn) FROM users LIMIT 1) COLUMNS a text PATH '.') x",
+        Expect::Runs,
+    ),
+    (
+        "J14",
+        "BEGIN; INSERT INTO audit (note) VALUES ('x') RETURNING JSON_ARRAY(SELECT ssn FROM users); ROLLBACK",
+        Expect::Runs,
+    ),
+    // Postgres 17 syntax: an error on earlier versions.
+    (
+        "J14",
+        "SELECT JSON_QUERY(to_jsonb(ssn), '$'), JSON_EXISTS(to_jsonb(ssn), '$') FROM users",
+        Expect::NoLeak,
+    ),
+    (
+        "J14",
+        "SELECT JSON_VALUE(jsonb '{}', '$a' PASSING ssn AS a) FROM users",
+        Expect::NoLeak,
+    ),
+    (
+        "J14",
+        "SELECT JSON_VALUE(to_jsonb(ssn), '$' RETURNING int ERROR ON ERROR) FROM users",
+        Expect::NoLeak,
+    ),
+    (
+        "J14",
+        "SELECT JSON_SCALAR(ssn), JSON_SERIALIZE(JSON(ssn::text)) FROM users",
+        Expect::NoLeak,
+    ),
+    ("J14", "SELECT JSON(ssn::text) FROM users", Expect::NoLeak),
+    (
+        "J14",
+        "SELECT j.a FROM users u, JSON_TABLE(jsonb '{}', '$' PASSING u.ssn AS v COLUMNS (a text PATH '$v')) j",
+        Expect::NoLeak,
+    ),
+    (
+        "J14",
+        "INSERT INTO audit (note) VALUES (JSON_OBJECT('k': (SELECT ssn FROM users LIMIT 1))::text)",
+        Expect::Blocked,
+    ),
+    (
+        "J14",
+        "BEGIN; UPDATE audit SET (note) = (SELECT ssn FROM users LIMIT 1); ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "J14",
+        "WITH c AS (SELECT JSON_ARRAY(SELECT ssn FROM users) AS j) INSERT INTO audit (note) SELECT j::text FROM c",
+        Expect::Blocked,
+    ),
+    (
+        "J14",
+        "COPY (SELECT JSON_ARRAY(SELECT ssn FROM users)) TO STDOUT",
+        Expect::Blocked,
+    ),
+    (
+        "J14",
+        "SELECT pg_notify('c', JSON_QUERY(to_jsonb((SELECT ssn FROM users LIMIT 1)), '$')::text)",
+        Expect::Blocked,
+    ),
     // RETURNING: the trigger raises the proxy-masked value on every update.
     (
         "J1",
