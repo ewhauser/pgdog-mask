@@ -1225,6 +1225,15 @@ async fn setup_proxy(client: &Client) {
                 SET search_path = {PROXY_SCHEMA} AS $$ SELECT 1 $$;
              CREATE FUNCTION returns_d(x VARCHAR) RETURNS checked_ssn LANGUAGE sql
                 SET search_path = {PROXY_SCHEMA} AS $$ SELECT x $$;
+             -- A negator writing audit_log, whose trigger raises an ssn.
+             CREATE FUNCTION eq_log(a BIGINT, b BIGINT) RETURNS BOOLEAN LANGUAGE sql
+                SET search_path = {PROXY_SCHEMA} AS $$ SELECT a = b $$;
+             CREATE FUNCTION ne_log(a BIGINT, b BIGINT) RETURNS BOOLEAN LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit_log VALUES (a, b) RETURNING true $$;
+             CREATE OPERATOR =#= (LEFTARG = BIGINT, RIGHTARG = BIGINT, FUNCTION = eq_log,
+                NEGATOR = !#=);
+             CREATE OPERATOR !#= (LEFTARG = BIGINT, RIGHTARG = BIGINT, FUNCTION = ne_log,
+                NEGATOR = =#=);
              -- Statistics hold ssn values, which estimates pass to operators.
              ANALYZE users;"
         ))
@@ -2585,6 +2594,12 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         "BEGIN; SELECT id FROM users WHERE 1 <<< name; SELECT note FROM audit; ROLLBACK",
         Expect::Runs,
     ),
+    // The negator's write runs audit_log's trigger, which raises an ssn.
+    (
+        "P26",
+        "SELECT id FROM orders WHERE NOT (id =#= 2)",
+        Expect::Fails("P0001"),
+    ),
     // Conversions to a domain run its check, and casts to a type their
     // function.
     (
@@ -3063,6 +3078,7 @@ async fn test_no_canary_leaks_proxy() {
         "BEGIN; UPDATE users SET name = name WHERE id = 1; ROLLBACK",
         "BEGIN; EXPLAIN SELECT id FROM users WHERE 1 <<< ssn; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
+        "SELECT id FROM orders WHERE NOT (id =#= 2)",
         "BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK",

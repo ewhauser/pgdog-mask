@@ -63,9 +63,11 @@ pub(in crate::analyzer) struct CallCheck<'c> {
 /// operand types, or swapped ones, counts.
 #[derive(Debug, Clone, Default)]
 struct Substitutes<'c> {
+    /// SQL functions whose bodies read no SQL-masked columns.
     functions: Vec<&'c Function>,
-    /// An operator whose function is neither in the catalog nor a built-in
-    /// without side effects.
+    /// One that can't be analyzed: an operator's function that's neither in
+    /// the catalog nor a built-in without side effects, or a function in
+    /// another language.
     opaque: Option<String>,
 }
 
@@ -397,10 +399,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if check.side_effect {
             self.sink(args.taint(), &format!("{name}()"));
         }
-        let candidates = match &check.kind {
+        // The planner may run an operator's substitutes instead: their
+        // bodies count too.
+        let candidates: Vec<&'c Function> = match &check.kind {
             CallKind::Udf(candidates) => candidates.as_slice(),
             CallKind::Trusted | CallKind::Done => &[],
-        };
+        }
+        .iter()
+        .chain(&check.substitutes.functions)
+        .copied()
+        .collect();
         if candidates
             .iter()
             .any(|function| self.body_info(function, |info| info.reads_proxies))
@@ -413,6 +421,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .iter()
             .any(|function| self.body_info(function, |info| info.redacts))
         {
+            self.state.writes = true;
+        }
+        // One that can't be analyzed may read or write anything.
+        if check.substitutes.opaque.is_some() {
+            self.note(Taint::Computed, false);
             self.state.writes = true;
         }
         if let Some(function) = candidates
@@ -453,16 +466,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
         let mut reaching = Taint::Clean;
         let mut why = None;
-        for function in candidates.iter().chain(&check.substitutes.functions) {
+        for function in candidates {
             if let Some((taint, reach)) = self.reaching(function, args) {
                 reaching = reaching.join(taint);
                 why.get_or_insert_with(|| reach.message(function, name));
             }
         }
-        if let Some(operator) = &check.substitutes.opaque {
+        if let Some(opaque) = &check.substitutes.opaque {
             reaching = reaching.join(args.taint());
             why.get_or_insert_with(|| format!(
-                "operator {operator} may be used in place of operator {name}, and its function can't be checked, so {name} can't be applied to values of proxy-masked columns"
+                "{opaque} may be run in place of operator {name} and can't be checked, so {name} can't be applied to values of proxy-masked columns"
             ));
         }
         if let Some(why) = why {
@@ -1040,8 +1053,27 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 }
             }
         }
-        let target = self.functions_target(&operator_label(names), &functions)?;
-        let substitutes = self.substitutes(&operators, &functions);
+        let label = operator_label(names);
+        let target = self.functions_target(&label, &functions)?;
+        let mut substitutes = self.substitutes(&operators, &functions);
+        // A substitute isn't inlined, so it can't read SQL-masked columns.
+        for function in std::mem::take(&mut substitutes.functions) {
+            match self.function_verdict(function) {
+                Verdict::Safe => substitutes.functions.push(function),
+                Verdict::Inline => {
+                    self.block(format!(
+                        "function {}() reads masked columns, and the planner may run it in place of operator {label}, where it can't be inlined",
+                        function.qualified_name()
+                    ));
+                    return Err(());
+                }
+                Verdict::Blocked(_) => {
+                    substitutes
+                        .opaque
+                        .get_or_insert_with(|| format!("function {}()", function.qualified_name()));
+                }
+            }
+        }
         Ok(Some((operators.len(), target, substitutes)))
     }
 
@@ -1073,9 +1105,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     && !rules::side_effect(&other.function_name)
                     && rules::denied_function(&other.function_name).is_none() => {}
                 None => {
-                    substitutes
-                        .opaque
-                        .get_or_insert_with(|| format!("{}.{}", other.schema, other.name));
+                    substitutes.opaque.get_or_insert_with(|| {
+                        format!("the function of operator {}.{}", other.schema, other.name)
+                    });
                 }
             }
         }

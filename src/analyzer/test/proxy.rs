@@ -2222,10 +2222,22 @@ fn operators() -> Vec<Case> {
         case(
             "P26",
             "SELECT id FROM users WHERE ssn ~>~ 1",
-            Block("operator public.~<~ may be used in place of operator ~>~"),
+            Block(
+                "the function of operator public.~<~ may be run in place of operator ~>~ and can't be checked",
+            ),
         ),
-        // Without values of proxy-masked columns, nothing reaches them.
-        case("P26", "SELECT id FROM users WHERE 1 <<< name", allow()),
+        // Without values of proxy-masked columns, nothing reaches them; but
+        // the commutator and negator write, so errors are redacted.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE 1 <<< name",
+            Same(vec![], true),
+        ),
+        case(
+            "P26",
+            "SELECT NOT (name ==== 1) FROM users",
+            Same(vec![], true),
+        ),
         case(
             "P26",
             "SELECT id FROM users WHERE ssn === 'x'",
@@ -2293,6 +2305,13 @@ fn operators() -> Vec<Case> {
             "P26",
             "SELECT id FROM orders WHERE id @@@ user_id",
             Rewritten(vec!["__pgdog_args"], vec![], false),
+        )
+        .user("analyst"),
+        // ...nor where the planner may run it in place of another operator.
+        case(
+            "P26",
+            "SELECT id FROM orders WHERE id @!@ user_id",
+            Block("function public.ssn_eq() reads masked columns, and the planner may run it in place of operator @!@"),
         )
         .user("analyst"),
     ]);

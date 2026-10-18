@@ -459,6 +459,13 @@ pub(crate) fn functions() -> Vec<Function> {
             "SELECT a::text = b",
         ),
         sql_function(
+            60,
+            "same_id",
+            &[("a", "bigint"), ("b", "bigint")],
+            "boolean",
+            "SELECT a = b",
+        ),
+        sql_function(
             59,
             "cast_d",
             &[("v", "text")],
@@ -680,6 +687,8 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
         // Its function isn't in the catalog.
         operator("~<~", "numeric", "character varying", 999, "cmp_c"),
         operator("##", "public.checked_ssn", "text", 58, "eq_d"),
+        // Takes what `@@@` does, so the planner may run ssn_eq for it.
+        operator("@!@", "bigint", "bigint", 60, "same_id"),
     ]);
     catalog
 }
