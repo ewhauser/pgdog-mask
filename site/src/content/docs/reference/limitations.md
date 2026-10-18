@@ -69,8 +69,8 @@ Conservatively return `NULL`:
 
 Not redacted:
 
-- Errors and notices that a row security policy, or a function in a view, raises during a read that doesn't compute with proxy-masked columns. Statements that write, maintain, alter or commit are always redacted, whatever table they write, so triggers, constraints and defaults of any table are covered, including deferred constraint triggers firing at `COMMIT`. See [Per-statement redaction](../../configure/errors/#per-statement-redaction).
-- Functions in `udf_allowlist` or `extension_allowlist` aren't analyzed: a call to one that writes doesn't make the statement redacted.
+- Errors and notices that a row security policy raises during a read that doesn't compute with proxy-masked columns. Reading a view whose definition computes with them, or calls a function that writes, is redacted, whether the view is inlined or queried like a table. Statements that write, maintain, alter or commit are always redacted, whatever table they write, so triggers, constraints and defaults of any table are covered, including deferred constraint triggers firing at `COMMIT`. See [Per-statement redaction](../../configure/errors/#per-statement-redaction).
+- Functions in `udf_allowlist` or `extension_allowlist`, and views in `view_allowlist`, aren't analyzed: reading or calling one that writes doesn't make the statement redacted.
 
 Not supported:
 

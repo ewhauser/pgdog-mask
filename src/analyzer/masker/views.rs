@@ -20,19 +20,38 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             relation.kind,
             RelationKind::View | RelationKind::MaterializedView
         ) || self.view_allowlisted(relation)
-            || self
-                .ctx
-                .assignments
-                .is_table_like(&relation.schema, &relation.name)
         {
             return Verdict::Safe;
         }
+        let table_like = self
+            .ctx
+            .assignments
+            .is_table_like(&relation.schema, &relation.name);
+        // A materialized view holds a copy: its definition only runs on
+        // REFRESH.
+        if table_like && relation.kind == RelationKind::MaterializedView {
+            return Verdict::Safe;
+        }
 
+        let info = self.view_info(relation);
+        self.touched |= info.touched;
+        // Inlined or not, the definition runs on real values: a view calling
+        // a function that writes, or computing on proxy-masked values, may
+        // quote them in messages. One that can't be analyzed may do either.
+        let unknown = matches!(info.verdict, Verdict::Blocked(_));
+        self.state.writes |= info.redacts || (table_like && unknown);
+        if table_like {
+            Verdict::Safe
+        } else {
+            info.verdict
+        }
+    }
+
+    /// A view's definition, analyzed for this user. Memoized.
+    fn view_info(&mut self, relation: &Relation) -> BodyInfo {
         let key = (relation.schema.clone(), relation.name.clone());
         if let Some(info) = self.memo.borrow().views.get(&key).cloned() {
-            self.touched |= info.touched;
-            self.state.writes |= info.redacts;
-            return info.verdict;
+            return info;
         }
 
         let label = relation.qualified_name();
@@ -60,10 +79,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         };
 
         self.memo.borrow_mut().views.insert(key, info.clone());
-        self.touched |= info.touched;
-        // A view calling a function that writes.
-        self.state.writes |= info.redacts;
-        info.verdict
+        info
     }
 
     fn view_allowlisted(&self, relation: &Relation) -> bool {

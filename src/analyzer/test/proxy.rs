@@ -2459,11 +2459,9 @@ fn views() -> Vec<Case> {
             "SELECT loud FROM user_loud",
             Rewritten(vec!["upper("], vec![n(0)], true),
         ),
-        case(
-            "Q4",
-            "SELECT ssn FROM ssn_barrier",
-            Same(vec![pt(0)], false),
-        ),
+        // Queried like a table, but its definition computes on ssn, which
+        // may raise errors quoting it.
+        case("Q4", "SELECT ssn FROM ssn_barrier", Same(vec![pt(0)], true)),
         case("Q5", "SELECT loud FROM ssn_barrier", Same(vec![n(0)], true)),
         case(
             "Q6",
@@ -2504,6 +2502,9 @@ fn views() -> Vec<Case> {
         ),
         // Table-like: masked by lineage.
         case("Q15", "SELECT ssn FROM user_ssns", Same(vec![pt(0)], false)).config(tables.clone()),
+        // Its definition calls a function that writes users, whose triggers
+        // see real values.
+        case("Q15", "SELECT b FROM bump_v", Same(vec![], true)).config(tables.clone()),
         // A write through a view writes its relations, and runs their
         // triggers and constraints.
         case(

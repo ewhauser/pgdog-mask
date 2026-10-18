@@ -1212,6 +1212,7 @@ async fn setup_proxy(client: &Client) {
              CREATE FUNCTION bump_name(uid BIGINT) RETURNS BIGINT LANGUAGE sql
                 AS $$ UPDATE users SET name = name WHERE id = uid RETURNING id $$;
              CREATE VIEW bump_v AS SELECT bump_name(1) AS b;
+             CREATE VIEW bump_sb WITH (security_barrier) AS SELECT bump_name(1) AS b;
              CREATE VIEW user_names_v AS SELECT id, name FROM users;
              -- A domain whose check, and a cast whose function, write the value;
              -- functions converting arguments and results to the domain.
@@ -3075,6 +3076,12 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ),
     ("P24", "BEGIN; SELECT bump_name(1); ROLLBACK", Expect::Runs),
     ("P24", "BEGIN; SELECT * FROM bump_v; ROLLBACK", Expect::Runs),
+    // Queried like a table: its definition runs the write too.
+    (
+        "P24",
+        "BEGIN; SELECT * FROM bump_sb; ROLLBACK",
+        Expect::Runs,
+    ),
     (
         "Q16",
         "BEGIN; UPDATE user_names_v SET name = name WHERE id = 1; ROLLBACK",
@@ -3121,6 +3128,7 @@ async fn test_no_canary_leaks_proxy() {
         "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
         "SELECT id FROM orders WHERE NOT (id =#= 2)",
         "SELECT (id::logged).v FROM orders WHERE id = 2",
+        "BEGIN; SELECT * FROM bump_sb; ROLLBACK",
         "BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK",
