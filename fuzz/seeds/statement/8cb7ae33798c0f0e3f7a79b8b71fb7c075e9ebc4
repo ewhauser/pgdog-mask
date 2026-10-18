@@ -1,0 +1,1 @@
+ SELECT users.id FROM public.users WHERE public.can_see_ssn((users.ssn)::text);

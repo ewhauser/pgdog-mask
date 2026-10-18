@@ -1,0 +1,1 @@
+SELECT pg_notify('c', ssn) FROM users

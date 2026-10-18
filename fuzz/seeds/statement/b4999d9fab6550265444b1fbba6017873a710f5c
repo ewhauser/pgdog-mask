@@ -1,0 +1,1 @@
+UPDATE notify_where_sb SET name = 'x' WHERE id = 1

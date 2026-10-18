@@ -1,0 +1,1 @@
+ SELECT users.id, users.name FROM public.users WHERE (pg_notify('c'::text, users.email) IS NOT NULL);

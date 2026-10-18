@@ -1,0 +1,1 @@
+ SELECT users.id, (pg_notify('c'::text, (users.ssn)::text))::text AS n FROM public.users;
