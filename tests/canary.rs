@@ -185,7 +185,26 @@ async fn setup(client: &Client) {
                 AS $$ SELECT count(*) FROM users $$;
              CREATE FUNCTION ssn_is(uid BIGINT, guess TEXT) RETURNS BOOLEAN LANGUAGE sql STABLE
                 AS $$ SELECT EXISTS (SELECT 1 FROM users WHERE id = uid AND ssn = guess) $$;
-             CREATE OPERATOR === (LEFTARG = BIGINT, RIGHTARG = TEXT, FUNCTION = ssn_is);"
+             CREATE OPERATOR === (LEFTARG = BIGINT, RIGHTARG = TEXT, FUNCTION = ssn_is);
+
+             -- Views queried like tables whose columns get masked values
+             -- some other way than by column references, which lineage
+             -- follows: through functions, what they're read from, or a
+             -- definition that can't be analyzed.
+             CREATE VIEW fn_sb WITH (security_barrier) AS
+                SELECT id, get_ssn(id) AS s FROM users;
+             CREATE MATERIALIZED VIEW fn_mv AS SELECT id, get_ssn(id) AS s FROM users;
+             CREATE VIEW opaque_sb WITH (security_barrier) AS
+                SELECT id, leak_plpgsql() AS x FROM users;
+             CREATE VIEW fn_from_sb WITH (security_barrier) AS
+                SELECT id, ssn AS v FROM all_ssns();
+             CREATE MATERIALIZED VIEW xml_mv AS
+                SELECT id, query_to_xml('SELECT ssn FROM {SCHEMA}.users', true, false, '') AS x
+                FROM users;
+             CREATE MATERIALIZED VIEW loud_mv AS SELECT id, upper(ssn) AS loud FROM users;
+             CREATE VIEW loud_sb WITH (security_barrier) AS SELECT id, loud FROM loud_mv;
+             CREATE VIEW fn_sb_v WITH (security_barrier) AS SELECT id, s FROM fn_sb;
+             CREATE VIEW fn_v AS SELECT s FROM fn_sb;"
         ))
         .await
         .expect("setup");
@@ -669,6 +688,19 @@ const CORPUS: &[(&str, Expect)] = &[
     ("SELECT * FROM ssn_mv", Expect::Runs),
     // Its definition runs on real values, and sends them elsewhere.
     ("SELECT id FROM notify_sb", Expect::Blocked),
+    // Columns filled with masked values other than by column references
+    // can't be masked.
+    ("SELECT s FROM fn_sb", Expect::Blocked),
+    ("SELECT * FROM fn_sb", Expect::Blocked),
+    ("SELECT id FROM fn_sb", Expect::Runs),
+    ("SELECT s FROM fn_mv", Expect::Blocked),
+    ("SELECT id FROM fn_mv", Expect::Runs),
+    ("SELECT x FROM opaque_sb", Expect::Blocked),
+    ("SELECT v FROM fn_from_sb", Expect::Blocked),
+    ("SELECT x FROM xml_mv", Expect::Blocked),
+    ("SELECT loud FROM loud_sb", Expect::Blocked),
+    ("SELECT s FROM fn_sb_v", Expect::Blocked),
+    ("SELECT s FROM fn_v", Expect::Blocked),
     // Writes through views over masked columns are blocked.
     (
         "BEGIN; UPDATE user_ssns SET email = email; ROLLBACK",
@@ -773,6 +805,22 @@ const CORPUS: &[(&str, Expect)] = &[
         "SELECT x.email FROM users u, LATERAL (SELECT email FROM contacts) x",
         Expect::Runs,
     ),
+];
+
+/// Columns of views queried like tables that their definition fills with
+/// masked values other than by column references: through a function's
+/// body, a function that can't be analyzed, a function in FROM, a
+/// definition that can't be analyzed, a computed column of a materialized
+/// view, or another such view. Both canary schemas have them.
+const FN_VIEW_COLUMNS: &[&str] = &[
+    "SELECT s FROM fn_sb",
+    "SELECT s FROM fn_mv",
+    "SELECT x FROM opaque_sb",
+    "SELECT v FROM fn_from_sb",
+    "SELECT x FROM xml_mv",
+    "SELECT loud FROM loud_sb",
+    "SELECT s FROM fn_sb_v",
+    "SELECT s FROM fn_v",
 ];
 
 /// Analyze each statement as the context's user and run what the analyzer
@@ -909,6 +957,12 @@ async fn test_no_canary_leaks() {
             .filter(|line| line.starts_with(&format!("NOTIFY {SCHEMA} ")))
             .collect();
         assert!(leaked(&notified).is_some(), "{sql}: {out}");
+    }
+    // Control: so do columns of views queried like tables that get masked
+    // values other than by column references.
+    for sql in FN_VIEW_COLUMNS {
+        let out = run(&conn, sql, View::Raw).await.unwrap();
+        assert!(leaked(&out).is_some(), "{sql}: {out}");
     }
 
     let profile = policies.profile("anonymous", "pgdog");
@@ -1302,6 +1356,28 @@ async fn setup_proxy(client: &Client) {
                 AS $$ INSERT INTO {PROXY_SCHEMA}.audit_log VALUES (v, v)
                    RETURNING ROW(v)::{PROXY_SCHEMA}.logged $$;
              CREATE CAST (BIGINT AS logged) WITH FUNCTION to_logged(BIGINT);
+             -- Views queried like tables whose columns get masked values
+             -- some other way than by column references.
+             CREATE FUNCTION ssn_plpgsql(uid BIGINT) RETURNS TEXT LANGUAGE plpgsql
+                AS $$ BEGIN RETURN (SELECT ssn FROM users WHERE id = uid); END $$;
+             CREATE VIEW fn_sb WITH (security_barrier) AS
+                SELECT id, user_ssn(id) AS s FROM users;
+             CREATE MATERIALIZED VIEW fn_mv AS SELECT id, user_ssn(id) AS s FROM users;
+             CREATE VIEW email_fn_sb WITH (security_barrier) AS
+                SELECT id, email_of(id) AS e FROM users;
+             CREATE VIEW opaque_sb WITH (security_barrier) AS
+                SELECT id, ssn_plpgsql(id) AS x FROM users;
+             CREATE VIEW fn_from_sb WITH (security_barrier) AS
+                SELECT id, ssn AS v FROM ssns();
+             CREATE MATERIALIZED VIEW xml_mv AS
+                SELECT id, query_to_xml('SELECT ssn FROM {PROXY_SCHEMA}.users', true, false, '') AS x
+                FROM users;
+             CREATE MATERIALIZED VIEW loud_mv AS SELECT id, upper(ssn) AS loud FROM users;
+             CREATE VIEW loud_sb WITH (security_barrier) AS SELECT id, loud FROM loud_mv;
+             CREATE VIEW fn_sb_v WITH (security_barrier) AS SELECT id, s FROM fn_sb;
+             CREATE VIEW fn_v AS SELECT s FROM fn_sb;
+             CREATE VIEW upper_sb WITH (security_barrier) AS
+                SELECT id, upper_safe(name) AS u FROM users;
              -- Statistics hold ssn values, which estimates pass to operators.
              ANALYZE users;"
         ))
@@ -2784,6 +2860,19 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ),
     ("Q18", "SELECT ssn FROM filtered_sb", Expect::Runs),
     ("Q18", "SELECT id FROM peek_sb", Expect::Blocked),
+    // Columns filled with masked values other than by column references:
+    // NULL for proxy masks, blocked for SQL masks (email).
+    ("Q19", "SELECT s FROM fn_sb", Expect::Runs),
+    ("Q19", "SELECT * FROM fn_sb", Expect::Runs),
+    ("Q19", "SELECT s FROM fn_mv", Expect::Runs),
+    ("Q19", "SELECT e FROM email_fn_sb", Expect::Blocked),
+    ("Q19", "SELECT x FROM opaque_sb", Expect::Blocked),
+    ("Q19", "SELECT v FROM fn_from_sb", Expect::Runs),
+    ("Q19", "SELECT x FROM xml_mv", Expect::Blocked),
+    ("Q19", "SELECT loud FROM loud_sb", Expect::Runs),
+    ("Q19", "SELECT s FROM fn_sb_v", Expect::Runs),
+    ("Q19", "SELECT s FROM fn_v", Expect::Runs),
+    ("Q19", "SELECT u FROM upper_sb", Expect::Runs),
     // EXPLAIN. Plans quote the statement's literals, so they're no canaries.
     (
         "R1",
@@ -3226,6 +3315,12 @@ async fn test_no_canary_leaks_proxy() {
             .filter(|line| line.starts_with("NOTIFY c "))
             .collect();
         assert!(leaked(&notified).is_some(), "{sql}: {out}");
+    }
+    // Control: so do columns of views queried like tables that get masked
+    // values other than by column references.
+    for sql in FN_VIEW_COLUMNS.iter().chain(&["SELECT e FROM email_fn_sb"]) {
+        let out = run(&conn, sql, View::Raw).await.unwrap();
+        assert!(leaked(&out).is_some(), "{sql}: {out}");
     }
 
     let profile = policies.profile("anonymous", "pgdog");
