@@ -1,0 +1,1 @@
+SELECT id FROM orders WHERE user_id IN (SELECT id FROM err_sb)
