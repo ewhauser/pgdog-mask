@@ -1,4 +1,4 @@
-# Both users share one Postgres role; masking depends on the PgDog user.
+# The users share one Postgres role; masking depends on the PgDog user.
 [[users]]
 name = "masked"
 database = "pgdog"
@@ -15,6 +15,13 @@ server_password = "pgdog"
 
 [[users]]
 name = "support"
+database = "pgdog"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
+
+[[users]]
+name = "analyst"
 database = "pgdog"
 password = "pgdog"
 server_user = "pgdog"

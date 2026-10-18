@@ -9,6 +9,11 @@ roles = ["pii_admin"]
 name = "support"
 roles = ["support"]
 
+# SQL masks only: proxy-masked columns are NULL.
+[[users]]
+name = "analyst"
+roles = ["analyst"]
+
 [[policies]]
 name = "ssn"
 data_type = "text"
@@ -90,6 +95,10 @@ options = { key_env = "PGDOG_MASK_E2E_HMAC_KEY", length = 16 }
 roles = ["pii_admin"]
 mask = "none"
 
+[[policies.rules]]
+roles = ["analyst"]
+mask = "null"
+
 [[policies]]
 name = "card"
 data_type = "character varying"
@@ -101,6 +110,10 @@ options = { key_env = "PGDOG_MASK_E2E_FF1_KEY" }
 roles = ["pii_admin"]
 mask = "none"
 
+[[policies.rules]]
+roles = ["analyst"]
+mask = "null"
+
 # test.increment is built with the test-masks feature.
 [[policies]]
 name = "balance"
@@ -111,6 +124,10 @@ proxy = "test.increment"
 [[policies.rules]]
 roles = ["pii_admin"]
 mask = "none"
+
+[[policies.rules]]
+roles = ["analyst"]
+mask = "null"
 
 [[masked_columns]]
 schema = "masking_e2e"

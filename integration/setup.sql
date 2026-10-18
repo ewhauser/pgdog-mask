@@ -33,3 +33,7 @@ INSERT INTO masking_e2e.users VALUES
 CREATE VIEW masking_e2e.user_ssns AS SELECT id, ssn FROM masking_e2e.users;
 CREATE FUNCTION masking_e2e.get_ssn(uid BIGINT) RETURNS TEXT LANGUAGE sql STABLE
     AS $$ SELECT ssn FROM masking_e2e.users WHERE id = uid $$;
+-- Queried like a table: its condition casts real values, whatever the
+-- user's masks.
+CREATE VIEW masking_e2e.err_sb WITH (security_barrier) AS
+    SELECT id FROM masking_e2e.users WHERE ssn::int > 0;

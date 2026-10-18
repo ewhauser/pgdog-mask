@@ -272,6 +272,39 @@ async fn test_error_detail_scrubbed() {
     );
 }
 
+/// A view queried like a table runs its definition on real values, so its
+/// errors are redacted, also for a user with only SQL masks.
+#[tokio::test]
+async fn test_table_like_view_errors_redacted() {
+    if !enabled() {
+        return;
+    }
+    // `invalid input syntax for type integer: "CANARYSSN-1111"`.
+    let sql = "SELECT id FROM masking_e2e.err_sb";
+    let err = simple_err(&connect("admin").await, sql).await;
+    assert!(err.message().contains("CANARYSSN"), "{err:?}");
+
+    let analyst = connect("analyst").await;
+    // SQL masks only: proxy-masked columns are NULL, and a statement's own
+    // casts apply to masks, so its errors keep their message.
+    assert_eq!(
+        simple(&analyst, "SELECT card FROM masking_e2e.users WHERE id = 1").await,
+        vec![vec![None]]
+    );
+    let err = simple_err(&analyst, "SELECT ssn::int FROM masking_e2e.users").await;
+    assert!(err.message().contains("XXX-XX-"), "{err:?}");
+
+    for (user, client) in [("analyst", analyst), ("masked", connect("masked").await)] {
+        let err = simple_err(&client, sql).await;
+        assert_redacted(&err, &SqlState::INVALID_TEXT_REPRESENTATION);
+        assert!(!format!("{err:?}").contains("CANARY"), "{user}: {err:?}");
+        let err = client.query(sql, &[]).await.unwrap_err();
+        let err = err.as_db_error().expect("database error");
+        assert_redacted(err, &SqlState::INVALID_TEXT_REPRESENTATION);
+        assert!(!format!("{err:?}").contains("CANARY"), "{user}: {err:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_raw_search() {
     if !enabled() {
