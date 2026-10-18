@@ -189,6 +189,105 @@ pub(crate) fn functions() -> Vec<Function> {
     );
     upper_safe.volatility = "immutable".into();
 
+    // Parameters that reach a write, and parameters that only reach its
+    // conditions.
+    let stash_if = |oid, name: &str, args: &[(&str, &str)], body: &str| {
+        let mut function = sql_function(oid, name, args, "text", body);
+        function.volatility = "volatile".into();
+        function
+    };
+    let mut stash_tags = stash_if(
+        33,
+        "stash_tags",
+        &[("tag", "text"), ("notes", "text[]")],
+        "INSERT INTO public.audit (note) SELECT array_to_string(notes, ',') WHERE tag IS NOT NULL RETURNING note",
+    );
+    stash_tags.variadic = true;
+    let mut check_all = stash_if(
+        34,
+        "check_all",
+        &[("note", "text"), ("guesses", "text[]")],
+        "INSERT INTO public.audit (note) SELECT note WHERE guesses IS NOT NULL RETURNING note",
+    );
+    check_all.variadic = true;
+    let mut stash_def = stash_if(
+        35,
+        "stash_def",
+        &[("guess", "text"), ("note", "text")],
+        "INSERT INTO public.audit (note) SELECT note WHERE guess IS NOT NULL RETURNING note",
+    );
+    stash_def.argument_defaults = 1;
+    let wide_names: Vec<String> = (1..=17).map(|i| format!("w{i}")).collect();
+    let wide_args: Vec<(&str, &str)> = wide_names.iter().map(|n| (n.as_str(), "text")).collect();
+    let wide = stash_if(
+        42,
+        "stash_wide",
+        &wide_args,
+        "INSERT INTO public.audit (note) SELECT w17 WHERE w1 IS NOT NULL RETURNING note",
+    );
+    let stash_if_functions = vec![
+        stash_if(
+            30,
+            "stash_if",
+            &[("note", "text"), ("guess", "text")],
+            "INSERT INTO public.audit (note) SELECT note WHERE guess IS NOT NULL RETURNING note",
+        ),
+        stash_if(
+            31,
+            "stash_if_p",
+            &[("", "text"), ("", "text")],
+            "INSERT INTO public.audit (note) SELECT $1 WHERE $2 IS NOT NULL RETURNING note",
+        ),
+        stash_if(
+            32,
+            "stash_if_q",
+            &[("note", "text"), ("guess", "text")],
+            "INSERT INTO public.audit (note) SELECT stash_if_q.note WHERE stash_if_q.guess IS NOT NULL RETURNING note",
+        ),
+        stash_tags,
+        check_all,
+        stash_def,
+        // Overloads: only the first argument reaches a write in both.
+        stash_if(
+            36,
+            "stash_ov",
+            &[("note", "text"), ("guess", "text")],
+            "INSERT INTO public.audit (note) SELECT note WHERE guess IS NOT NULL RETURNING note",
+        ),
+        stash_if(
+            37,
+            "stash_ov",
+            &[("n", "bigint"), ("g", "text")],
+            "INSERT INTO public.audit (note) SELECT n::text WHERE g IS NOT NULL RETURNING note",
+        ),
+        stash_if(
+            38,
+            "wrap_stash_if",
+            &[("note", "text"), ("guess", "text")],
+            "SELECT public.stash_if(note, guess)",
+        ),
+        stash_if(
+            39,
+            "swap_stash_if",
+            &[("a", "text"), ("b", "text")],
+            "SELECT public.stash_if(b, a)",
+        ),
+        // Columns take precedence over parameters of the same name.
+        stash_if(
+            40,
+            "shadow_note",
+            &[("note", "text"), ("uid", "bigint")],
+            "INSERT INTO public.audit (note) SELECT note FROM public.audit WHERE id = uid RETURNING note",
+        ),
+        stash_if(
+            41,
+            "touch_if",
+            &[("guess", "text")],
+            "UPDATE public.audit SET note = 'seen' WHERE note = guess RETURNING note",
+        ),
+        wide,
+    ];
+
     // Mislabelled: it reads a table, so the planner may run it in advance.
     let mut imm_ssn = sql_function(
         25,
@@ -338,6 +437,9 @@ pub(crate) fn functions() -> Vec<Function> {
             "TRUNCATE public.users; SELECT 1",
         ),
     ]
+    .into_iter()
+    .chain(stash_if_functions)
+    .collect()
 }
 
 pub(crate) fn catalog() -> Catalog {

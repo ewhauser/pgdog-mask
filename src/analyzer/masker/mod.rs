@@ -26,7 +26,7 @@ use super::rules;
 use super::scope::{Cte, Frame, Item, derived_outputs, exact_name, find_cte};
 use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::mask::SearchOp;
-use functions::{CallCheck, CallUse, ParamMode};
+use functions::{CallArgs, CallCheck, CallUse, ParamMode, ParamSinks};
 use results::{OutputRef, StatementState};
 
 /// Why statements after one that may change name resolution are blocked.
@@ -177,8 +177,8 @@ impl BodyInfo {
 struct Memo {
     views: HashMap<(String, String), BodyInfo>,
     functions: HashMap<i64, BodyInfo>,
-    /// Whether a parameter of a SQL function can reach a sink in its body.
-    param_sinks: HashMap<i64, bool>,
+    /// Which parameters of a SQL function can reach a sink in its body.
+    param_sinks: HashMap<i64, ParamSinks>,
     /// For a relation an unqualified name resolves to, by schema and name, a
     /// namesake in another schema that reads differently, if there's one.
     namesakes: HashMap<(String, String), Option<String>>,
@@ -851,6 +851,20 @@ enum Keep {
     },
 }
 
+/// Transforms the arguments of a call one by one, recording what each
+/// carries.
+struct EachArg<'a, 'c, 'mem> {
+    masker: &'a mut Masker<'c, 'mem>,
+    taints: Vec<Taint>,
+}
+
+impl<'mem> Transform<'mem> for EachArg<'_, '_, 'mem> {
+    fn transform_node<'mutref>(&mut self, node: Assignable<'mem, 'mutref>) {
+        let taint = self.masker.scoped(|masker| masker.transform_node(node));
+        self.taints.push(taint);
+    }
+}
+
 impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     fn transform_node<'mutref>(&mut self, node: Assignable<'mem, 'mutref>) {
         let action = self.action(&node);
@@ -962,11 +976,12 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     // in `mytype(ssn) 'x'`, `ssn` is a name Postgres passes to the type.
     fn transform_type_name<'mutref>(&mut self, _node: nodes::TypeNameMut<'mem, 'mutref>) {}
 
-    fn transform_param_ref<'mutref>(&mut self, _node: nodes::ParamRefMut<'mem, 'mutref>) {
+    fn transform_param_ref<'mutref>(&mut self, node: nodes::ParamRefMut<'mem, 'mutref>) {
         // A parameter of the function body being analyzed for where its
         // parameters go. Anywhere else, parameters are the client's values.
-        if self.params.is_some() {
-            self.note(Taint::Computed, false);
+        if let Some(params) = &self.params {
+            let taint = params.positional(node.number);
+            self.note(taint, false);
         }
     }
 
@@ -1049,7 +1064,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     // Expressions are checked in their typed hooks, which run for top-level
     // expressions (e.g. a whole WHERE clause) as well as nested ones.
-    fn transform_a_expr<'mutref>(&mut self, node: nodes::A_ExprMut<'mem, 'mutref>) {
+    fn transform_a_expr<'mutref>(&mut self, mut node: nodes::A_ExprMut<'mem, 'mutref>) {
         if self.predicate {
             self.mark_raw_a_expr(&node);
         }
@@ -1068,8 +1083,18 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_owned();
-        let args = self.scoped(|masker| transform::transform_a_expr(node, masker));
-        self.call_post_check(&check, args, &name);
+        // The operands are the function's arguments; a prefix operator has
+        // only the right one.
+        let prefix = matches!(node.lexpr(), Node::None);
+        self.transform_list(node.name_mut());
+        let left = self.scoped(|masker| child!(masker, node, lexpr_mut, set_lexpr));
+        let right = self.scoped(|masker| child!(masker, node, rexpr_mut, set_rexpr));
+        let mut args = CallArgs::default();
+        if !prefix {
+            args.args.push((None, left));
+        }
+        args.args.push((None, right));
+        self.call_post_check(&check, &args, &name);
     }
 
     fn transform_null_test<'mutref>(&mut self, node: nodes::NullTestMut<'mem, 'mutref>) {
@@ -1079,7 +1104,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         transform::transform_null_test(node, self);
     }
 
-    fn transform_func_call<'mutref>(&mut self, node: nodes::FuncCallMut<'mem, 'mutref>) {
+    fn transform_func_call<'mutref>(&mut self, mut node: nodes::FuncCallMut<'mem, 'mutref>) {
         // Calls in generic positions were checked by `transform_node`.
         let check = match self.checked_calls.get(&call_address(&node)) {
             Some(check) => check.clone(),
@@ -1099,7 +1124,31 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             .flatten()
             .map(str::to_owned)
             .collect();
-        let args = self.scoped(|masker| transform::transform_func_call(node, masker));
+        let names: Vec<Option<String>> = node
+            .args()
+            .iter()
+            .map(|arg| match arg {
+                Node::NamedArgExpr(named) => named.name().map(str::to_owned),
+                _ => None,
+            })
+            .collect();
+        let variadic = node.func_variadic;
+
+        // What each argument carries, then the rest of the call.
+        self.transform_list(node.funcname_mut());
+        let mut each = EachArg {
+            masker: self,
+            taints: vec![],
+        };
+        transform::transform_list(node.args_mut(), &mut each);
+        let taints = each.taints;
+        let mut rest = self.scoped(|masker| {
+            masker.transform_sort_by_list(node.agg_order_mut());
+            child!(masker, node, agg_filter_mut, set_agg_filter);
+            if let Some(over) = node.over_mut() {
+                masker.transform_window_def(over);
+            }
+        });
         // A named window's PARTITION BY and ORDER BY decide the value too.
         for window in windows {
             if let Some(taint) = self
@@ -1109,9 +1158,15 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 .copied()
             {
                 self.note_from(taint, false, false);
+                rest = rest.join(taint);
             }
         }
-        self.call_post_check(&check, args, &name);
+        let args = CallArgs {
+            args: names.into_iter().zip(taints).collect(),
+            variadic,
+            rest,
+        };
+        self.call_post_check(&check, &args, &name);
     }
 
     fn transform_window_def<'mutref>(&mut self, node: nodes::WindowDefMut<'mem, 'mutref>) {

@@ -465,18 +465,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// What a name that resolves to no column or FROM item carries: in a
-    /// function body analyzed for where its parameters go, a parameter
-    /// carries values of proxy-masked columns.
+    /// function body analyzed for where its parameters go, a followed
+    /// parameter carries values of proxy-masked columns.
     fn unresolved_taint(&self, names: &[&str]) -> Taint {
-        if self
-            .params
+        self.params
             .as_ref()
-            .is_some_and(|params| params.is_param(names))
-        {
-            Taint::Computed
-        } else {
-            Taint::Unknown
-        }
+            .and_then(|params| params.named(names))
+            .unwrap_or(Taint::Unknown)
     }
 
     /// The CTE being analyzed, whose pending columns aren't taint sources.

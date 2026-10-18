@@ -5,9 +5,10 @@
 //! called with values of proxy-masked columns. A user-defined SQL function is
 //! analyzed: if its body reads no SQL-masked columns, the call is allowed as is
 //! (its result is NULL in results if the body reads proxy-masked columns, or if
-//! it's called with their values). Called with values of proxy-masked columns,
-//! it's blocked if its body can move a parameter where PgDog can't mask it:
-//! the body is analyzed once more with parameters as sources. If the body
+//! it's called with their values). A call that passes values of proxy-masked
+//! columns to a parameter its body can move where PgDog can't mask it is
+//! blocked: the body is analyzed once more with parameters as sources, and
+//! once per parameter if one reaches a sink. If the body
 //! reads SQL-masked columns, and the function can be inlined, the call is
 //! replaced by its body with masks applied:
 //!
@@ -20,6 +21,8 @@
 //! names, as in SQL functions. Everything else (procedural languages, `SECURITY
 //! DEFINER`, `SET` options, volatile or polymorphic functions) is blocked unless
 //! it's in `udf_allowlist` or `extension_allowlist`.
+use std::rc::Rc;
+
 use pg_raw_parse::{
     ConstValue, Node, NodeMut,
     make::Unique,
@@ -90,34 +93,88 @@ enum CallTarget<'c> {
 /// carry values of proxy-masked columns.
 #[derive(Debug)]
 pub(super) struct ParamMode {
-    /// Parameter names; positional parameters (`$1`) are sources too.
+    /// Parameter names by position, empty for unnamed ones; positional
+    /// references (`$1`) are parameters too.
     names: Vec<String>,
     /// The function's name, which can qualify its parameters.
     function: String,
-    /// A parameter can reach a sink.
+    /// The parameter followed, by position: `None` follows all of them.
+    source: Option<usize>,
+    /// A followed parameter can reach a sink.
     pub(super) sinks: bool,
 }
 
 impl ParamMode {
-    fn new(function: &Function) -> Self {
+    fn new(function: &Function, source: Option<usize>) -> Self {
         Self {
-            names: param_names(function),
+            names: function.argument_names.clone(),
             function: function.name.clone(),
+            source,
             sinks: false,
         }
     }
 
-    /// Is a name that resolves to no column a parameter: `param`,
-    /// `function.param`, or a field of a composite parameter?
-    pub(super) fn is_param(&self, names: &[&str]) -> bool {
-        let param = |name: &str| self.names.iter().any(|param| param == name);
-        match names {
-            [name, ..] if param(name) => true,
-            [function, name, ..] => *function == self.function && param(name),
-            _ => false,
+    /// What a parameter carries: values of proxy-masked columns if it's
+    /// followed, nothing that matters otherwise.
+    fn taint(&self, position: usize) -> Taint {
+        if self.source.is_none_or(|source| source == position) {
+            Taint::Computed
+        } else {
+            Taint::Clean
         }
     }
+
+    /// What `$n` carries.
+    pub(super) fn positional(&self, number: i32) -> Taint {
+        match usize::try_from(number).ok().and_then(|n| n.checked_sub(1)) {
+            Some(position) => self.taint(position),
+            None => Taint::Unknown,
+        }
+    }
+
+    /// What a name that resolves to no column carries if it's a parameter:
+    /// `param`, `function.param`, or a field of a composite parameter.
+    pub(super) fn named(&self, names: &[&str]) -> Option<Taint> {
+        let param = |name: &str| {
+            self.names
+                .iter()
+                .position(|param| !param.is_empty() && param == name)
+        };
+        let position = match names {
+            [name, ..] if let Some(position) = param(name) => position,
+            [function, name, ..] if *function == self.function => param(name)?,
+            _ => return None,
+        };
+        Some(self.taint(position))
+    }
 }
+
+/// A call's arguments, once transformed.
+#[derive(Debug, Default)]
+pub(super) struct CallArgs {
+    /// Each argument in call order: its name in named notation, and what it
+    /// carries.
+    pub(super) args: Vec<(Option<String>, Taint)>,
+    /// `VARIADIC` marks the last argument.
+    pub(super) variadic: bool,
+    /// What the rest of the call carries: aggregate `ORDER BY`, `FILTER`
+    /// and `OVER`.
+    pub(super) rest: Taint,
+}
+
+impl CallArgs {
+    /// What the call's inputs carry, together.
+    pub(super) fn taint(&self) -> Taint {
+        self.args
+            .iter()
+            .map(|(_, taint)| *taint)
+            .fold(self.rest, Taint::join)
+    }
+}
+
+/// Which parameters of a SQL function can reach a sink in its body, by
+/// position.
+pub(super) type ParamSinks = Rc<[bool]>;
 
 /// What a function name resolves to.
 enum Target<'c> {
@@ -132,6 +189,11 @@ const ARG_PREFIX: &str = "__pgdog_arg_";
 const BODY: &str = "__pgdog_body";
 const BODY_PLACEHOLDER: &str = "__pgdog_body_placeholder";
 const SCALAR_PLACEHOLDER: &str = "__pgdog_scalar_placeholder";
+
+/// Functions with more parameters whose body has a sink count it as
+/// reachable from every parameter, rather than analyzing the body once per
+/// parameter.
+const MAX_PARAM_PASSES: usize = 16;
 
 impl<'c, 'mem> Masker<'c, 'mem> {
     /// A function call in an expression.
@@ -243,11 +305,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// After a call's arguments are transformed: built-ins that store their
     /// arguments are sinks, user-defined functions whose body reads
     /// proxy-masked columns return values computed from them, and those
-    /// that can move a parameter to a sink can't be called with their
-    /// values.
-    pub(super) fn call_post_check(&mut self, check: &CallCheck<'c>, args: Taint, name: &str) {
+    /// that can move a parameter to a sink can't be passed their values in
+    /// that parameter.
+    pub(super) fn call_post_check(&mut self, check: &CallCheck<'c>, args: &CallArgs, name: &str) {
         if check.side_effect {
-            self.sink(args, &format!("{name}()"));
+            self.sink(args.taint(), &format!("{name}()"));
         }
         let CallKind::Udf(candidates) = &check.kind else {
             return;
@@ -286,19 +348,64 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         // Planning alone can call an operator's function on values from
         // pg_statistic (RESTRICT = eqsel), so this applies under plain
         // EXPLAIN too.
-        if !args.is_clean()
-            && let Some(function) = candidates
-                .iter()
-                .copied()
-                .find(|function| self.param_sinks(function))
-        {
-            let name = function.qualified_name();
-            self.sink_with(args, |_| {
-                format!(
-                    "function {name}() can pass a parameter to a write or a side effect, so it can't be called with values of proxy-masked columns"
-                )
+        if args.taint().is_clean() {
+            return;
+        }
+        let mut reaching = Taint::Clean;
+        let mut why = None;
+        for function in candidates {
+            let (taint, param) = self.reaching_sinks(function, args);
+            if !taint.is_clean() {
+                reaching = reaching.join(taint);
+                why.get_or_insert_with(|| {
+                    let name = function.qualified_name();
+                    match param {
+                        Some(param) => format!(
+                            "function {name}() can pass a parameter to a write or a side effect, so its argument for {param} can't carry values of proxy-masked columns"
+                        ),
+                        None => format!(
+                            "function {name}() can pass a parameter to a write or a side effect, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
+                        ),
+                    }
+                });
+            }
+        }
+        if let Some(why) = why {
+            self.sink_with(reaching, |_| why);
+        }
+    }
+
+    /// What the arguments passed to parameters of a user-defined SQL
+    /// function that can reach a sink carry, and the first such parameter
+    /// given a non-Clean argument. When the arguments can't be matched to
+    /// the parameters, every argument may reach one.
+    fn reaching_sinks(
+        &mut self,
+        function: &'c Function,
+        args: &CallArgs,
+    ) -> (Taint, Option<String>) {
+        let sinks = self.param_sinks(function);
+        if !sinks.contains(&true) {
+            return (Taint::Clean, None);
+        }
+        let Some(positions) = parameter_positions(function, args) else {
+            return (args.taint(), None);
+        };
+        // Aggregate and window syntax is an error for a plain function, but
+        // fail closed.
+        let mut taint = args.rest;
+        let mut param = None;
+        for ((_, arg), position) in args.args.iter().zip(positions) {
+            if arg.is_clean() || sinks.get(position) == Some(&false) {
+                continue;
+            }
+            taint = taint.join(*arg);
+            param.get_or_insert_with(|| match function.argument_names.get(position) {
+                Some(name) if !name.is_empty() => name.clone(),
+                _ => format!("${}", position + 1),
             });
         }
+        (taint, param)
     }
 
     /// Something about a user-defined function's body, once analyzed.
@@ -320,31 +427,56 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         })
     }
 
-    /// Could a value passed to a user-defined SQL function reach a sink in
-    /// its body? Memoized; recursion and bodies that can't be analyzed
-    /// count as sinks.
-    fn param_sinks(&mut self, function: &'c Function) -> bool {
+    /// Which parameters of a user-defined SQL function can pass a value
+    /// to a sink in its body, by position? Memoized; recursion and bodies
+    /// that can't be analyzed count as sinks for every parameter.
+    ///
+    /// The body is analyzed with every parameter as a source first: most
+    /// bodies have no sink. If a parameter reaches one, it's analyzed once
+    /// per parameter, each alone as a source.
+    fn param_sinks(&mut self, function: &'c Function) -> ParamSinks {
         if let Some(sinks) = self.memo.borrow().param_sinks.get(&function.oid) {
-            return *sinks;
+            return sinks.clone();
         }
+        let count = function.argument_types.len();
+        let all: ParamSinks = vec![true; count].into();
         let active = format!("parameters of function {}", function.oid);
         if self.memo.borrow().active.contains(&active) {
-            return true;
+            return all;
         }
         let sinks = match function_body(function) {
             Some(body) if function.language == "sql" => {
                 let search_path = self.function_search_path(function);
                 self.memo.borrow_mut().active.push(active);
-                let sinks = self.body_param_sinks(&body, search_path, ParamMode::new(function));
+                let reaches = |masker: &Self, source| {
+                    masker.body_param_sinks(
+                        &body,
+                        search_path.clone(),
+                        ParamMode::new(function, source),
+                    )
+                };
+                let sinks = if !reaches(self, None) {
+                    vec![false; count].into()
+                } else if count <= 1 || count > MAX_PARAM_PASSES {
+                    all.clone()
+                } else {
+                    let each: Vec<bool> = (0..count).map(|i| reaches(self, Some(i))).collect();
+                    // A sink no parameter reaches alone: fail closed.
+                    if each.contains(&true) {
+                        each.into()
+                    } else {
+                        all.clone()
+                    }
+                };
                 self.memo.borrow_mut().active.pop();
                 sinks
             }
-            _ => true,
+            _ => all,
         };
         self.memo
             .borrow_mut()
             .param_sinks
-            .insert(function.oid, sinks);
+            .insert(function.oid, sinks.clone());
         sinks
     }
 
@@ -1076,6 +1208,28 @@ fn plain_call(call: &nodes::FuncCall) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// The parameter each argument of a call is passed to, by position, the
+/// way Postgres matches them: positional arguments in order, the extra ones
+/// of a `VARIADIC` function to its last parameter, and named arguments by
+/// name. Parameters left out take their defaults. `None` if the arguments
+/// don't match the function's parameters.
+fn parameter_positions(function: &Function, args: &CallArgs) -> Option<Vec<usize>> {
+    let count = function.argument_types.len();
+    args.args
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| match name {
+            Some(name) => function
+                .argument_names
+                .iter()
+                .position(|param| !param.is_empty() && param == name),
+            None if i < count => Some(i),
+            None if function.variadic && !args.variadic => count.checked_sub(1),
+            None => None,
+        })
+        .collect()
 }
 
 /// Can a function that reads masked columns be inlined? Mirrors the conditions

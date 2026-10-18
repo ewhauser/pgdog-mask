@@ -1940,6 +1940,214 @@ fn param_sinks() -> Vec<Case> {
             "SELECT recursive_fn(length(ssn)) FROM users",
             Block("recursive"),
         ),
+        // Per argument: a parameter that only reaches conditions takes
+        // values of proxy-masked columns; one that reaches a sink doesn't.
+        case(
+            "P25",
+            "SELECT stash_if('x', ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if(ssn, 'x') FROM users",
+            Block(
+                "function public.stash_if() can pass a parameter to a write or a side effect, so its argument for note can't carry values of proxy-masked columns",
+            ),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if(upper(ssn), ssn) FROM users",
+            Block("its argument for note"),
+        ),
+        case(
+            "P25",
+            "SELECT id FROM users WHERE stash_if(name, ssn) IS NULL",
+            Same(vec![], true),
+        ),
+        case(
+            "P25",
+            "SELECT * FROM stash_if('x', $1) s",
+            Same(vec![], true),
+        ),
+        case(
+            "P25",
+            "SELECT s FROM users u, stash_if(u.name, u.ssn) s",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT s FROM users u, stash_if(u.ssn, u.name) s",
+            Block("its argument for note"),
+        ),
+        // Positional and qualified references.
+        case(
+            "P25",
+            "SELECT stash_if_p('x', ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if_p(ssn, 'x') FROM users",
+            Block("its argument for $1"),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if_q('x', ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if_q(ssn, 'x') FROM users",
+            Block("its argument for note"),
+        ),
+        // Named arguments go to the parameter they name.
+        case(
+            "P25",
+            "SELECT stash_if(guess => ssn, note => 'x') FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if('x', guess => ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if(guess => 'x', note => ssn) FROM users",
+            Block("its argument for note"),
+        ),
+        case(
+            "P25",
+            "SELECT stash_if(note => ssn, guess => 'x') FROM users",
+            Block("its argument for note"),
+        ),
+        // A name no parameter has: fail closed.
+        case(
+            "P25",
+            "SELECT stash_if(nope => ssn, note => 'x') FROM users",
+            Block("can't be matched to its parameters"),
+        ),
+        // VARIADIC: the extra arguments go to the last parameter.
+        case(
+            "P25",
+            "SELECT stash_tags(ssn, 'a', 'b') FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_tags('t', 'a', ssn) FROM users",
+            Block("its argument for notes"),
+        ),
+        case(
+            "P25",
+            "SELECT stash_tags('t', VARIADIC ARRAY[ssn]) FROM users",
+            Block("its argument for notes"),
+        ),
+        case(
+            "P25",
+            "SELECT stash_tags(ssn, VARIADIC ARRAY['a']) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT check_all('x', 'a', ssn, ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT check_all(ssn, 'a') FROM users",
+            Block("its argument for note"),
+        ),
+        // Parameters left out take their defaults.
+        case(
+            "P25",
+            "SELECT stash_def(ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_def('a', ssn) FROM users",
+            Block("its argument for note"),
+        ),
+        case(
+            "P25",
+            "SELECT stash_def(note => ssn, guess => 'a') FROM users",
+            Block("its argument for note"),
+        ),
+        // Every overload the call could resolve to is checked.
+        case(
+            "P25",
+            "SELECT stash_ov('x', ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT stash_ov(ssn, 'x') FROM users",
+            Block("its argument for"),
+        ),
+        // `guess` and `note` aren't stash_ov(n, g)'s parameters: fail closed.
+        case(
+            "P25",
+            "SELECT stash_ov(guess => ssn, note => 'x') FROM users",
+            Block("can't be matched to its parameters"),
+        ),
+        // Through nested calls, following which parameter goes where.
+        case(
+            "P25",
+            "SELECT wrap_stash_if('x', ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT wrap_stash_if(ssn, 'x') FROM users",
+            Block(
+                "function public.wrap_stash_if() can pass a parameter to a write or a side effect, so its argument for note",
+            ),
+        ),
+        case(
+            "P25",
+            "SELECT swap_stash_if(ssn, 'x') FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT swap_stash_if('x', ssn) FROM users",
+            Block("its argument for b"),
+        ),
+        // A column of the same name hides the parameter.
+        case(
+            "P25",
+            "SELECT shadow_note(ssn, 1) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        case(
+            "P25",
+            "SELECT touch_if(ssn) FROM users",
+            Same(vec![n(0)], true),
+        ),
+        // Operators: noisy_eq's right operand only reaches a condition.
+        case(
+            "P25",
+            "SELECT id FROM users WHERE 'x' ~~~ ssn",
+            Same(vec![], true),
+        ),
+        // The check applies when only planning, too.
+        case(
+            "P25",
+            "EXPLAIN SELECT stash_if(ssn, 'x') FROM users",
+            Block("its argument for note"),
+        ),
+        case(
+            "P25",
+            "EXPLAIN SELECT stash_if('x', ssn) FROM users",
+            Same(vec![], true),
+        ),
+        // Too many parameters to follow one by one: every one reaches it.
+        case(
+            "P25",
+            "SELECT stash_wide(ssn, '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17') FROM users",
+            Block("its argument for w1"),
+        ),
     ]
 }
 
@@ -2639,6 +2847,14 @@ fn test_param_sinks_memoized() {
     let (parses, blocked) = param_parses("SELECT wrap_stash(ssn) FROM users");
     assert_eq!(parses, 2);
     assert!(blocked.is_some_and(|reason| reason.contains("wrap_stash")));
+    // A body with a sink is analyzed once with every parameter as a
+    // source, then once per parameter; still once per query.
+    assert_eq!(
+        param_parses(
+            "SELECT stash_if('x', ssn) FROM users; SELECT stash_if(name, ssn), stash_if(upper(name), ssn) FROM users"
+        ),
+        (3, None)
+    );
 }
 
 #[test]

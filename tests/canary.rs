@@ -1137,6 +1137,12 @@ async fn setup_proxy(client: &Client) {
                 AS $$ SELECT a = b FROM (SELECT pg_notify('c', a)) AS n $$;
              CREATE FUNCTION recursive_fn(x INTEGER) RETURNS INTEGER LANGUAGE sql
                 AS $$ SELECT recursive_fn(x) $$;
+             -- `note` reaches a write, `guess` and `tag` only its condition.
+             CREATE FUNCTION stash_if(note TEXT, guess TEXT) RETURNS TEXT LANGUAGE sql
+                AS $$ INSERT INTO audit (note) SELECT note WHERE guess IS NOT NULL RETURNING note $$;
+             CREATE FUNCTION stash_tags(tag TEXT, VARIADIC notes TEXT[]) RETURNS TEXT LANGUAGE sql
+                AS $$ INSERT INTO audit (note) SELECT array_to_string(notes, ',') WHERE tag IS NOT NULL
+                   RETURNING note $$;
              CREATE FUNCTION plpgsql_fn() RETURNS INTEGER LANGUAGE plpgsql
                 AS $$ BEGIN RETURN 1; END $$;
              CREATE FUNCTION safe_fn(v TEXT) RETURNS TEXT LANGUAGE plpgsql
@@ -2368,6 +2374,43 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     (
         "P24",
         "SELECT recursive_fn(length(ssn)) FROM users",
+        Expect::Blocked,
+    ),
+    // Proxy-masked values may go to parameters that only reach conditions:
+    // the writes store none of them.
+    (
+        "P25",
+        "BEGIN; SELECT stash_if('x', ssn) FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Runs,
+    ),
+    (
+        "P25",
+        "BEGIN; SELECT stash_if(guess => ssn, note => 'x') FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Runs,
+    ),
+    (
+        "P25",
+        "BEGIN; SELECT stash_tags(ssn, 'a', 'b') FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Runs,
+    ),
+    (
+        "P25",
+        "SELECT id FROM users WHERE 'x' ~~~ ssn",
+        Expect::Runs,
+    ),
+    (
+        "P25",
+        "SELECT stash_if(ssn, 'x') FROM users",
+        Expect::Blocked,
+    ),
+    (
+        "P25",
+        "SELECT stash_if(note => ssn, guess => 'x') FROM users",
+        Expect::Blocked,
+    ),
+    (
+        "P25",
+        "SELECT stash_tags('t', 'a', ssn) FROM users",
         Expect::Blocked,
     ),
     // Views.
