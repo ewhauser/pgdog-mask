@@ -1,0 +1,1 @@
+SELECT * FROM stash((SELECT ssn FROM users LIMIT 1)) s

@@ -1,0 +1,1 @@
+SELECT ROW(u.id, u.name, u.ssn, u.email, u.opted_in, u.salary)::users FROM users u

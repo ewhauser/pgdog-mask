@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT array_to_string(notes, ',') WHERE tag IS NOT NULL RETURNING note

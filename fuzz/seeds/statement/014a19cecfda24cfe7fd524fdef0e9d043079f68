@@ -1,0 +1,1 @@
+ SELECT users.id, users.id AS user_id, users.ssn AS total FROM public.users;

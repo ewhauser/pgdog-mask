@@ -1,0 +1,1 @@
+SELECT ssn, email FROM users WHERE ssn = $1 AND email = $2

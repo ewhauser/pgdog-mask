@@ -1,0 +1,1 @@
+SELECT v.x FROM LATERAL (VALUES ((SELECT ssn FROM users LIMIT 1))) v(x)

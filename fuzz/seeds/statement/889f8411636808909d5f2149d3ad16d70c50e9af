@@ -1,0 +1,1 @@
+SELECT s.u FROM (SELECT upper(ssn) AS u FROM users) s

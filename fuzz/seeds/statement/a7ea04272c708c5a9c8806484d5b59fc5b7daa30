@@ -1,0 +1,1 @@
+UPDATE users SET (name, opted_in) = (SELECT ssn, true FROM users_2024 LIMIT 1)

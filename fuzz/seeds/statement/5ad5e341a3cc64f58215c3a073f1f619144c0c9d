@@ -1,0 +1,1 @@
+SELECT stash_tags(ssn, 'a', 'b') FROM users

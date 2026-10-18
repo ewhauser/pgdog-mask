@@ -1,0 +1,1 @@
+SELECT x.email FROM users u, LATERAL (SELECT email FROM contacts) x

@@ -1,0 +1,1 @@
+SELECT l.*, 1 FROM users u, LATERAL (SELECT u.*) l

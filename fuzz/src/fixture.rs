@@ -64,9 +64,23 @@ pub const MASKED_FUNCTIONS: &[&str] = &[
     "ssn_eq",
 ];
 
+/// Of [`MASKED_COLUMNS`], those `anonymous` sees through proxy masks:
+/// masked in the results only, read raw by the statement.
+pub const PROXY_COLUMNS: &[(&str, &str)] = &[
+    ("accounts", "token"),
+    ("accounts", "card"),
+    ("accounts", "balance"),
+    ("accounts", "note"),
+];
+
 /// Is this column of this fixture relation masked for `anonymous`?
 pub fn masked(relation: &str, column: &str) -> bool {
     MASKED_COLUMNS.contains(&(relation, column))
+}
+
+/// Is this column of this fixture relation masked by a proxy mask for `anonymous`?
+pub fn proxy_masked(relation: &str, column: &str) -> bool {
+    PROXY_COLUMNS.contains(&(relation, column))
 }
 
 /// Selects every column with a proxy mask, so their masks can be fuzzed.
@@ -155,7 +169,6 @@ data_type = "character varying"
 mask = "proxy"
 proxy = "ff1"
 options = { key_file = "{dir}/ff1.key" }
-fallback = "null"
 
 [[policies.rules]]
 roles = ["pii_admin"]
@@ -177,8 +190,6 @@ name = "note"
 data_type = "text"
 mask = "proxy"
 proxy = "fuzz.blocking"
-fallback = "constant"
-value = "hidden"
 
 [[policies.rules]]
 roles = ["pii_admin"]
@@ -258,11 +269,7 @@ pub fn plugin() -> &'static PluginVtable {
 /// Proxy masks of [`PROXY_STATEMENT`]: valid mask IDs for `mask_rows`.
 pub fn proxy_masks() -> &'static [ColumnMask] {
     static MASKS: LazyLock<Vec<ColumnMask>> = LazyLock::new(|| {
-        let session = Session {
-            user: MASKED_USER.into(),
-            database: DATABASE.into(),
-            ..Default::default()
-        };
+        let session = Session::new(MASKED_USER.into(), DATABASE.into());
         match plugin().statement(&session, PROXY_STATEMENT) {
             Ok(Verdict::Rewrite { columns, .. }) if columns.len() == 4 => columns,
             other => panic!("expected four proxy masks, got {other:?}"),
@@ -307,25 +314,16 @@ pub fn type_oid(data_type: &str) -> u32 {
 }
 
 pub fn column(name: &str, data_type: &str) -> Column {
-    Column {
-        name: name.into(),
-        data_type: data_type.into(),
-        type_name: data_type.into(),
-        type_oid: type_oid(data_type),
-        ..Default::default()
-    }
+    let mut column = Column::new(name, data_type);
+    column.type_name = data_type.into();
+    column.type_oid = type_oid(data_type);
+    column
 }
 
 pub fn relation(name: &str, kind: RelationKind, columns: Vec<Column>) -> Relation {
-    Relation {
-        schema: "public".into(),
-        name: name.into(),
-        kind,
-        columns,
-        parent: None,
-        definition: None,
-        options: vec![],
-    }
+    let mut relation = Relation::new("public", name, kind);
+    relation.columns = columns;
+    relation
 }
 
 fn view(name: &str, columns: &[&str], definition: &str) -> Relation {
@@ -341,10 +339,7 @@ fn view(name: &str, columns: &[&str], definition: &str) -> Relation {
 fn users_columns() -> Vec<Column> {
     let mut phone = column("phone", "text");
     phone.comment = Some("pgdog:tag=pii.phone".into());
-    phone.security_labels = vec![SecurityLabel {
-        provider: "pgdog".into(),
-        label: "pii.phone".into(),
-    }];
+    phone.security_labels = vec![SecurityLabel::new("pgdog", "pii.phone")];
     let mut id = column("id", "bigint");
     id.is_primary_key = true;
     vec![
@@ -444,20 +439,16 @@ fn sql_function(
     returns: &str,
     body: &str,
 ) -> Function {
-    Function {
-        oid,
-        schema: "public".into(),
-        name: name.into(),
-        kind: "function".into(),
-        argument_types: args.iter().map(|(_, t)| (*t).to_owned()).collect(),
-        argument_names: args.iter().map(|(n, _)| (*n).to_owned()).collect(),
-        return_type: returns.into(),
-        result: returns.into(),
-        language: "sql".into(),
-        source: body.into(),
-        volatility: "stable".into(),
-        ..Default::default()
-    }
+    let mut function = Function::new(oid, "public", name);
+    function.kind = "function".into();
+    function.argument_types = args.iter().map(|(_, t)| (*t).to_owned()).collect();
+    function.argument_names = args.iter().map(|(n, _)| (*n).to_owned()).collect();
+    function.return_type = returns.into();
+    function.result = returns.into();
+    function.language = "sql".into();
+    function.source = body.into();
+    function.volatility = "stable".into();
+    function
 }
 
 /// The functions of the fixture catalog.
@@ -561,29 +552,19 @@ pub fn functions() -> Vec<Function> {
 
 /// The operators of the fixture catalog.
 pub fn operators() -> Vec<Operator> {
+    let operator = |oid, name: &str, left: &str, function_oid, function: &str| {
+        let mut operator = Operator::new(oid, "public", name);
+        operator.left_type = Some(left.into());
+        operator.right_type = Some(left.into());
+        operator.result_type = "boolean".into();
+        operator.function_oid = function_oid;
+        operator.function_schema = "public".into();
+        operator.function_name = function.into();
+        operator
+    };
     vec![
-        Operator {
-            oid: 100,
-            schema: "public".into(),
-            name: "===".into(),
-            left_type: Some("text".into()),
-            right_type: Some("text".into()),
-            result_type: "boolean".into(),
-            function_oid: 11,
-            function_schema: "public".into(),
-            function_name: "same".into(),
-        },
-        Operator {
-            oid: 101,
-            schema: "public".into(),
-            name: "@@@".into(),
-            left_type: Some("bigint".into()),
-            right_type: Some("bigint".into()),
-            result_type: "boolean".into(),
-            function_oid: 12,
-            function_schema: "public".into(),
-            function_name: "ssn_eq".into(),
-        },
+        operator(100, "===", "text", 11, "same"),
+        operator(101, "@@@", "bigint", 12, "ssn_eq"),
     ]
 }
 
@@ -597,12 +578,11 @@ pub fn system_functions() -> Vec<String> {
 
 /// The fixture catalog, as PgDog sends it.
 pub fn catalog() -> Catalog {
-    Catalog {
-        parts: CatalogParts::ALL,
-        search_path: vec!["$user".into(), "public".into()],
-        relations: relations(),
-        functions: functions(),
-        system_functions: system_functions(),
-        operators: operators(),
-    }
+    let mut catalog = Catalog::new(CatalogParts::ALL);
+    catalog.search_path = vec!["$user".into(), "public".into()];
+    catalog.relations = relations();
+    catalog.functions = functions();
+    catalog.system_functions = system_functions();
+    catalog.operators = operators();
+    catalog
 }

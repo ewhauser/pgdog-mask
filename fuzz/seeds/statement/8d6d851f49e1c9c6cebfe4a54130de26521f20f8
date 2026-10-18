@@ -1,0 +1,1 @@
+SELECT b FROM users AS t(a, b)

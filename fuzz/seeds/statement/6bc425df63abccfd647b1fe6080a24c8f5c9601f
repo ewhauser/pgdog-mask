@@ -1,0 +1,1 @@
+WITH s AS (SELECT ssn || '' AS x FROM users) SELECT x FROM s

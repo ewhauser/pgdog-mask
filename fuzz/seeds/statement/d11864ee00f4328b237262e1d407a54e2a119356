@@ -1,0 +1,1 @@
+SELECT ssn::mytype(ssn) FROM users

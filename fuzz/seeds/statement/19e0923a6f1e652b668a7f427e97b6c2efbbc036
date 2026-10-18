@@ -1,0 +1,1 @@
+SELECT count_err_sb()

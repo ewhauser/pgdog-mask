@@ -1,0 +1,1 @@
+SELECT (u).*, 1 FROM users u WHERE id = 2

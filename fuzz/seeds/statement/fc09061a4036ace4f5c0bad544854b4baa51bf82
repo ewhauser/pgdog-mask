@@ -1,0 +1,1 @@
+UPDATE orders SET total = 0 FROM ssn_flags f WHERE f.starts_9

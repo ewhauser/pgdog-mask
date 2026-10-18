@@ -1,0 +1,1 @@
+WITH s AS MATERIALIZED (SELECT * FROM users) SELECT ssn, email FROM s

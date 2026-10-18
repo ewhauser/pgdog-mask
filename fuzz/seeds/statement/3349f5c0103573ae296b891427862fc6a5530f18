@@ -1,0 +1,1 @@
+SELECT lo_from_bytea(0, convert_to(ssn, 'UTF8')) FROM users

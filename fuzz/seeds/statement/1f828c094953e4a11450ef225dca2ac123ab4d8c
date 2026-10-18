@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE stash_if(name, ssn) IS NULL

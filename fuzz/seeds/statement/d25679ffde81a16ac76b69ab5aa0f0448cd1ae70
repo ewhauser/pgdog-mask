@@ -1,0 +1,1 @@
+ALTER TABLE orders ADD COLUMN x text DEFAULT masking_canary_proxy.user_ssn(1)

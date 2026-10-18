@@ -44,7 +44,7 @@ What they show:
 - **Exempt users** are within run-to-run variation of PgDog.
 - **SQL masks** cost 1–4% on point queries and joins.
 - **Wide `SELECT *`** costs about 25% over the simple and extended protocols, but 5% with prepared statements. The plugin's analysis is cached in all three, so the difference comes from Postgres executing the expanded, masked statement. Planning is a likely part of it: a prepared statement can reuse a plan, while the simple and extended runs plan every execution. The masked expressions are still evaluated on every execution, prepared or not, and Postgres may plan a prepared statement again for its parameters (see [`PREPARE`](https://www.postgresql.org/docs/current/sql-prepare.html)). The benchmark measures the difference; it doesn't isolate the cause.
-- **Lookups by a masked column** can't use its index, and scan the table: 99.6% lower throughput here, with 100,000 rows. With `search = "raw"`, the condition compares real values and ran within a few percent of PgDog, while results stay masked. Choose raw search for columns users look rows up by, if your security model allows it.
+- **Lookups by a SQL-masked column** can't use its index, and scan the table: 99.6% lower throughput here, with 100,000 rows. With `search = "raw"`, the condition compares real values and ran within a few percent of PgDog, while results stay masked. Choose raw search for columns users look rows up by, if your security model allows it.
 - **Proxy masks** cost per value: within variation for 20 rows, and 39–48% lower throughput for 500 rows, where every row's value goes through the plugin's HMAC. Use SQL masks unless you need a key or code.
 
 ## Per statement
@@ -64,9 +64,10 @@ Decisions are cached per statement and masking profile. Statements that differ o
 
 ## Indexes
 
-A masked column in a condition is compared through its mask: `WHERE mask(login) = $1` can't use an index on `login`. This is inherent to masking conditions (Snowflake behaves the same way) and only affects masked users filtering, joining or sorting on masked columns.
+A SQL-masked column in a condition is compared through its mask: `WHERE mask(login) = $1` can't use an index on `login`. This is inherent to masking conditions (Snowflake behaves the same way) and only affects masked users filtering, joining or sorting on masked columns.
 
 - Rules with [`search = "raw"`](../../configure/raw-search/) keep their lookups on the real column, so they use its index, as the lookup results above show.
+- [Proxy masks](../../configure/proxy-masks/) never rewrite references to the column, so conditions, joins and ordering on it use its indexes, and Postgres plans the statement as it would for an unmasked user.
 - An expression index on the exact mask expression can serve hot queries, but it must match the rewritten expression exactly, including its cast, and breaks when the policy changes.
 - [Shadow mode](../../start/shadow-mode/) shows which statements would be affected before you enforce.
 

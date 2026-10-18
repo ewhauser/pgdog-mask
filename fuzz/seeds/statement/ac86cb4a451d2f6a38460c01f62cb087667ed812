@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT a RETURNING a <> b::text

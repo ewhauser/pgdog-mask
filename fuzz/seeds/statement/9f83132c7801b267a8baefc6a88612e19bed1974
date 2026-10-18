@@ -1,0 +1,1 @@
+DELETE FROM user_names_v WHERE id = $1

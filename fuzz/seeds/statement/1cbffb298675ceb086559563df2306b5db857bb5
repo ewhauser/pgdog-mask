@@ -1,0 +1,1 @@
+BEGIN RETURN (SELECT ssn FROM public.users WHERE id = uid); END

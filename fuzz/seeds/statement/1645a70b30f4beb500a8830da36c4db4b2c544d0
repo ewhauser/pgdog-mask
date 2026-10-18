@@ -1,0 +1,1 @@
+SELECT id, ssn = 'CANARYSSN-1111' AS hit FROM users

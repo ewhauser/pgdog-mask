@@ -1,0 +1,1 @@
+ SELECT users.id, users.ssn FROM public.users WHERE (users.id > 0);

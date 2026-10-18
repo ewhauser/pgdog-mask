@@ -1,0 +1,1 @@
+UPDATE orders SET total = (SELECT length(ssn) FROM users WHERE users.id = orders.user_id)

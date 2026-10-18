@@ -1,0 +1,1 @@
+SELECT returns_d(name) FROM users

@@ -1,0 +1,1 @@
+SELECT c.relname, u.ssn FROM pg_class c, users u

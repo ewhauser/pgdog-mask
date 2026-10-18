@@ -1,0 +1,1 @@
+SELECT ssn_d(1)

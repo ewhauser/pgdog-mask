@@ -1,0 +1,1 @@
+SELECT safe_fn(ssn) FROM users

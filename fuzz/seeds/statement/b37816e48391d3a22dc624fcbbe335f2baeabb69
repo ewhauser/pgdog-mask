@@ -1,0 +1,1 @@
+SELECT CAST(ssn AS public.checked_ssn) FROM users

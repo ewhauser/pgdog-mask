@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE ssn BETWEEN SYMMETRIC 'a' AND 'z'

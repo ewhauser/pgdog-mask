@@ -7,7 +7,7 @@ Views and functions could otherwise read masked columns on a masked user's behal
 
 ## Views
 
-A view whose definition reads masked columns is **inlined**: `FROM user_ssns` becomes `FROM (<its definition>) AS user_ssns`, masked like any subquery. Nested views are inlined recursively.
+A view whose definition reads masked columns, with SQL or proxy masks, is **inlined**: `FROM user_ssns` becomes `FROM (<its definition>) AS user_ssns`, masked like any subquery. Nested views are inlined recursively. Inlining doesn't change the plan, because Postgres expands views into subqueries the same way. A proxy-masked column the view passes through keeps its proxy mask, and columns the view computes from it return `NULL`.
 
 Some views are queried **like tables** instead:
 
@@ -16,30 +16,98 @@ Some views are queried **like tables** instead:
 - views with masked columns of their own (assigned in `[[masked_columns]]` or by tags);
 - every view, with `inline_views = false`.
 
-Columns of a table-like view that pass a masked column through unchanged get its mask. Columns computed from masked columns are blocked, unless you assign them a policy.
+Columns of a table-like view that pass a masked column through unchanged get its mask, SQL or proxy. Columns computed from masked columns are blocked, unless you assign them a policy. When every masked column one is computed from has a proxy mask for the user, it returns `NULL` instead, and conditions on it use real values. Which masked columns a column is computed from also covers values that don't come from column references; see [Columns filled by functions](#columns-filled-by-functions).
 
-Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked.
+Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked. For users with proxy masks, every write has its [errors redacted](../errors/#per-statement-redaction), through a view or not: the triggers and constraints of the tables it writes run on real values.
 
-`view_allowlist` lists views masked users may query without analysis. Listing one attests that it doesn't return masked data.
+`view_allowlist` lists views masked users may query without analysis. Listing one attests that it doesn't return masked data, and, for a view queried like a table, that its definition doesn't send masked data anywhere else (below).
+
+### What a table-like view's definition does
+
+Only the columns of a table-like view are masked. Its definition runs on real values whenever the view is read or written through, whatever columns the statement uses. So the plugin analyzes the definition the way Postgres runs it: every masked column carries its real value, whether its mask is SQL or proxy, and nothing is rewritten. The view is blocked for every masked user if its definition would move those values anywhere but its columns:
+
+- to a built-in with a side effect, such as `pg_notify`, `set_config` or an advisory lock;
+- to a parameter of a SQL function that can reach a write or a side effect, directly or through another function;
+- to a type that isn't built in, by a cast or a function's parameter or result: a domain's checks and a user-defined cast's function run on the value.
+
+It's also blocked if the definition can't be analyzed, for instance if it calls a function that isn't in the catalog or one that's never allowed, such as `dblink`. Nested views and the bodies of SQL functions it calls are analyzed the same way.
+
+For example, with
+
+```sql
+CREATE VIEW notify_sb WITH (security_barrier) AS
+  SELECT id, pg_notify('c', ssn)::text AS n FROM users;
+```
+
+`SELECT id FROM notify_sb` would notify every listener of `c`, which a masked user can be, of every raw SSN. It's blocked:
+
+```text
+view public.notify_sb is queried like a table, so its definition runs on real values: pg_notify() would move values of masked columns (public.users.ssn) where PgDog can't mask them
+```
+
+The definition's errors can quote those values too, as in `WHERE ssn::int > 0`, which fails with `invalid input syntax for type integer: "123-45-6789"`. So a statement that reads such a view, or writes through it, has its errors [redacted](../errors/#views-queried-like-tables) for every masked user, including users with only SQL masks, if the definition computes with masked columns, writes, or calls a function the plugin can't analyze.
+
+Functions the plugin can't analyze, written in PL/pgSQL, C or another language, aggregates, and functions of extensions, are the exception. In a table-like view's definition, they may be called with values of unmasked columns, which is how `security_barrier` views usually filter rows: `WHERE can_see(id)` is fine. Each of their arguments counts as reaching a side effect, so `WHERE can_see(ssn)` blocks the view, and their result counts as computed from every masked column: a column of the view that holds it is masked as such ([below](#columns-filled-by-functions)). They may write, or read masked columns on their own, so reading such a view has its errors redacted, for every masked user.
+
+This is a trade-off: a function the plugin can't analyze that reads masked columns on its own, and sends them anywhere but the view's columns, isn't caught. Masked users can't call such functions directly, but a table-like view can call them on their behalf. Functions in `udf_allowlist` or `extension_allowlist` are trusted as elsewhere, and may be passed values of masked columns.
+
+Materialized views aren't affected: their definition runs only on `REFRESH`, which masked users can't run. What it put in their columns is checked, though ([below](#columns-filled-by-functions)).
+
+### Columns filled by functions
+
+Lineage only follows column references. A function computes its result from whatever its body reads, so a table-like view's column can hold masked values that no column reference in the definition shows:
+
+```sql
+CREATE FUNCTION get_ssn(uid BIGINT) RETURNS TEXT LANGUAGE sql STABLE
+  AS $$ SELECT ssn FROM users WHERE id = uid $$;
+CREATE VIEW fn_sb WITH (security_barrier) AS
+  SELECT id, get_ssn(id) AS s FROM users;
+```
+
+`s` is computed from `id` as far as lineage goes, but holds every raw SSN. So when the schema loads, the plugin also analyzes each table-like view's definition as Postgres runs it, on real values, once for each policy, and a column that would hold values of a policy's columns counts as computed from them, whatever the reason:
+
+- a SQL function whose body reads them, directly or through other functions;
+- a set-returning function in `FROM` that returns them;
+- a function the plugin can't analyze, which counts as reading every masked column;
+- a column of a materialized view, or of another table-like view, computed from them.
+
+Such a column is blocked for users with a SQL mask on any of those columns, and returns `NULL` for users with only proxy masks on them, like any computed column:
+
+```text
+column public.fn_sb.s is computed from masked columns and can't be masked; assign it a policy
+```
+
+A column that would hold none, like `id` above, isn't affected.
+
+This applies to materialized views too: their columns hold what the definition computed when it last ran. If the definition can't be analyzed at all, for instance if it calls `query_to_xml`, every column counts as computed from every masked column.
+
+To read such a column, assign it a policy of its own with `[[masked_columns]]`, which masks it whatever it holds; allow a function the plugin can't analyze with `udf_allowlist`, if it can't return masked data; or list the view in `view_allowlist`, which attests that it returns no masked data.
 
 ## SQL functions
 
 SQL-language functions are analyzed:
 
 - A function that reads no masked columns is called as is.
-- One that does is **inlined** with masks applied, if both the function and the call allow it (below).
-- Otherwise the statement is blocked.
+- One that reads SQL-masked columns is **inlined** with masks applied, if both the function and the call allow it (below). Otherwise the statement is blocked.
+- One that reads only proxy-masked columns is called as is, never inlined, since inlining could change the plan. Its result is `NULL`, and the statement's [errors are redacted](../errors/#per-statement-redaction). `SECURITY DEFINER` and `SET` options don't matter for these. Volatility matters only under `EXPLAIN`: `EXPLAIN [ANALYZE]` of a call to one that is `IMMUTABLE`, or to a function that calls one, is blocked, because the planner can compute the result in advance and the plan would show it. Declare such functions `STABLE`.
+- One whose body writes, such as an `UPDATE`, makes the statement's errors redacted for users with proxy masks, as the write itself would.
+- A call that passes proxy-masked values as arguments, such as `last4(ssn)`, returns `NULL`. The plugin also checks the function's body for each parameter: a call is blocked if it passes proxy-masked values to a parameter that could reach a write or a side effect, such as an `INSERT` or `pg_notify`, directly or through another function. A parameter used only in conditions, such as the `WHERE` of the `INSERT`, can take them. A function call's arguments are matched to parameters the way Postgres does it, by position or by name, with the extra arguments of a `VARIADIC` function going to its last parameter; an operator's operands are handled differently (below). When they can't be matched, such as a named argument that one overload doesn't have, or the function has more than 16 parameters, every parameter counts as reaching the sink. Every overload the call could resolve to is checked. This check applies under plain `EXPLAIN` too: the planner can call an operator's function on values from the column's statistics.
+- A function whose body changes name resolution, with `SET search_path`, `SET ROLE`, `RESET ALL`, `DISCARD ALL`, or `set_config` of `search_path` or `role`, is blocked for every masked user. The change would outlive the call without the plugin seeing it. A function's own `SET search_path` option is fine: Postgres restores it when the function returns.
 
-User-defined operators are treated as calls to their functions.
+Converting a value to a type that isn't built in, such as a domain, can run user-defined code: the domain's `CHECK` constraints, or the function of a cast created with `CREATE CAST`. So a call passing proxy-masked values to a parameter of such a type is blocked, as is a call to a function returning one, other than a table's row type, if its result is computed from proxy-masked values. Casts follow the same rule.
+
+User-defined operators are treated as calls to their functions, however they're applied: `a op b`, `IN` and `NOT IN`, `LIKE`, `BETWEEN`, `NULLIF`, `IS DISTINCT FROM`, `CASE x WHEN`, `ANY`, `ALL` or `IN` over a subquery, `ORDER BY … USING`, and the merged columns of `JOIN … USING` and `NATURAL JOIN`. Only `a op b` can be inlined; the others are blocked if the operator's function reads SQL-masked columns. As for functions, once an unqualified operator resolves to a user-defined one on the `search_path`, operators of the same name in other schemas count too: Postgres may resolve it with another `search_path` than the one PgDog reports.
+
+The planner can also run an operator's commutator, with the operands swapped, for instance to estimate `1 < col` from the column's statistics, and its negator, for `NOT (a op b)`. The catalog doesn't say which operators those are. So for proxy-masked values, each operand counts as reaching every parameter of the operator's function, and of the function of every user-defined operator with the same operand types or swapped ones: an operator is blocked with proxy-masked operands if any of these functions can pass a parameter to a write or a side effect, or can't be analyzed. Their bodies also count as the operator's own: the result is `NULL` if one reads proxy-masked columns, errors are redacted if one writes, and the operator is blocked if one reads SQL-masked columns, since it can't be inlined in the planner's place.
 
 ### When a function can be inlined
 
-The function must:
+These conditions only concern functions whose body reads SQL-masked columns. The function must:
 
 - have a body that's a single `SELECT`, not selecting `*`;
 - be `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, with no `SET` options;
 - not be polymorphic, `VARIADIC` or recursive;
-- be the only function the call could resolve to: if several overloads match the name and number of arguments, and one reads masked columns, the call is blocked.
+- be the only function the call could resolve to: if several overloads match the name and number of arguments, and one reads masked columns, the call is blocked. Functions of the same name in schemas outside the `search_path` count, since Postgres may resolve the call with another `search_path` than the one PgDog reports.
 
 The call must be a plain call:
 
@@ -58,7 +126,7 @@ Pass every argument explicitly, by position, to keep a call inlinable. Blocked c
 
 ## Code the plugin can't analyze
 
-Functions in PL/pgSQL, C or other languages, functions of extensions, and functions not in the catalog are blocked for masked users. If such a function can't return masked data, allow it:
+Functions in PL/pgSQL, C or other languages, functions of extensions, and functions not in the catalog are blocked for masked users. Only the definition of a view queried like a table may call those in the catalog, with values of unmasked columns ([above](#what-a-table-like-views-definition-does)). If such a function can't return masked data, allow it:
 
 ```toml
 [general]
@@ -66,4 +134,4 @@ udf_allowlist = ["public.normalize_phone"]   # functions, schema-qualified
 extension_allowlist = ["citext"]             # all functions and operators of an extension
 ```
 
-Listing a function or extension attests that it doesn't return or leak masked data. The plugin calls it without analysis.
+Listing a function or extension attests that it doesn't return or leak masked data. The plugin calls it without analysis. Listed functions may also be called with proxy-masked values; their results return `NULL`.

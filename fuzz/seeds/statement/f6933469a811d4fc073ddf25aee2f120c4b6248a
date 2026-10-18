@@ -1,0 +1,1 @@
+SELECT JSON_QUERY(to_jsonb(ssn), '$'), JSON_EXISTS(to_jsonb(ssn), '$') FROM users

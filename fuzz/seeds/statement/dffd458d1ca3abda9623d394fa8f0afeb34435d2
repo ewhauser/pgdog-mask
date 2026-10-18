@@ -1,0 +1,1 @@
+SELECT o.id FROM orders o JOIN err_sb e ON e.id = o.user_id

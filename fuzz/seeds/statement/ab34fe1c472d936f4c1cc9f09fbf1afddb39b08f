@@ -1,0 +1,1 @@
+SELECT JSON_SCALAR(ssn), JSON_SERIALIZE(JSON(ssn::text)) FROM users

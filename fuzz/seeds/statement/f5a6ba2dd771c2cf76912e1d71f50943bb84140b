@@ -1,0 +1,1 @@
+COPY (SELECT id, upper(ssn) FROM users) TO STDOUT

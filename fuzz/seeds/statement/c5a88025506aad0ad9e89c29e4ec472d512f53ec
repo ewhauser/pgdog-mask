@@ -1,0 +1,1 @@
+SELECT ssn FROM users GROUP BY 1

@@ -1,0 +1,1 @@
+SELECT l.v FROM users u, LATERAL (SELECT u.email AS v FROM (orders u JOIN orders o ON true) AS j) l

@@ -1,0 +1,1 @@
+SELECT x.o, x.a FROM users u, XMLTABLE('/r' PASSING (u.ssn::xml) COLUMNS o FOR ORDINALITY, a text PATH '.') x

@@ -1,0 +1,1 @@
+UPDATE users SET name = 'deferred' WHERE id = 2

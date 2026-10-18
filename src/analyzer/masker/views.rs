@@ -1,81 +1,169 @@
 //! Views over masked columns.
 //!
-//! A view whose definition reads masked columns is inlined: `FROM v` becomes
-//! `FROM (<definition>) AS v(columns)`, and the definition is then masked like
-//! any subquery. Views that would change meaning if inlined (`security_barrier`,
+//! A view whose definition reads masked columns (SQL or proxy) is inlined:
+//! `FROM v` becomes `FROM (<definition>) AS v(columns)`, and the definition is
+//! then masked like any subquery. Postgres expands views the same way, so this
+//! doesn't change plans. Views that would change meaning if inlined (`security_barrier`,
 //! `security_invoker`, materialized views, views with their own masked columns,
 //! or all views with `inline_views = false`) are queried like tables instead;
 //! their columns are masked by lineage (see `Assignments`).
-use pg_raw_parse::{Node, make::Unique, nodes};
+//!
+//! The definition of a table-like view runs on real values, whatever the
+//! user's masks: it's analyzed with every masked column carrying its value,
+//! like a proxy-masked one, and nothing rewritten. Its columns are masked,
+//! but nothing else is: if it would move values anywhere else, e.g. to
+//! `pg_notify()`, or can't be analyzed, the view can't be read. A function
+//! that can't be analyzed is the exception: it can be called there, but not
+//! with values of masked columns.
+//!
+//! Lineage only follows column references, so the same analysis also tells,
+//! at catalog load, which of a table-like view's columns its definition
+//! fills with values of masked columns some other way, e.g. through a
+//! function's body (`view_outputs`). Materialized views hold what their
+//! definition computed, so theirs are analyzed too.
+use std::cell::RefCell;
+use std::rc::Rc;
 
-use super::{Masker, Verdict, find_cte, ident, names};
+use pg_raw_parse::{Node, make::MemoryToken, make::Unique, nodes};
+
+use super::{BodyInfo, Masker, Memo, Verdict, find_cte, ident, names};
+use crate::analyzer::Context;
 use crate::catalog::{Relation, RelationKind};
+use crate::config::General;
+
+/// Is a view trusted by the configuration?
+pub(in crate::analyzer) fn view_allowlisted(general: &General, relation: &Relation) -> bool {
+    let qualified = relation.qualified_name();
+    general
+        .view_allowlist
+        .iter()
+        .any(|v| *v == qualified || *v == relation.name)
+}
+
+/// For each table-like view, which of its columns its definition, run on
+/// real values, fills with values of the columns `ctx.profile` masks: `None`
+/// if that can't be told.
+pub(in crate::analyzer) fn view_outputs<'c>(
+    mem: MemoryToken<'_>,
+    ctx: &'c Context<'c>,
+    views: &[&'c Relation],
+) -> Vec<Option<Vec<bool>>> {
+    let memo: Rc<RefCell<Memo>> = Rc::default();
+    views
+        .iter()
+        .map(|relation| {
+            let mut masker = Masker::new(mem, ctx);
+            masker.real_values = true;
+            masker.outputs_only = true;
+            masker.memo = memo.clone();
+            masker.definition_outputs(relation)
+        })
+        .collect()
+}
 
 impl<'c, 'mem> Masker<'c, 'mem> {
-    /// What reading a view means for this user. Tables and table-like views are `Safe`:
-    /// their masked columns are handled like any table's.
+    /// What reading a view means for this user. Tables are `Safe`, and so
+    /// are table-like views their definition allows: their masked columns
+    /// are handled like any table's.
     pub(super) fn view_verdict(&mut self, relation: &Relation) -> Verdict {
         if !matches!(
             relation.kind,
             RelationKind::View | RelationKind::MaterializedView
         ) || self.view_allowlisted(relation)
-            || self
-                .ctx
-                .assignments
-                .is_table_like(&relation.schema, &relation.name)
         {
             return Verdict::Safe;
         }
+        let table_like = self
+            .ctx
+            .assignments
+            .is_table_like(&relation.schema, &relation.name);
+        // A materialized view holds a copy: its definition only runs on
+        // REFRESH.
+        if table_like && relation.kind == RelationKind::MaterializedView {
+            return Verdict::Safe;
+        }
 
+        let info = if table_like && !self.real_values {
+            self.real_values_masker().view_info(relation, true)
+        } else {
+            self.view_info(relation, table_like)
+        };
+        self.touched |= info.touched;
+        // A view calling a function that writes, or computing on values of
+        // masked columns that aren't rewritten, may quote them in messages.
+        // Inlined, only proxy-masked ones aren't; queried like a table, no
+        // masked column is, whatever the user's masks.
+        self.state.body_redacts |= info.redacts;
+        info.verdict
+    }
+
+    /// A view's definition, analyzed for this user. Memoized.
+    fn view_info(&mut self, relation: &Relation, table_like: bool) -> BodyInfo {
         let key = (relation.schema.clone(), relation.name.clone());
-        if let Some((verdict, touched)) = self.memo.borrow().views.get(&key).cloned() {
-            self.touched |= touched;
-            return verdict;
+        if let Some(info) = self.memo.borrow().views.get(&key).cloned() {
+            return info;
         }
 
         let label = relation.qualified_name();
         let active = format!("view {label}");
-        let (verdict, touched) = match relation.definition.as_deref() {
-            None => (
-                Verdict::Blocked(format!(
-                    "view {label} has no definition in the catalog, so it can't be checked for masked columns"
-                )),
-                false,
-            ),
-            Some(_) if self.memo.borrow().active.contains(&active) => (
-                Verdict::Blocked(format!("view {label} is recursive")),
-                false,
-            ),
+        let info = match relation.definition.as_deref() {
+            None => BodyInfo::blocked(format!(
+                "view {label} has no definition in the catalog, so it can't be checked for masked columns"
+            )),
+            Some(_) if self.memo.borrow().active.contains(&active) => {
+                BodyInfo::blocked(format!("view {label} is recursive"))
+            }
             Some(definition) => {
                 self.memo.borrow_mut().active.push(active);
                 // Definitions are schema-qualified, so no search_path is needed.
-                let (verdict, touched) = self.analyze_body(definition, vec![], |_| Ok(()));
+                let mut info = self.analyze_body(definition, vec![], |_| Ok(()));
                 self.memo.borrow_mut().active.pop();
-                let verdict = match verdict {
+                info.verdict = match info.verdict {
+                    Verdict::Blocked(reason) if table_like => Verdict::Blocked(format!(
+                        "view {label} is queried like a table, so its definition runs on real values: {reason}"
+                    )),
                     Verdict::Blocked(reason) => Verdict::Blocked(format!("view {label}: {reason}")),
+                    // Inlined, so what its columns carry is known.
+                    Verdict::Safe if info.reads_proxies && !table_like => Verdict::Inline,
                     verdict => verdict,
                 };
-                (verdict, touched)
+                info
             }
         };
 
-        self.memo
-            .borrow_mut()
-            .views
-            .insert(key, (verdict.clone(), touched));
-        self.touched |= touched;
-        verdict
+        self.memo.borrow_mut().views.insert(key, info.clone());
+        info
     }
 
     fn view_allowlisted(&self, relation: &Relation) -> bool {
-        let qualified = relation.qualified_name();
-        self.ctx
-            .policies
-            .config
-            .general
-            .view_allowlist
-            .iter()
-            .any(|v| *v == qualified || *v == relation.name)
+        view_allowlisted(&self.ctx.policies.config.general, relation)
+    }
+
+    /// Which columns a view's definition fills with values of masked
+    /// columns, analyzed as the top-level statement it is when the view is
+    /// queried like a table: its result masks are those columns. `None` if
+    /// it has no definition or can't be analyzed.
+    fn definition_outputs(&mut self, relation: &Relation) -> Option<Vec<bool>> {
+        let definition = relation.definition.as_deref()?;
+        let mut stmts = self.mem.parse(definition).ok()?;
+        if stmts.as_ref().iter().count() != 1 {
+            return None;
+        }
+        let active = format!("view {}", relation.qualified_name());
+        self.memo.borrow_mut().active.push(active);
+        for stmt in stmts.as_mut() {
+            self.statement(stmt);
+            self.finish_statement(0);
+        }
+        self.memo.borrow_mut().active.pop();
+        if self.blocked.is_some() {
+            return None;
+        }
+        let mut tainted = vec![false; relation.columns.len()];
+        for column in &self.results.columns {
+            *tainted.get_mut(usize::from(column.column))? = true;
+        }
+        Some(tainted)
     }
 
     /// `FROM v` for a view over masked columns: `(<definition>) AS v(columns)`.
@@ -83,7 +171,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         &mut self,
         range_var: &nodes::RangeVar,
     ) -> Option<Unique<'mem, Node<'mem>>> {
-        if !self.from {
+        // After a change of name resolution, `add_range_var` blocks it.
+        if !self.from || self.path_changed {
             return None;
         }
         let name = range_var.relname()?;
@@ -91,10 +180,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if schema.is_none() && find_cte(&self.frames, name).is_some() {
             return None;
         }
-        let relation = self
-            .ctx
-            .catalog
-            .resolve(schema, name, &self.ctx.search_path)?;
+        let relation = self.resolve_relation(schema, name)?;
         if relation.kind != RelationKind::View || self.view_verdict(relation) != Verdict::Inline {
             return None;
         }
@@ -141,11 +227,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let Some(name) = range_var.relname() else {
             return;
         };
-        let Some(relation) =
-            self.ctx
-                .catalog
-                .resolve(range_var.schemaname(), name, &self.ctx.search_path)
-        else {
+        let Some(relation) = self.resolve_relation(range_var.schemaname(), name) else {
             return;
         };
         if !matches!(

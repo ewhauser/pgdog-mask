@@ -1,0 +1,1 @@
+SELECT public.imm_ssn(uid)

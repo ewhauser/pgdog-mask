@@ -1,0 +1,1 @@
+SELECT noisy_eq('x', ssn) FROM users

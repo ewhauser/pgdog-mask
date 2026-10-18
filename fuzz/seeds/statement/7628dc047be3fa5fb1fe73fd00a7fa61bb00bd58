@@ -1,0 +1,1 @@
+UPDATE users SET name = 'x' FROM archive a, LATERAL (SELECT ssn AS v) l WHERE l.v = 'y'

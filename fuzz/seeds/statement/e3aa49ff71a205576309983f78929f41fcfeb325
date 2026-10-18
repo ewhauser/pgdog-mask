@@ -1,0 +1,1 @@
+BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK

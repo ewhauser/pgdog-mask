@@ -1,0 +1,1 @@
+SELECT ssn::text IS JSON, ssn::text IS JSON SCALAR FROM users

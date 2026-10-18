@@ -1,0 +1,1 @@
+EXPLAIN SELECT notify_fn(ssn) FROM users

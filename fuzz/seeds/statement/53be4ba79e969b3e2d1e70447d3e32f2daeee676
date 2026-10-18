@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE EXISTS (SELECT 1 FROM users_2024 p WHERE p.ssn = users.ssn)

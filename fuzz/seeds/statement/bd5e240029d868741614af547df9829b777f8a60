@@ -1,0 +1,1 @@
+SELECT stash_tags('t', VARIADIC ARRAY[ssn]) FROM users

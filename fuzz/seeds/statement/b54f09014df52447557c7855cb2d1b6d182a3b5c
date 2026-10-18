@@ -1,0 +1,1 @@
+SET "Search_Path" TO other; SELECT 1 FROM orders

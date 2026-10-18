@@ -1,0 +1,1 @@
+WITH RECURSIVE r(n, s) AS (SELECT 1, ssn FROM users WHERE id = 1 UNION ALL SELECT n + 1, s FROM r WHERE n < 3) SELECT s FROM r

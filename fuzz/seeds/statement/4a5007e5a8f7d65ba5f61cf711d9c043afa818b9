@@ -1,0 +1,1 @@
+SELECT stash_if(nope => ssn, note => 'x') FROM users

@@ -1,0 +1,1 @@
+SELECT s FROM users u, stash_if(u.ssn, u.name) s

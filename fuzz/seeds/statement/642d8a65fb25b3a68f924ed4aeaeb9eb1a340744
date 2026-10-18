@@ -1,0 +1,1 @@
+BEGIN; EXPLAIN ANALYZE UPDATE users SET name = 'x' WHERE ssn = 'x'; ROLLBACK

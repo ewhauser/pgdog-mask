@@ -1,0 +1,1 @@
+SELECT stash_if_q(ssn, 'x') FROM users

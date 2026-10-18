@@ -14,6 +14,8 @@ The plugin logs through PgDog's logger. Every message starts with `[pgdog_mask]`
 | Statement blocked | `warn` | `blocked statement for user "support_app": <reason> [<statement>]` |
 | Statement rewritten (`enforce`) | `debug` | `rewrote statement for user "support_app", masked {"public.users.ssn"}: <statement>` |
 | Statement would be rewritten (`shadow`) | `info` | `(shadow) would rewrite statement for user "support_app", …` |
+| Statement's results or errors would be masked by proxy masks (`shadow`) | `info` | `(shadow) would mask results for user "oncall": 1 proxy, 1 NULL, errors redacted: yes: <statement>` |
+| Statement's results or errors masked by proxy masks (`enforce`) | `debug` | the same summary as in shadow mode |
 | [Raw search](../../configure/raw-search/) | `info` | `user "support_app" searched raw values of {"public.users.ssn"}` |
 | A [database tag](../../configure/columns/#tags-in-the-database) was removed | `warn` | `tag "pii.ssn" was removed from column public.users.ssn …` |
 | A column's tags don't resolve to one policy | `error` | `column public.users.ssn has tags ["pii.snn"] with no [[tags]] entry; …` |
@@ -22,7 +24,7 @@ Statements are logged normalized, with literals replaced by placeholders. Parame
 
 ## Analysis logs, not an audit trail
 
-Statement messages (blocked, rewritten, raw search) are written when the plugin **analyzes** a statement, not each time a statement runs. Analyses are reused without logging:
+Statement messages (blocked, rewritten, results masked, raw search) are written when the plugin **analyzes** a statement, not each time a statement runs. Analyses are reused without logging:
 
 - **Repeated statements.** Decisions are cached per statement, masking profile, `search_path`, and configuration and catalog version. A repeat is answered from the cache and logs nothing. Statements that differ only in their literal values share one analysis, so `WHERE id = 1` and `WHERE id = 2` produce one message between them.
 - **Users with the same profile.** The cache is keyed by profile, not by user (unless the `search_path` contains `$user`). If `alice` and `bob` have the same masking roles, a statement already analyzed for `alice` runs for `bob` without a message. The user a message names is the one whose statement caused the analysis.
@@ -31,11 +33,11 @@ Statement messages (blocked, rewritten, raw search) are written when the plugin 
 
 The cache starts over after a reload or a schema change, and evicts entries beyond `cache_size`, so a statement can be logged again later.
 
-What the logs tell you is which statement shapes were blocked, rewritten or searched by raw value, and one user they were seen for. They don't say how often that happened, or every user who did it. Don't rely on them as a complete access log, or to detect someone probing a raw-search column: pgdog-mask doesn't provide a complete audit log.
+What the logs tell you is which statement shapes were blocked, rewritten, masked in their results or searched by raw value, and one user they were seen for. They don't say how often that happened, or every user who did it. Don't rely on them as a complete access log, or to detect someone probing a raw-search column: pgdog-mask doesn't provide a complete audit log.
 
-### Shadow mode and proxy masks
+### Proxy masks
 
-In [shadow mode](../../start/shadow-mode/), a statement whose only masking would be done by [proxy masks](../../configure/proxy-masks/), in the results, logs no `would rewrite` message: the statement wouldn't change. The columns a `would rewrite` message lists are the ones masked in the statement, including proxy mask fallbacks; output columns a proxy mask would mask aren't listed.
+[Proxy masks](../../configure/proxy-masks/) don't change the statement, so a statement that only proxy masks affect, by masking its results or redacting its errors, logs a results message instead of a rewrite: `would mask results` at `info` in [shadow mode](../../start/shadow-mode/), and at `debug` in `enforce` mode. It counts the output columns that get a proxy mask and those replaced with `NULL`, across every statement of the query, and says whether errors are redacted. A statement that's also rewritten, for SQL-masked columns or to expand `*`, adds the same summary to its rewrite message. The columns a rewrite message lists are the ones masked in the statement; proxy-masked columns aren't listed, since references to them aren't rewritten.
 
 ## Confirm the active configuration
 

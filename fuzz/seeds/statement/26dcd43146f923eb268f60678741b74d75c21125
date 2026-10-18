@@ -1,0 +1,1 @@
+SELECT u.ssn, u.email, p.mrn FROM users u JOIN patients p ON p.user_id = u.id

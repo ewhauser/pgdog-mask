@@ -1,0 +1,1 @@
+SELECT (SELECT total FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total) LIMIT 1) FROM orders

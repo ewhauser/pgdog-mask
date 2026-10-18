@@ -1,0 +1,1 @@
+SELECT b FROM users AS x(a, b) WHERE x.a = $1

@@ -1,0 +1,1 @@
+SELECT numeric(ssn) '1' FROM users

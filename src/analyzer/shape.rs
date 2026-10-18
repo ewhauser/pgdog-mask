@@ -20,6 +20,7 @@ use std::sync::LazyLock;
 
 use pg_raw_parse::{
     Node, NodeMut, make, nodes,
+    raw::{CoercionForm, XmlExprOp},
     transform::{self, Assignable, Transform},
 };
 
@@ -86,6 +87,20 @@ impl<'mem> Transform<'mem> for Placeholders<'mem> {
             NodeMut::A_Const(constant) => Some(self.deparse(constant)),
             // Options are not expressions: leave their literals alone.
             NodeMut::DefElem(_) => return,
+            NodeMut::FuncCall(call) => {
+                let name = call.funcname().iter().next_back().and_then(|n| n.as_str());
+                // Whether set_config is allowed depends on its literal
+                // arguments. NORMALIZE's form is a keyword the deparser reads
+                // from a literal.
+                if name == Some("set_config")
+                    || (call.funcformat == CoercionForm::COERCE_SQL_SYNTAX
+                        && matches!(name, Some("normalize" | "is_normalized")))
+                {
+                    self.failed = true;
+                    return;
+                }
+                None
+            }
             _ => None,
         };
         match literal {
@@ -100,6 +115,29 @@ impl<'mem> Transform<'mem> for Placeholders<'mem> {
             Some(None) => self.failed = true,
             None => transform::transform_node(node.into_inner(), self),
         }
+    }
+
+    // The deparser reads these literals as literals: replacing them would
+    // write garbage, or crash it.
+
+    /// Type modifiers, e.g. `numeric(10, 2)` or `interval minute`, are part
+    /// of the type.
+    fn transform_type_name<'mutref>(&mut self, _node: nodes::TypeNameMut<'mem, 'mutref>) {}
+
+    /// JSON_TABLE paths.
+    fn transform_json_table_path_spec<'mutref>(
+        &mut self,
+        _node: nodes::JsonTablePathSpecMut<'mem, 'mutref>,
+    ) {
+    }
+
+    /// XMLROOT's version and standalone arguments.
+    fn transform_xml_expr<'mutref>(&mut self, node: nodes::XmlExprMut<'mem, 'mutref>) {
+        if node.op == XmlExprOp::IS_XMLROOT {
+            self.failed = true;
+            return;
+        }
+        transform::transform_xml_expr(node, self);
     }
 }
 
@@ -216,6 +254,34 @@ mod test {
             literals("SELECT '__pgdog_lit_0'").is_none(),
             "forged placeholder"
         );
+    }
+
+    #[test]
+    fn test_literals_the_deparser_needs() {
+        // Type modifiers stay in the shape.
+        let shape = literals("SELECT x::interval(2), '1 day'::interval minute, 1 FROM t").unwrap();
+        assert!(shape.shape.contains("::interval(2)"), "{shape:?}");
+        assert!(shape.shape.contains("::interval minute"), "{shape:?}");
+        let shape = literals("SELECT '1'::numeric(10, 2)").unwrap();
+        assert_eq!(shape.values, ["'1'"]);
+        // JSON_TABLE paths stay too (replacing them crashed the deparser).
+        let shape = literals(
+            "SELECT * FROM JSON_TABLE('{}'::jsonb, '$' COLUMNS (a text PATH '$.a')) j WHERE a = 'x'",
+        )
+        .unwrap();
+        assert_eq!(shape.values, ["'{}'", "'x'"]);
+        assert!(shape.shape.contains("'$.a'"), "{shape:?}");
+        // Not shaped.
+        assert!(literals("SELECT xmlroot('<a/>'::xml, version '1.0', standalone yes)").is_none());
+        assert!(literals("SELECT normalize('a', NFC)").is_none());
+        assert!(literals("SELECT 'a' IS NFC NORMALIZED").is_none());
+    }
+
+    #[test]
+    fn test_set_config_not_shaped() {
+        assert!(literals("SELECT set_config('app.x', 'v', false)").is_none());
+        assert!(literals("SELECT id, pg_catalog.set_config('a', 'b', true) FROM t").is_none());
+        assert!(literals("SELECT * FROM set_config('a', 'b', true)").is_none());
     }
 
     #[test]

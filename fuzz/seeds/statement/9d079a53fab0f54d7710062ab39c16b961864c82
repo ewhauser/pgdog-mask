@@ -1,0 +1,1 @@
+EXPLAIN INSERT INTO audit (note) SELECT ssn FROM users

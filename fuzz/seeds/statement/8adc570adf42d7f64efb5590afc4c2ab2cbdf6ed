@@ -1,0 +1,1 @@
+SELECT id, ssn, email FROM users WHERE email LIKE $1 AND ssn = $2 ORDER BY ssn

@@ -1,0 +1,1 @@
+SELECT wrap_stash_if('x', ssn) FROM users

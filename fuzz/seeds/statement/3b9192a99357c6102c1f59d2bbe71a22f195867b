@@ -1,0 +1,1 @@
+EXPLAIN SELECT imm_ssn(1)

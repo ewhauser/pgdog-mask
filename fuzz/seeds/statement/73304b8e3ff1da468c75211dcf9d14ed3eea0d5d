@@ -1,0 +1,1 @@
+SELECT (SELECT s.ssn FROM ((SELECT 'clean'::varchar AS ssn) s CROSS JOIN orders o) AS j LIMIT 1) FROM (SELECT ssn FROM users) s

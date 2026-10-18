@@ -1,0 +1,1 @@
+SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM (orders u CROSS JOIN orders o) AS j WHERE u.ssn LIKE 'x%')

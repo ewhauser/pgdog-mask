@@ -1,0 +1,1 @@
+WITH ins AS (INSERT INTO orders (user_id, total) SELECT id, 0 FROM users WHERE ssn = $1 RETURNING id) SELECT count(*) FROM ins

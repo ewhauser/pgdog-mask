@@ -1,0 +1,1 @@
+SELECT pg_restore_relation_stats('relation', 'public.audit'::regclass, 'relpages', length(ssn)) FROM users

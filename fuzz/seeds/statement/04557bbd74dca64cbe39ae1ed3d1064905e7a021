@@ -1,0 +1,1 @@
+SELECT public.users.to_jsonb FROM public.users

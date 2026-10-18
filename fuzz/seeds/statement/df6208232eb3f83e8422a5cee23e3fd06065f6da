@@ -1,0 +1,1 @@
+SELECT ssn, ssn AS again FROM users

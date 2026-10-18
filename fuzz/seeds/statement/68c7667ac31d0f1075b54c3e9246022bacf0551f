@@ -1,0 +1,1 @@
+EXPLAIN ANALYZE SELECT pg_notify('ch', ssn) FROM users

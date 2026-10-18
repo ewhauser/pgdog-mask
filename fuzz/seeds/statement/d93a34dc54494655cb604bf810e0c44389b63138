@@ -1,0 +1,1 @@
+SELECT cast_d(ssn) FROM users

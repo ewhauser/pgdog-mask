@@ -1,0 +1,1 @@
+SELECT string_agg(ssn, ',') FROM users

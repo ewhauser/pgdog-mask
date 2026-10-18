@@ -1,0 +1,1 @@
+SELECT x.ssn FROM users u JOIN LATERAL (SELECT ssn FROM archive) x ON true

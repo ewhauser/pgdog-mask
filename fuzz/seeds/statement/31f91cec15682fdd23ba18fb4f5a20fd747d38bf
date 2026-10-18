@@ -1,0 +1,1 @@
+SELECT public.count_users()

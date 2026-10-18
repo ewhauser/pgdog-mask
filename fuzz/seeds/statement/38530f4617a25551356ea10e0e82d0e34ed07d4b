@@ -1,0 +1,1 @@
+SELECT s.case FROM (SELECT CASE WHEN true THEN ssn END FROM users) s

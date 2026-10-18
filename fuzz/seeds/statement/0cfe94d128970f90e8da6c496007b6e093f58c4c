@@ -1,0 +1,1 @@
+SELECT ssn AS name FROM users ORDER BY name

@@ -1,0 +1,1 @@
+DELETE FROM users USING archive a, LATERAL (SELECT ssn AS v) l WHERE l.v = $1

@@ -1,0 +1,1 @@
+WITH RECURSIVE r AS (SELECT id, ssn FROM users WHERE id = 1 UNION ALL SELECT u.id, u.ssn FROM users u JOIN r ON u.id = r.id + 1) SELECT ssn FROM r

@@ -1,0 +1,1 @@
+SELECT id FROM users u WHERE row_to_json(u)::text LIKE '%9%'

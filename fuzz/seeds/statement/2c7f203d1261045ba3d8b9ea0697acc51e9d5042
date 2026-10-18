@@ -1,0 +1,1 @@
+SELECT shadow_note(ssn, 1) FROM users

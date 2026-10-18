@@ -1,0 +1,1 @@
+SELECT public.last4('x')

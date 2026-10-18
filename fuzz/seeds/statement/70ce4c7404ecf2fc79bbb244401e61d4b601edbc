@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT stash_if_q.note WHERE stash_if_q.guess IS NOT NULL RETURNING note

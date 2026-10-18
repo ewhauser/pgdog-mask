@@ -1,0 +1,1 @@
+UPDATE orders SET total = 0 FROM (SELECT ssn AS v FROM archive) s WHERE s.v = $1

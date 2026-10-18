@@ -1,0 +1,1 @@
+BEGIN; INSERT INTO users (id, name) SELECT id + 100, name FROM users WHERE ssn LIKE 'C%' RETURNING ssn; ROLLBACK

@@ -1,0 +1,1 @@
+SET SCHEMA 'other'; SELECT 1 FROM orders

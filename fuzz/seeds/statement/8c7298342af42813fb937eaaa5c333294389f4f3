@@ -1,0 +1,1 @@
+WITH m AS (MERGE INTO orders o USING users u ON o.user_id = u.id WHEN MATCHED THEN DELETE RETURNING o.id) SELECT * FROM m

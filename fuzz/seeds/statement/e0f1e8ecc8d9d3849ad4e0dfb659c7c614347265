@@ -1,0 +1,1 @@
+SELECT * FROM set_config('a', 'b', true)

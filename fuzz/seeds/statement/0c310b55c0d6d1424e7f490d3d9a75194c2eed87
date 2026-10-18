@@ -1,0 +1,1 @@
+SELECT v::public.checked_ssn IS NOT NULL

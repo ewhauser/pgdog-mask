@@ -1,5 +1,5 @@
-//! The mask hook: batches of result rows for proxy-masked columns, with valid
-//! and unknown mask IDs, declared and mismatched types, both formats, and
+//! The mask hook: batches of result rows for proxy-masked columns, with valid,
+//! NULL and unknown mask IDs, declared and mismatched types, both formats, and
 //! arbitrary values.
 #![no_main]
 
@@ -50,6 +50,8 @@ struct ColumnInput {
 #[derive(Debug, Arbitrary)]
 enum MaskChoice {
     Proxy(u8),
+    /// PgDog applies NULL masks itself, but one passed anyway must give NULLs.
+    Null,
     Id(u64),
 }
 
@@ -98,6 +100,7 @@ fuzz_target!(|input: Input| {
         .map(|column| {
             let mut mask = match column.mask {
                 MaskChoice::Proxy(i) => proxies[i as usize % proxies.len()],
+                MaskChoice::Null => ColumnMask::null(0),
                 MaskChoice::Id(id) => ColumnMask::new(0, MaskId(id), 25),
             };
             mask.type_oid = match column.type_oid {
@@ -140,7 +143,8 @@ fuzz_target!(|input: Input| {
         .collect();
     let batch = MaskBatch::new(rows as u32, &columns);
 
-    let known = |mask: &ColumnMask| proxies.iter().any(|proxy| proxy.mask == mask.mask);
+    let known =
+        |mask: &ColumnMask| mask.is_null() || proxies.iter().any(|proxy| proxy.mask == mask.mask);
     let masked = match plugin.mask_rows(&batch) {
         Ok(masked) => masked,
         // Unmaskable values fail the result; that's the contract.
@@ -156,6 +160,10 @@ fuzz_target!(|input: Input| {
     for (c, ((mask, format), values)) in masks.iter().zip(&values).enumerate() {
         for (row, value) in values.iter().enumerate() {
             let out = masked.get(c * rows + row);
+            if mask.is_null() {
+                assert_eq!(out, None, "a NULL mask returned a value");
+                continue;
+            }
             match (value.get(), out) {
                 (None, None) => (),
                 (None, Some(_)) => panic!("NULL masked to a value"),

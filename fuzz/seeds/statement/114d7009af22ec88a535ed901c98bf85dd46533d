@@ -1,0 +1,1 @@
+SELECT ssn FROM users UNION ALL SELECT upper(ssn) FROM users

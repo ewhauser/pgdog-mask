@@ -1,0 +1,1 @@
+SELECT (WITH c AS (SELECT u.ssn AS x) SELECT x FROM c) FROM users u

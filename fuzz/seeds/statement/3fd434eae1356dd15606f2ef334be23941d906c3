@@ -1,0 +1,1 @@
+SELECT id AS id, NULL::varchar AS ssn FROM users WHERE NULL::varchar = $1

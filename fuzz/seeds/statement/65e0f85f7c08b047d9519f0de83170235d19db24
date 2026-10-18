@@ -1,0 +1,1 @@
+SELECT s.btrim, s.upper FROM (SELECT trim(ssn), upper(ssn) FROM users) s

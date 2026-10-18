@@ -10,11 +10,11 @@ For PgDog users with masking policies, the plugin parses each statement before P
 - `INSERT … SELECT` and `COPY`;
 - views and SQL functions that read masked columns, which are inlined with masks applied.
 
-Postgres then computes the masked values, so filters, sorting and aggregates can't reveal the real ones. Users whose policies mask nothing are passed through untouched.
+Postgres then computes the masked values, so filters, sorting and aggregates can't reveal the real ones. Users whose policies mask nothing are passed through untouched. [Proxy masks](#proxy-masks) work the other way: the statement runs unchanged, and the plugin masks its results.
 
 ## Requirements
 
-The plugin uses PgDog's plugin API 0.7 (statement, mask, error and catalog hooks), which is only on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`). It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form. `Cargo.toml` pins `pgdog-plugin` to a commit there.
+The plugin uses PgDog's plugin API 0.8 (statement, mask, error and catalog hooks), which is only on [`ewhauser/pgdog`](https://github.com/ewhauser/pgdog) (branch `masking/plugin-api`). It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form. `Cargo.toml` pins `pgdog-plugin` to a commit there.
 
 PgDog only loads plugins with the same plugin API version that were built by the same Rust compiler. Build PgDog from the pinned commit with the same toolchain as this plugin. `rust-toolchain.toml` matches PgDog's.
 
@@ -126,7 +126,7 @@ Tag changes apply when PgDog next loads the schema. `COMMENT ON COLUMN` and `SEC
 
 A view whose definition reads masked columns is inlined: `FROM v` becomes `FROM (<definition>) AS v(...)`, masked like any subquery. `security_barrier` and `security_invoker` views, materialized views, views with masked columns of their own, and all views with `inline_views = false` are queried like tables: columns passed through from masked columns get their masks, and columns computed from masked columns are blocked unless they're assigned a policy.
 
-SQL functions are analyzed. A function that reads no masked columns is called as is. One that does is inlined with masks applied if it's a single `SELECT`, `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, has no `SET` options, and isn't polymorphic or variadic. Set-returning functions are inlined in `FROM`. User-defined operators are treated as calls to their functions.
+SQL functions are analyzed. A function that reads no masked columns is called as is. One that does is inlined with masks applied if it's a single `SELECT`, `IMMUTABLE` or `STABLE`, not `SECURITY DEFINER`, has no `SET` options, and isn't polymorphic or variadic. Set-returning functions are inlined in `FROM`. User-defined operators are treated as calls to their functions. Proxy masks never cause inlining: functions that read proxy-masked columns are called as is, and their results return NULL.
 
 Built-in masks are `none`, `null`, `constant` (`value`), `default`, `partial` (`keep_prefix`, `keep_suffix`, `fill`), `email`, `hash`, `round` (`digits`), `truncate` (`unit`), and `sql` (`expression`, over `val` and the policy's `arguments`). Every mask is cast back to the column's type.
 
@@ -138,14 +138,19 @@ Built-in masks are `none`, `null`, `constant` (`value`), `default`, `partial` (`
 [[policies]]
 name = "card"
 data_type = "character varying"
+mask = "partial"                           # everyone else: a SQL mask
+keep_suffix = 4
+
+[[policies.rules]]
+roles = ["engineer"]
 mask = "proxy"
 proxy = "ff1"                              # or "hmac_sha256", or your own
 options = { key_env = "CARD_FF1_KEY" }     # hex AES key, from the environment
-fallback = "partial"                       # SQL mask for every other reference
-keep_suffix = 4
 ```
 
-Proxy masks apply to plain output columns of a top-level `SELECT`. Everywhere else (filters, joins, ordering, subqueries, views, `COPY`), the column gets the SQL `fallback`, `null` by default.
+Proxy masks mask every output that passes the column through, and return NULL for outputs computed from it. Conditions, joins and ordering use real values, so use them for trusted roles.
+
+References to a proxy-masked column are never rewritten, so Postgres runs the statement with the same plan and indexes as for an unmasked user, and `EXPLAIN` shows that plan. The plugin only expands `*` into column names and inlines views, which doesn't change the plan. Statements that would move values where PgDog can't mask them (`INSERT … SELECT`, `UPDATE … SET`, `CREATE TABLE AS`, `COPY … TO`, cursors, `set_config`) are blocked, and the errors of statements that compute with the column are redacted. `search = "raw"` and SQL mask keys such as `keep_suffix` on proxy rules are configuration errors. See [Proxy masks](https://ewhauser.github.io/pgdog-mask/configure/proxy-masks/).
 
 Built-in proxy masks: `hmac_sha256` (options `key_env` or `key_file`, `length`) and `ff1` (options `key_env` or `key_file`, `alphabet`, `tweak`).
 
@@ -158,17 +163,23 @@ To write your own, implement `pgdog_mask::proxy::ProxyMask` and build your own p
 ## What masked users can't do
 
 All of these fail closed with SQLSTATE `42501`:
-- call functions in procedural languages or C, extension functions and operators, and SQL functions that read masked columns but can't be inlined, unless they're in `udf_allowlist` or `extension_allowlist`;
+- call functions in procedural languages or C, extension functions and operators, and SQL functions that read SQL-masked columns but can't be inlined, unless they're in `udf_allowlist` or `extension_allowlist`;
 - call functions that aren't in the catalog;
 - call SQL-executing built-ins such as `query_to_xml`, `dblink*` and `lo_*`;
 - query `pg_stats`, `pg_statistic` or `pg_stat_statements`;
-- run `DO`, `MERGE`, `COPY … TO PROGRAM/file`, or DDL other than creating tables, `DROP`, sequences, and `ALTER TABLE`/`CREATE INDEX`/renames of relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, renames would unmask columns, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
+- run `DO`, `MERGE` (anywhere, including under `EXPLAIN`), `COPY … TO PROGRAM/file`, or DDL other than creating tables and sequences, `DROP`, and `ALTER TABLE`/`CREATE INDEX` on relations without masked columns. DDL on masked relations is blocked: expressions in `ALTER … USING` or index definitions can leak values through errors, and `ATTACH PARTITION`/`INHERIT` would expose their rows through another table;
+- run DDL that changes what a name resolves to before PgDog reloads its catalog: create temporary relations, or relations named like one in the catalog; drop columns; rename anything; `DROP … CASCADE`; drop a relation whose name another schema shares;
 - write through views that read masked columns, or read columns of table-like views computed from masked columns;
 - query views missing from the catalog's view definitions;
 - query relations missing from the catalog;
 - expand `*` across `JOIN … USING`/`NATURAL`, or alias a join, over masked columns;
-- create tables that shadow a masked table;
+- alias a masked table's columns in `FROM` (`users AS x(a, b, c)`), or use attribute notation on it (`u.row_to_json`);
+- send a statement after DDL in the same query; change `search_path` or the role other than in a query of its own that starts with `SET`, `RESET` or `DISCARD`; or call `set_config` on `search_path` (use `SET search_path`);
+- use an unqualified relation name whose namesakes in other schemas have different columns or masks (qualify it);
+- `EXECUTE` a statement that wasn't `PREPARE`d in the same query;
 - make fast-path function calls.
+
+Users with proxy masks also can't move proxy-masked values where PgDog can't mask them, `DECLARE` or `PREPARE` statements that use them, or place a `*` of unknown width (a function, a catalog table) before columns that carry them. See [What masked users can't do](https://ewhauser.github.io/pgdog-mask/reference/limitations/).
 
 ## Tests
 
@@ -200,7 +211,7 @@ Decisions are cached per statement and masking profile, and statements that diff
 | masked user, new literals (simple protocol) | 2–6µs |
 | masked user, new statement shape | 3–35µs (once per shape) |
 
-End to end, `integration/bench/bench.sh` runs pgbench against Postgres directly, PgDog, and PgDog with the plugin for exempt and masked users, and for masked lookups with and without raw search (see [integration/bench/README.md](integration/bench/README.md)). Against PgDog without the plugin: exempt users are within noise; SQL masks cost 1–4% on point queries and joins; a 34-column `SELECT *` costs about 25% over the simple and extended protocols and 5% prepared, mostly Postgres planning the masked select list; masked lookups can't use the column's index unless the rule allows raw search; and proxy masks cost per value (about 15% for 20 rows, 73% for 500). Full results: [Performance](https://ewhauser.github.io/pgdog-mask/operate/performance/).
+End to end, `integration/bench/bench.sh` runs pgbench against Postgres directly, PgDog, and PgDog with the plugin for exempt and masked users, and for masked lookups with and without raw search (see [integration/bench/README.md](integration/bench/README.md)). Against PgDog without the plugin: exempt users are within noise; SQL masks cost 1–4% on point queries and joins; a 34-column `SELECT *` costs about 25% over the simple and extended protocols and 5% prepared, mostly Postgres planning the masked select list; masked lookups can't use the column's index unless the rule allows raw search; and proxy masks cost per value (within variation for 20 rows, 39–48% for 500). Full results: [Performance](https://ewhauser.github.io/pgdog-mask/operate/performance/).
 
 ## Upgrading PgDog
 
@@ -210,4 +221,6 @@ End to end, `integration/bench/bench.sh` runs pgbench against Postgres directly,
 
 ## Error details
 
-Errors and notices can carry row values in their `DETAIL`, e.g. a `CHECK` violation's `Failing row contains (...)`. For masked users, the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` before it reaches the client; the severity and SQLSTATE are kept. `scrub_error_detail = false` turns this off.
+Errors and notices can carry row values in their `DETAIL`, e.g. a `CHECK` violation's `Failing row contains (...)`. For masked users, the plugin removes `DETAIL` from every `ErrorResponse` and `NoticeResponse` before it reaches the client; the severity and SQLSTATE are kept. `scrub_error_detail = false` turns this off, except for users with proxy masks.
+
+Statements that compute with proxy-masked columns run on real values, so their errors could quote them (`SELECT card::int …`). For those, and for writes to tables with proxy-masked columns, `FETCH`, `MOVE` and `EXECUTE`, PgDog replaces the message of every error and notice with a generic one, keeping the severity, SQLSTATE, position and object names.

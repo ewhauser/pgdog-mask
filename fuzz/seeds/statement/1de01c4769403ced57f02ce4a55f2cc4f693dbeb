@@ -1,0 +1,1 @@
+SELECT * FROM ((SELECT ssn AS x FROM users) s JOIN orders o ON true) AS j

@@ -1,0 +1,1 @@
+SELECT s.coalesce FROM (SELECT COALESCE(ssn, 'x') FROM users) s

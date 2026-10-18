@@ -21,6 +21,8 @@ search_operators = ["=", "in"]   # optional: replaces the default operators
 SELECT id, ssn FROM users WHERE ssn = $1;
 ```
 
+Raw search is for SQL masks. Proxy rules always search real values, since [proxy masks](../proxy-masks/#conditions-and-ordering-use-real-values) never rewrite conditions, so `search = "raw"` and `search_operators` on them are configuration errors.
+
 ## What stays raw
 
 A reference is left unmasked only in a search shape. Everywhere else, including the select list of the same statement, it's masked.

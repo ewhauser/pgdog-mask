@@ -1,0 +1,1 @@
+ALTER TABLE audit ALTER note TYPE text USING masking_canary_proxy.user_ssn(id)

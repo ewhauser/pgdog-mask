@@ -1,0 +1,1 @@
+SELECT x::checked_ssn FROM (SELECT ssn AS x FROM users) s

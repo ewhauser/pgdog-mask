@@ -1,0 +1,1 @@
+SELECT ssn AS s FROM users UNION ALL SELECT ssn FROM users_2024 ORDER BY s

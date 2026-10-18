@@ -1,0 +1,1 @@
+SELECT (SELECT email FROM contacts LIMIT 1) FROM users

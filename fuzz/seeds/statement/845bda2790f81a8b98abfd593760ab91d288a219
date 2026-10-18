@@ -1,0 +1,1 @@
+SELECT set_config('search_path', 'public', false); SELECT ssn FROM users

@@ -1,0 +1,1 @@
+BEGIN RETURN uid > 0; END

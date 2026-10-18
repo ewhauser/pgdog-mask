@@ -1,0 +1,1 @@
+UPDATE user_names_v SET name = 'x' WHERE id = 1

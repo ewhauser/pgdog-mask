@@ -149,7 +149,8 @@ pub struct Operator {
 pub struct Catalog {
     /// Server default `search_path`.
     pub search_path: Vec<String>,
-    relations: HashMap<(String, String), Relation>,
+    /// Relations by name, in every schema.
+    relations: HashMap<String, Vec<Relation>>,
     /// User-defined functions by name.
     functions: HashMap<String, Vec<Function>>,
     /// User-defined operators by name.
@@ -175,6 +176,9 @@ impl Catalog {
                     plugin::RelationKind::View => RelationKind::View,
                     plugin::RelationKind::MaterializedView => RelationKind::MaterializedView,
                     plugin::RelationKind::Other => RelationKind::Other,
+                    // A kind added after this plugin was built: assume it holds
+                    // data, so its columns are tagged and masked like a table's.
+                    _ => RelationKind::Table,
                 };
                 let columns = relation
                     .columns
@@ -251,12 +255,17 @@ impl Catalog {
 
     /// Build a catalog from relations.
     pub fn new(search_path: Vec<String>, relations: Vec<Relation>) -> Self {
+        let mut by_name: HashMap<String, Vec<Relation>> = HashMap::new();
+        for relation in relations {
+            let named = by_name.entry(relation.name.clone()).or_default();
+            match named.iter_mut().find(|r| r.schema == relation.schema) {
+                Some(existing) => *existing = relation,
+                None => named.push(relation),
+            }
+        }
         Self {
             search_path,
-            relations: relations
-                .into_iter()
-                .map(|relation| ((relation.schema.clone(), relation.name.clone()), relation))
-                .collect(),
+            relations: by_name,
             ..Default::default()
         }
     }
@@ -284,11 +293,18 @@ impl Catalog {
     }
 
     pub fn get(&self, schema: &str, name: &str) -> Option<&Relation> {
-        self.relations.get(&(schema.to_owned(), name.to_owned()))
+        self.relations_named(name)
+            .iter()
+            .find(|relation| relation.schema == schema)
     }
 
     pub fn relations(&self) -> impl Iterator<Item = &Relation> {
-        self.relations.values()
+        self.relations.values().flatten()
+    }
+
+    /// Relations with this name, in every schema.
+    pub fn relations_named(&self, name: &str) -> &[Relation] {
+        self.relations.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// Find a relation the way Postgres would, using the `search_path` for
@@ -310,22 +326,25 @@ impl Catalog {
         self.system_functions.contains(name)
     }
 
-    /// User-defined functions a call could resolve to: by name, in the given
-    /// schema or the `search_path`.
-    pub fn functions(
-        &self,
-        schema: Option<&str>,
-        name: &str,
-        search_path: &[String],
-    ) -> Vec<&Function> {
+    /// Is there a user-defined function with this name, in any schema?
+    pub fn has_function_named(&self, name: &str) -> bool {
+        self.functions.contains_key(name)
+    }
+
+    /// Is there a user-defined operator with this name, in any schema?
+    pub fn has_operator_named(&self, name: &str) -> bool {
+        self.operators.contains_key(name)
+    }
+
+    /// User-defined functions a call could resolve to, by name: in `schema`,
+    /// or for an unqualified call, in any schema. Postgres resolves it with
+    /// the session's search_path, which may not be the one PgDog follows.
+    pub fn functions(&self, schema: Option<&str>, name: &str) -> Vec<&Function> {
         self.functions
             .get(name)
             .into_iter()
             .flatten()
-            .filter(|function| match schema {
-                Some(schema) => function.schema == schema,
-                None => search_path.contains(&function.schema),
-            })
+            .filter(|function| schema.is_none_or(|schema| function.schema == schema))
             .collect()
     }
 
@@ -335,6 +354,11 @@ impl Catalog {
             .values()
             .flatten()
             .find(|function| function.oid == oid)
+    }
+
+    /// Every user-defined operator, in every schema.
+    pub fn all_operators(&self) -> impl Iterator<Item = &Operator> {
+        self.operators.values().flatten()
     }
 
     /// User-defined operators an expression could resolve to.
@@ -354,6 +378,13 @@ impl Catalog {
             })
             .collect()
     }
+}
+
+/// Is a type, as the catalog names it, user-defined? Its names come from
+/// `format_type` with an empty `search_path`, which qualifies every type
+/// outside `pg_catalog`.
+pub fn is_user_type(data_type: &str) -> bool {
+    data_type.contains('.')
 }
 
 /// Parse a `search_path` setting, e.g. `"$user", public`.
@@ -387,63 +418,32 @@ mod test {
 
     #[test]
     fn test_from_plugin() {
-        let catalog = plugin::Catalog {
-            parts: CatalogParts::ALL,
-            search_path: vec!["$user".into(), "public".into()],
-            relations: vec![
-                plugin::Relation {
-                    schema: "public".into(),
-                    name: "users".into(),
-                    kind: plugin::RelationKind::Table,
-                    columns: vec![
-                        plugin::Column {
-                            name: "id".into(),
-                            data_type: "bigint".into(),
-                            ..Default::default()
-                        },
-                        plugin::Column {
-                            name: "ssn".into(),
-                            data_type: "text".into(),
-                            type_name: "text".into(),
-                            comment: Some("pgdog:tag=pii.ssn".into()),
-                            security_labels: vec![plugin::SecurityLabel {
-                                provider: "pgdog".into(),
-                                label: "pii.ssn".into(),
-                            }],
-                            ..Default::default()
-                        },
-                    ],
-                    parent: None,
-                    definition: None,
-                    options: vec![],
-                },
-                plugin::Relation {
-                    schema: "public".into(),
-                    name: "user_ssns".into(),
-                    kind: plugin::RelationKind::View,
-                    columns: vec![],
-                    parent: None,
-                    definition: Some(" SELECT users.ssn FROM public.users;".into()),
-                    options: vec!["security_barrier=true".into()],
-                },
-            ],
-            functions: vec![plugin::Function {
-                oid: 10,
-                schema: "public".into(),
-                name: "last4".into(),
-                kind: "function".into(),
-                argument_types: vec!["text".into()],
-                argument_names: vec!["value".into()],
-                return_type: "text".into(),
-                language: "sql".into(),
-                source: "SELECT right(value, 4)".into(),
-                volatility: "immutable".into(),
-                strict: true,
-                ..Default::default()
-            }],
-            system_functions: vec!["lower".into(), "right".into()],
-            operators: vec![],
-        };
+        let mut ssn = plugin::Column::new("ssn", "text");
+        ssn.type_name = "text".into();
+        ssn.comment = Some("pgdog:tag=pii.ssn".into());
+        ssn.security_labels = vec![plugin::SecurityLabel::new("pgdog", "pii.ssn")];
+        let mut users = plugin::Relation::new("public", "users", plugin::RelationKind::Table);
+        users.columns = vec![plugin::Column::new("id", "bigint"), ssn];
+
+        let mut view = plugin::Relation::new("public", "user_ssns", plugin::RelationKind::View);
+        view.definition = Some(" SELECT users.ssn FROM public.users;".into());
+        view.options = vec!["security_barrier=true".into()];
+
+        let mut last4 = plugin::Function::new(10, "public", "last4");
+        last4.kind = "function".into();
+        last4.argument_types = vec!["text".into()];
+        last4.argument_names = vec!["value".into()];
+        last4.return_type = "text".into();
+        last4.language = "sql".into();
+        last4.source = "SELECT right(value, 4)".into();
+        last4.volatility = "immutable".into();
+        last4.strict = true;
+
+        let mut catalog = plugin::Catalog::new(CatalogParts::ALL);
+        catalog.search_path = vec!["$user".into(), "public".into()];
+        catalog.relations = vec![users, view];
+        catalog.functions = vec![last4];
+        catalog.system_functions = vec!["lower".into(), "right".into()];
         let catalog = Catalog::from_plugin(&catalog);
         assert!(catalog.full);
         let users = catalog.resolve(None, "users", &["public".into()]).unwrap();
@@ -460,12 +460,12 @@ mod test {
         assert!(!view.option("security_invoker"));
         assert!(view.definition.is_some());
 
-        let path = ["public".to_owned()];
-        let last4 = catalog.functions(None, "last4", &path);
+        let last4 = catalog.functions(None, "last4");
         assert_eq!(last4.len(), 1);
         assert!(last4[0].accepts(1));
         assert!(!last4[0].accepts(2));
-        assert!(catalog.functions(None, "last4", &[]).is_empty());
+        assert_eq!(catalog.functions(Some("public"), "last4").len(), 1);
+        assert!(catalog.functions(Some("other"), "last4").is_empty());
         assert!(catalog.is_system_function("lower"));
         assert!(!catalog.is_system_function("last4"));
     }
@@ -473,10 +473,7 @@ mod test {
     #[test]
     fn test_partial_catalog() {
         // Without every part, views and functions can't be analyzed.
-        let catalog = Catalog::from_plugin(&plugin::Catalog {
-            parts: CatalogParts::COLUMNS,
-            ..Default::default()
-        });
+        let catalog = Catalog::from_plugin(&plugin::Catalog::new(CatalogParts::COLUMNS));
         assert!(!catalog.full);
     }
 }

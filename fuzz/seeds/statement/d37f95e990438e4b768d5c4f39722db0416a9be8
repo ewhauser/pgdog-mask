@@ -1,0 +1,1 @@
+SELECT string_agg(name, ',' ORDER BY ssn) FROM users

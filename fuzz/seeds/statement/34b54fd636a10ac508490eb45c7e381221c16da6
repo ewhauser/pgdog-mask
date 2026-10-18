@@ -1,0 +1,1 @@
+PREPARE p AS SELECT id FROM orders WHERE total::text = $1; EXPLAIN EXECUTE p(user_ssn(1))

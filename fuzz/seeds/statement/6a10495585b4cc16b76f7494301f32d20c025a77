@@ -1,0 +1,1 @@
+SELECT stash_if(guess => ssn, note => 'x') FROM users

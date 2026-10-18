@@ -6,16 +6,20 @@
 //! shape cache is exercised too.
 //!
 //! While generating, it records whether the statement reads a masked column
-//! for [`MASKED_USER`](crate::fixture::MASKED_USER): a reference in any
-//! expression, `*` or a whole-row reference over a masked column, `COPY` of a
-//! masked table, or a call of a function computed from masked columns. Such
-//! a statement must never be allowed as is.
+//! for [`MASKED_USER`](crate::fixture::MASKED_USER) in a way that needs
+//! masking: a column with a SQL mask anywhere (in any expression, `*`, a
+//! whole-row reference, `COPY` of its table), a call of a function computed
+//! from such columns, or a proxy-masked column anywhere but as a whole
+//! output column (computed on, compared, sorted, grouped, a whole-row
+//! reference, `COPY`). Such a statement must never be allowed as is. A
+//! proxy-masked column passed through as an output column isn't counted: in a
+//! subquery whose column nothing selects, nothing needs masking.
 use std::sync::LazyLock;
 
 use arbitrary::{Result, Unstructured};
 use pgdog_mask::pgdog_plugin::catalog::{Relation, RelationKind};
 
-use crate::fixture::{MASKED_FUNCTIONS, masked, relations};
+use crate::fixture::{MASKED_FUNCTIONS, masked, proxy_masked, relations};
 
 /// Expression nesting, beyond which expressions are leaves.
 const MAX_DEPTH: u32 = 4;
@@ -36,6 +40,7 @@ pub fn statement(u: &mut Unstructured<'_>) -> Result<Generated> {
         aliases: 0,
         reads_masked: false,
         counting: true,
+        output: false,
     };
     let sql = generator.top_level(true)?;
     Ok(Generated {
@@ -46,17 +51,91 @@ pub fn statement(u: &mut Unstructured<'_>) -> Result<Generated> {
 
 static RELATIONS: LazyLock<Vec<Relation>> = LazyLock::new(relations);
 
+/// How [`MASKED_USER`](crate::fixture::MASKED_USER) sees a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Masking {
+    Unmasked,
+    /// Rewritten in the statement.
+    Sql,
+    /// Masked in the results.
+    Proxy,
+}
+
+impl Masking {
+    fn of(relation: &str, column: &str) -> Self {
+        if proxy_masked(relation, column) {
+            Self::Proxy
+        } else if masked(relation, column) {
+            Self::Sql
+        } else {
+            Self::Unmasked
+        }
+    }
+}
+
+/// A read of a masked column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// Of a column with a SQL mask, anywhere.
+    Sql,
+    /// Of a proxy-masked column, anywhere but as a whole output column.
+    ProxyComputing,
+    /// Of a proxy-masked column, as a whole output column.
+    ProxyPassthrough,
+}
+
+/// Where a column is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Position {
+    /// A whole output column: the column alone, or `*`.
+    Output,
+    /// Anywhere else.
+    Computing,
+}
+
+impl Position {
+    /// The read of a column masked this way, `None` if it isn't masked.
+    fn read(self, masking: Masking) -> Option<Read> {
+        match (masking, self) {
+            (Masking::Unmasked, _) => None,
+            (Masking::Sql, _) => Some(Read::Sql),
+            (Masking::Proxy, Position::Output) => Some(Read::ProxyPassthrough),
+            (Masking::Proxy, Position::Computing) => Some(Read::ProxyComputing),
+        }
+    }
+}
+
 /// A `FROM` item in scope: its alias and columns.
 #[derive(Debug, Clone)]
 struct Item {
     alias: String,
-    /// Column names, and whether each is masked.
-    columns: Vec<(String, bool)>,
+    /// Column names, and how each is masked.
+    columns: Vec<(String, Masking)>,
 }
 
 impl Item {
-    fn any_masked(&self) -> bool {
-        self.columns.iter().any(|(_, masked)| *masked)
+    /// Columns of a relation.
+    fn relation(alias: String, relation: &Relation) -> Self {
+        Self {
+            alias,
+            columns: relation
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), Masking::of(&relation.name, &c.name)))
+                .collect(),
+        }
+    }
+
+    /// Columns of a derived item, which a statement reading them only reads
+    /// masked columns through its own query.
+    fn derived(alias: String, columns: Vec<String>) -> Self {
+        Self {
+            alias,
+            columns: columns
+                .into_iter()
+                .map(|c| (c, Masking::Unmasked))
+                .collect(),
+        }
     }
 }
 
@@ -68,6 +147,8 @@ struct Generator<'a, 'u> {
     reads_masked: bool,
     /// Reads count towards `reads_masked`. Off under `EXPLAIN`, which returns no rows.
     counting: bool,
+    /// The next expression is a whole output column, if it's a column alone.
+    output: bool,
 }
 
 /// Functions masked users may call on any value, with their arity.
@@ -194,10 +275,25 @@ impl Generator<'_, '_> {
         format!("{prefix}{}", self.aliases)
     }
 
-    fn read(&mut self, masked: bool) {
-        if masked && self.counting {
+    fn read(&mut self, read: Option<Read>) {
+        if matches!(read, Some(Read::Sql | Read::ProxyComputing)) && self.counting {
             self.reads_masked = true;
         }
+    }
+
+    /// Read every column of an item.
+    fn read_all(&mut self, item: &Item, position: Position) {
+        for (_, masking) in &item.columns {
+            self.read(position.read(*masking));
+        }
+    }
+
+    /// An expression that's a whole output column if it's a column alone.
+    fn output_expr(&mut self, depth: u32) -> Result<String> {
+        self.output = true;
+        let expr = self.expr(depth);
+        self.output = false;
+        expr
     }
 
     fn top_level(&mut self, several: bool) -> Result<String> {
@@ -248,11 +344,10 @@ impl Generator<'_, '_> {
             ))
         } else {
             let relation = self.relation()?;
-            let any_masked = relation
-                .columns
-                .iter()
-                .any(|c| masked(&relation.name, &c.name));
-            self.read(any_masked);
+            self.read_all(
+                &Item::relation(String::new(), relation),
+                Position::Computing,
+            );
             Ok(format!(
                 "SELECT table_to_xml({}, true, false, '')",
                 quote(&format!("public.{}", relation.name))
@@ -279,14 +374,9 @@ impl Generator<'_, '_> {
         } else {
             ""
         };
-        let columns = relation
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), masked(&relation.name, &c.name)))
-            .collect();
         Ok((
             format!("{only}{qualified}{} AS {alias}", relation.name),
-            Item { alias, columns },
+            Item::relation(alias, relation),
         ))
     }
 
@@ -294,15 +384,23 @@ impl Generator<'_, '_> {
     fn source(&mut self, depth: u32) -> Result<(String, Item)> {
         match self.u.int_in_range(0..=5)? {
             0 if depth < MAX_DEPTH => {
-                let lateral = if self.u.arbitrary()? { "LATERAL " } else { "" };
-                let (sql, columns) = self.select(depth + 1)?;
+                let lateral: bool = self.u.arbitrary()?;
+                // Only LATERAL subqueries see the items before them in the
+                // FROM list; Postgres rejects references to them otherwise.
+                let hidden = match self.scopes.last_mut() {
+                    Some(scope) if !lateral => Some(std::mem::take(scope)),
+                    _ => None,
+                };
+                let selected = self.select(depth + 1);
+                if let (Some(items), Some(scope)) = (hidden, self.scopes.last_mut()) {
+                    *scope = items;
+                }
+                let (sql, columns) = selected?;
                 let alias = self.alias("s");
+                let lateral = if lateral { "LATERAL " } else { "" };
                 Ok((
                     format!("{lateral}({sql}) AS {alias}"),
-                    Item {
-                        alias,
-                        columns: columns.into_iter().map(|c| (c, false)).collect(),
-                    },
+                    Item::derived(alias, columns),
                 ))
             }
             1 => {
@@ -312,7 +410,10 @@ impl Generator<'_, '_> {
                     format!("public.ssns() AS {alias}(id bigint, ssn text)"),
                     Item {
                         alias,
-                        columns: vec![("id".into(), false), ("ssn".into(), true)],
+                        columns: vec![
+                            ("id".into(), Masking::Unmasked),
+                            ("ssn".into(), Masking::Sql),
+                        ],
                     },
                 ))
             }
@@ -320,10 +421,7 @@ impl Generator<'_, '_> {
                 let alias = self.alias("g");
                 Ok((
                     format!("generate_series(1, 3) AS {alias}(n)"),
-                    Item {
-                        alias,
-                        columns: vec![("n".into(), false)],
-                    },
+                    Item::derived(alias, vec!["n".into()]),
                 ))
             }
             _ => self.table_item(),
@@ -345,25 +443,20 @@ impl Generator<'_, '_> {
                 ctes.push(format!("{name} AS ({cte})"));
                 // Referenced below, so it always runs.
                 let alias = self.alias("c");
-                items.push((
-                    format!("{name} AS {alias}"),
-                    Item {
-                        alias,
-                        columns: columns.into_iter().map(|c| (c, false)).collect(),
-                    },
-                ));
+                items.push((format!("{name} AS {alias}"), Item::derived(alias, columns)));
             }
             sql.push_str(&format!("WITH {} ", ctes.join(", ")));
         }
 
         self.scopes.push(vec![]);
         let mut from = String::new();
+        let mut tree = 0;
         for (sql, item) in items {
-            self.push_item(&mut from, sql, item, depth)?;
+            self.push_item(&mut from, &mut tree, sql, item, depth)?;
         }
         for _ in 0..self.u.int_in_range(0..=3)? {
             let (sql, item) = self.source(depth)?;
-            self.push_item(&mut from, sql, item, depth)?;
+            self.push_item(&mut from, &mut tree, sql, item, depth)?;
         }
 
         sql.push_str("SELECT ");
@@ -377,19 +470,19 @@ impl Generator<'_, '_> {
             match self.u.int_in_range(0..=7)? {
                 0 if !in_scope.is_empty() => {
                     for item in &in_scope {
-                        self.read(item.any_masked());
+                        self.read_all(item, Position::Output);
                         columns.extend(item.columns.iter().map(|(name, _)| name.clone()));
                     }
                     targets.push("*".to_owned());
                 }
                 1 if !in_scope.is_empty() => {
                     let item = self.u.choose(&in_scope)?.clone();
-                    self.read(item.any_masked());
+                    self.read_all(&item, Position::Output);
                     columns.extend(item.columns.iter().map(|(name, _)| name.clone()));
                     targets.push(format!("{}.*", item.alias));
                 }
                 _ => {
-                    let expr = self.expr(depth)?;
+                    let expr = self.output_expr(depth)?;
                     let name = format!("c{i}");
                     targets.push(format!("{expr} AS {name}"));
                     columns.push(name);
@@ -432,36 +525,58 @@ impl Generator<'_, '_> {
     }
 
     /// Add a `FROM` item to the innermost scope, joined to the items before it.
-    fn push_item(&mut self, from: &mut String, sql: String, item: Item, depth: u32) -> Result<()> {
-        let first = from.is_empty();
-        self.scopes
-            .last_mut()
-            .expect("a FROM list has a scope")
-            .push(item);
-        if first {
+    /// `tree` is the scope index of the first item of the current join tree:
+    /// the items after the last comma.
+    fn push_item(
+        &mut self,
+        from: &mut String,
+        tree: &mut usize,
+        sql: String,
+        item: Item,
+        depth: u32,
+    ) -> Result<()> {
+        let scope = self.scopes.last_mut().expect("a FROM list has a scope");
+        let index = scope.len();
+        scope.push(item);
+        if from.is_empty() {
+            *tree = index;
             from.push_str(&sql);
             return Ok(());
         }
         match self.u.int_in_range(0..=3)? {
-            0 => from.push_str(&format!(", {sql}")),
+            0 => {
+                *tree = index;
+                from.push_str(&format!(", {sql}"));
+            }
             1 => from.push_str(&format!(" CROSS JOIN {sql}")),
             _ => {
                 let join = self.pick(&["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"])?;
-                let on = self.expr(depth)?;
-                from.push_str(&format!(" {join} {sql} ON {on}"));
+                // ON only sees the items of its join tree.
+                let scope = self.scopes.last_mut().expect("a FROM list has a scope");
+                let outside: Vec<Item> = scope.drain(..*tree).collect();
+                let on = self.expr(depth);
+                let scope = self.scopes.last_mut().expect("a FROM list has a scope");
+                scope.splice(0..0, outside);
+                from.push_str(&format!(" {join} {sql} ON {}", on?));
             }
         }
         Ok(())
     }
 
     fn expr(&mut self, depth: u32) -> Result<String> {
+        // Only this expression is an output column; what it's made of isn't.
+        let position = if std::mem::take(&mut self.output) {
+            Position::Output
+        } else {
+            Position::Computing
+        };
         if depth >= MAX_DEPTH {
-            return self.leaf();
+            return self.leaf(position);
         }
         let next = depth + 1;
         Ok(match self.u.int_in_range(0..=17)? {
             0..=1 => self.literal()?,
-            2..=4 => self.column()?,
+            2..=4 => self.column(position)?,
             5 => {
                 let left = self.expr(next)?;
                 let op = self.pick(BINARY)?;
@@ -540,16 +655,16 @@ impl Generator<'_, '_> {
         })
     }
 
-    fn leaf(&mut self) -> Result<String> {
+    fn leaf(&mut self, position: Position) -> Result<String> {
         if self.u.arbitrary()? {
-            self.column()
+            self.column(position)
         } else {
             self.literal()
         }
     }
 
     /// A column of an item in scope, from this query level or an outer one.
-    fn column(&mut self) -> Result<String> {
+    fn column(&mut self, position: Position) -> Result<String> {
         let levels: Vec<usize> = (0..self.scopes.len())
             .filter(|level| !self.scopes[*level].is_empty())
             .collect();
@@ -568,7 +683,7 @@ impl Generator<'_, '_> {
         if item.columns.is_empty() {
             return self.literal();
         }
-        let (name, masked) = item.columns[self.u.choose_index(item.columns.len())?].clone();
+        let (name, masking) = item.columns[self.u.choose_index(item.columns.len())?].clone();
         // Unqualified only where it can't be ambiguous.
         let unqualified = innermost && items.len() == 1 && self.u.arbitrary()?;
         let sql = if unqualified {
@@ -576,7 +691,7 @@ impl Generator<'_, '_> {
         } else {
             format!("{}.{name}", item.alias)
         };
-        self.read(masked);
+        self.read(position.read(masking));
         Ok(sql)
     }
 
@@ -586,7 +701,7 @@ impl Generator<'_, '_> {
             return self.literal();
         };
         let item = items[self.u.choose_index(items.len())?].clone();
-        self.read(item.any_masked());
+        self.read_all(&item, Position::Computing);
         let f = self.pick(&["row_to_json", "to_jsonb", "to_json", "hstore"])?;
         Ok(format!("{f}({})", item.alias))
     }
@@ -594,7 +709,9 @@ impl Generator<'_, '_> {
     fn call(&mut self, depth: u32) -> Result<String> {
         let (name, arity) = *self.u.choose(FUNCTIONS)?;
         let bare = name.rsplit('.').next().unwrap_or(name);
-        self.read(MASKED_FUNCTIONS.contains(&bare));
+        if MASKED_FUNCTIONS.contains(&bare) {
+            self.read(Some(Read::Sql));
+        }
         let args = (0..arity)
             .map(|_| self.expr(depth))
             .collect::<Result<Vec<_>>>()?;
@@ -665,14 +782,7 @@ impl Generator<'_, '_> {
         } else {
             ""
         };
-        let item = Item {
-            alias: alias.clone(),
-            columns: relation
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), masked(&relation.name, &c.name)))
-                .collect(),
-        };
+        let item = Item::relation(alias.clone(), relation);
         let returning = self.returning(item)?;
         Ok(format!(
             "INSERT INTO {} AS {alias} ({}) {source}{conflict}{returning}",
@@ -683,13 +793,15 @@ impl Generator<'_, '_> {
 
     fn update(&mut self) -> Result<String> {
         let (target, item) = self.table_item()?;
-        self.scopes.push(vec![item.clone()]);
+        // The FROM list doesn't see the target.
+        let mut scope = vec![item.clone()];
         let mut from = String::new();
         if self.u.ratio(1, 3)? {
             let (sql, other) = self.source(1)?;
             from = format!(" FROM {sql}");
-            self.scopes.last_mut().expect("scope").push(other);
+            scope.push(other);
         }
+        self.scopes.push(scope);
         let mut sets = vec![];
         for _ in 0..self.u.int_in_range(1..=2)? {
             let (column, _) = self.u.choose(&item.columns)?.clone();
@@ -707,13 +819,15 @@ impl Generator<'_, '_> {
 
     fn delete(&mut self) -> Result<String> {
         let (target, item) = self.table_item()?;
-        self.scopes.push(vec![item.clone()]);
+        // The USING list doesn't see the target.
+        let mut scope = vec![item.clone()];
         let mut using = String::new();
         if self.u.ratio(1, 3)? {
             let (sql, other) = self.source(1)?;
             using = format!(" USING {sql}");
-            self.scopes.last_mut().expect("scope").push(other);
+            scope.push(other);
         }
+        self.scopes.push(scope);
         let filter = self.filter()?;
         self.scopes.pop();
         let returning = self.returning(item)?;
@@ -734,10 +848,10 @@ impl Generator<'_, '_> {
         }
         self.scopes.push(vec![item.clone()]);
         let sql = if self.u.arbitrary()? {
-            self.read(item.any_masked());
+            self.read_all(&item, Position::Output);
             " RETURNING *".to_owned()
         } else {
-            format!(" RETURNING {}", self.expr(1)?)
+            format!(" RETURNING {}", self.output_expr(1)?)
         };
         self.scopes.pop();
         Ok(sql)
@@ -751,19 +865,23 @@ impl Generator<'_, '_> {
         }
         // Postgres only copies plain tables out; views fail.
         let table = relation.kind == RelationKind::Table;
+        // COPY sends values where PgDog can't mask them: any masked column counts.
         if self.u.arbitrary()? {
             let column = self.u.choose(&relation.columns)?;
-            self.read(table && masked(&relation.name, &column.name));
+            if table {
+                self.read(Position::Computing.read(Masking::of(&relation.name, &column.name)));
+            }
             Ok(format!(
                 "COPY {} ({}) TO STDOUT",
                 relation.name, column.name
             ))
         } else {
-            let any_masked = relation
-                .columns
-                .iter()
-                .any(|c| masked(&relation.name, &c.name));
-            self.read(table && any_masked);
+            if table {
+                self.read_all(
+                    &Item::relation(String::new(), relation),
+                    Position::Computing,
+                );
+            }
             Ok(format!("COPY {} TO STDOUT", relation.name))
         }
     }

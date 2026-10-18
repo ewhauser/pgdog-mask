@@ -1,0 +1,1 @@
+COPY accounts TO STDOUT

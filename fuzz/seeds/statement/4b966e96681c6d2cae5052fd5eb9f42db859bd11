@@ -1,0 +1,1 @@
+SELECT a.id, b.id FROM users a JOIN users_2024 b ON a.ssn = b.ssn

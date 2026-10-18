@@ -1,0 +1,1 @@
+ SELECT loud_mv.id, loud_mv.loud FROM public.loud_mv;

@@ -1,0 +1,1 @@
+INSERT INTO masking_e2e.users (id, name, card) SELECT id + 100, name, card FROM masking_e2e.users

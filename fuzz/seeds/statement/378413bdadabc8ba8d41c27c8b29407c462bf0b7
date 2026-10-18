@@ -1,0 +1,1 @@
+SELECT JSON_OBJECTAGG(ssn: id) FROM users

@@ -1,0 +1,1 @@
+WITH w AS (DELETE FROM user_names_v WHERE id = $1 RETURNING id) SELECT id FROM w

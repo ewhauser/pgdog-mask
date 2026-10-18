@@ -1,0 +1,1 @@
+WITH archive AS (SELECT ssn FROM users) SELECT x.ssn FROM orders o, (SELECT * FROM archive) x

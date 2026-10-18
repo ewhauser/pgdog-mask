@@ -1,0 +1,1 @@
+SELECT ssn AS ssn FROM (SELECT users.id AS id, users.ssn AS ssn FROM public.users) user_ssns(id, ssn)

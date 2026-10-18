@@ -1,0 +1,1 @@
+BEGIN; SELECT id INTO scratch FROM users WHERE ssn LIKE 'C%'; ROLLBACK

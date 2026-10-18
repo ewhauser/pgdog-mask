@@ -1,0 +1,1 @@
+WITH c AS (SELECT x.ssn FROM users u, LATERAL (SELECT ssn FROM archive) x) SELECT * FROM c

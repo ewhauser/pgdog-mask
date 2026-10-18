@@ -1,0 +1,1 @@
+BEGIN; UPDATE orders SET total = 0 WHERE id = 1 RETURNING id; ROLLBACK

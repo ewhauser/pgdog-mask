@@ -1,0 +1,1 @@
+BEGIN; SET LOCAL search_path TO other; COMMIT

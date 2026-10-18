@@ -1,0 +1,1 @@
+SELECT ssn FROM users ORDER BY upper(ssn) LIMIT 1

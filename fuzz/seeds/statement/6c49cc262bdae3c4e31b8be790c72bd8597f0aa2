@@ -1,0 +1,1 @@
+SELECT CASE id WHEN 1 THEN ssn END FROM users

@@ -146,14 +146,12 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
     // Converted like PgDog does (pgdog/src/plugin/catalog.rs).
     let mut relations: Vec<_> = relations.into_values().map(relation).collect();
     relations.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
-    let catalog = plugin::Catalog {
-        parts: CatalogParts::ALL,
-        search_path: search_path.iter().map(|s| (*s).to_owned()).collect(),
-        relations,
-        functions: functions.into_iter().map(function).collect(),
-        system_functions,
-        operators: operators.into_iter().map(operator).collect(),
-    };
+    let mut catalog = plugin::Catalog::new(CatalogParts::ALL);
+    catalog.search_path = search_path.iter().map(|s| (*s).to_owned()).collect();
+    catalog.relations = relations;
+    catalog.functions = functions.into_iter().map(function).collect();
+    catalog.system_functions = system_functions;
+    catalog.operators = operators.into_iter().map(operator).collect();
     Catalog::from_plugin(&catalog)
 }
 
@@ -166,72 +164,58 @@ fn relation(relation: Relation) -> plugin::Relation {
         "foreign table" => plugin::RelationKind::ForeignTable,
         _ => plugin::RelationKind::Other,
     };
-    plugin::Relation {
-        schema: relation.schema,
-        name: relation.name,
-        kind,
-        columns: relation
-            .columns
-            .into_values()
-            .map(|column| plugin::Column {
-                name: column.column_name,
-                data_type: column.data_type,
-                type_name: column.type_name,
-                type_oid: column.type_oid,
-                is_primary_key: column.is_primary_key,
-                comment: column.comment,
-                security_labels: column
-                    .security_labels
-                    .into_iter()
-                    .map(|label| plugin::SecurityLabel {
-                        provider: label.provider,
-                        label: label.label,
-                    })
-                    .collect(),
-            })
-            .collect(),
-        parent: relation.parent_table_schema.zip(relation.parent_table_name),
-        definition: relation.definition,
-        options: relation.options,
-    }
+    let mut out = plugin::Relation::new(relation.schema, relation.name, kind);
+    out.columns = relation.columns.into_values().map(column).collect();
+    out.parent = relation.parent_table_schema.zip(relation.parent_table_name);
+    out.definition = relation.definition;
+    out.options = relation.options;
+    out
+}
+
+fn column(column: Column) -> plugin::Column {
+    let mut out = plugin::Column::new(column.column_name, column.data_type);
+    out.type_name = column.type_name;
+    out.type_oid = column.type_oid;
+    out.is_primary_key = column.is_primary_key;
+    out.comment = column.comment;
+    out.security_labels = column
+        .security_labels
+        .into_iter()
+        .map(|label| plugin::SecurityLabel::new(label.provider, label.label))
+        .collect();
+    out
 }
 
 fn function(function: Function) -> plugin::Function {
-    plugin::Function {
-        oid: function.oid as u32,
-        schema: function.schema,
-        name: function.name,
-        kind: function.kind,
-        argument_types: function.argument_types,
-        argument_names: function.argument_names,
-        argument_defaults: function.argument_defaults.max(0) as u16,
-        variadic: function.variadic,
-        return_type: function.return_type,
-        result: function.result,
-        returns_set: function.returns_set,
-        output_names: function.output_names,
-        output_types: function.output_types,
-        language: function.language,
-        source: function.source,
-        sql_body: function.sql_body,
-        volatility: function.volatility,
-        security_definer: function.security_definer,
-        strict: function.strict,
-        config: function.config,
-        extension: function.extension,
-    }
+    let mut out = plugin::Function::new(function.oid as u32, function.schema, function.name);
+    out.kind = function.kind;
+    out.argument_types = function.argument_types;
+    out.argument_names = function.argument_names;
+    out.argument_defaults = function.argument_defaults.max(0) as u16;
+    out.variadic = function.variadic;
+    out.return_type = function.return_type;
+    out.result = function.result;
+    out.returns_set = function.returns_set;
+    out.output_names = function.output_names;
+    out.output_types = function.output_types;
+    out.language = function.language;
+    out.source = function.source;
+    out.sql_body = function.sql_body;
+    out.volatility = function.volatility;
+    out.security_definer = function.security_definer;
+    out.strict = function.strict;
+    out.config = function.config;
+    out.extension = function.extension;
+    out
 }
 
 fn operator(operator: Operator) -> plugin::Operator {
-    plugin::Operator {
-        oid: operator.oid as u32,
-        schema: operator.schema,
-        name: operator.name,
-        left_type: operator.left_type,
-        right_type: operator.right_type,
-        result_type: operator.result_type,
-        function_oid: operator.function_oid as u32,
-        function_schema: operator.function_schema,
-        function_name: operator.function_name,
-    }
+    let mut out = plugin::Operator::new(operator.oid as u32, operator.schema, operator.name);
+    out.left_type = operator.left_type;
+    out.right_type = operator.right_type;
+    out.result_type = operator.result_type;
+    out.function_oid = operator.function_oid as u32;
+    out.function_schema = operator.function_schema;
+    out.function_name = operator.function_name;
+    out
 }

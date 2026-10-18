@@ -1,0 +1,1 @@
+BEGIN; UPDATE err_sb SET id = id WHERE id = 1; ROLLBACK

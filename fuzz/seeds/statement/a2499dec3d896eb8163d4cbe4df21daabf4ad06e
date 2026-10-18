@@ -1,0 +1,1 @@
+SELECT j.*, upper(u.ssn) FROM (orders a JOIN orders b ON true) j, users u

@@ -1,0 +1,1 @@
+SELECT id, pg_catalog.set_config('a', 'b', true) FROM t

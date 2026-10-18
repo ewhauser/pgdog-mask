@@ -1,0 +1,1 @@
+SELECT l.v FROM (SELECT ssn FROM users) s, LATERAL (SELECT s.ssn AS v FROM ((SELECT 'clean'::varchar AS ssn) s CROSS JOIN orders o) AS j) l

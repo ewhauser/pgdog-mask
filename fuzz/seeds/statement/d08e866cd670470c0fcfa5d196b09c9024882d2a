@@ -1,0 +1,1 @@
+SELECT o.id, (SELECT u.ssn FROM users u WHERE u.id = o.user_id) FROM orders o

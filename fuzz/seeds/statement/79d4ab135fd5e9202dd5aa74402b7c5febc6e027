@@ -1,0 +1,1 @@
+UPDATE tags SET labels[length(u.ssn)] = 'x' FROM users u WHERE u.id = tags.id

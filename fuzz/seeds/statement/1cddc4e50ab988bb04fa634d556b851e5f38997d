@@ -1,0 +1,1 @@
+SELECT j.total FROM (orders a CROSS JOIN (SELECT 1 AS k) b) AS j

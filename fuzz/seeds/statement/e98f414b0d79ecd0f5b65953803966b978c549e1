@@ -1,0 +1,1 @@
+SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id JOIN archive a ON a.id = u.id AND u.ssn = a.ssn

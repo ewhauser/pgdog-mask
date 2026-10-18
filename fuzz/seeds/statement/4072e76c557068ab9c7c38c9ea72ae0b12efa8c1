@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT $1 WHERE $2 IS NOT NULL RETURNING note

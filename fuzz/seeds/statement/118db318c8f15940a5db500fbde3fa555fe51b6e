@@ -1,0 +1,1 @@
+SELECT x.ssn FROM users u, LATERAL (SELECT ssn FROM archive WHERE id = 1) x

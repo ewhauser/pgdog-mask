@@ -6,10 +6,9 @@
 //! keyed hash whose key must never appear in statement text, format-preserving
 //! encryption, tokens from a vault, or anything else written in Rust.
 //!
-//! A proxy mask only applies where a masked column is a plain output of the
-//! top-level `SELECT`. Every other reference to the column, in `WHERE`, joins,
-//! `ORDER BY`, subqueries or functions, gets the policy's SQL `fallback` mask,
-//! so filtering, ordering and aggregates never run on raw values.
+//! A proxy mask applies to every output column that passes the column
+//! through. Outputs computed from it are NULL. References elsewhere, in
+//! `WHERE`, joins, `GROUP BY` or `ORDER BY`, use real values.
 //!
 //! # Writing a mask
 //!
@@ -53,7 +52,6 @@
 //! mask = "proxy"
 //! proxy = "acme.offset"
 //! options = { offset = 5000 }
-//! fallback = "null"
 //! ```
 use std::borrow::Cow;
 use std::collections::HashMap;
