@@ -1279,6 +1279,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         self.explaining = explaining;
     }
 
+    // Type modifiers are constants or identifiers, never column references:
+    // in `mytype(ssn) 'x'`, `ssn` is a name Postgres passes to the type.
+    fn transform_type_name<'mutref>(&mut self, _node: nodes::TypeNameMut<'mem, 'mutref>) {}
+
     fn transform_param_ref<'mutref>(&mut self, _node: nodes::ParamRefMut<'mem, 'mutref>) {
         // A parameter of the function body being analyzed for where its
         // parameters go. Anywhere else, parameters are the client's values.

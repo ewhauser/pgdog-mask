@@ -2400,6 +2400,12 @@ fn exempt_user() -> Vec<Case> {
 fn parameters_literals() -> Vec<Case> {
     use Expect::*;
     vec![
+        // A type modifier names an identifier; it reads no column.
+        case(
+            "V0",
+            "SELECT id FROM users WHERE mytype(ssn) 'x' = 'x'",
+            Same(vec![], false),
+        ),
         case(
             "V1",
             "SELECT ssn FROM users WHERE id = $1",

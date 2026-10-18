@@ -835,6 +835,20 @@ fn test_wrapped_statements() {
     }
 }
 
+/// Type modifiers are identifiers, not column references: masking them
+/// would change the type, and deparse as nothing.
+#[test]
+fn test_type_modifiers_are_not_columns() {
+    unchanged("anonymous", "SELECT numeric(ssn) '1' FROM users");
+    unchanged(
+        "anonymous",
+        "SELECT id FROM users WHERE set_config(')', ssn, false) 'x' = 'x'",
+    );
+    let sql = rewritten("anonymous", "SELECT ssn::mytype(ssn) FROM users");
+    assert!(sql.contains("::mytype(ssn)"), "{sql}");
+    assert!(pg_raw_parse::parse(&sql).is_ok(), "{sql}");
+}
+
 #[test]
 fn test_partitions_inherit() {
     assert!(rewritten("anonymous", "SELECT ssn FROM users_2024").contains("'XXX-XX-'"));
