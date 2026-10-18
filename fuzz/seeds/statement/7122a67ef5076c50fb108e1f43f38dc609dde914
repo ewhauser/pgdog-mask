@@ -1,0 +1,1 @@
+SELECT stash_def('a', ssn) FROM users

@@ -1,0 +1,1 @@
+SELECT JSON_VALUE(to_jsonb(ssn), '$' RETURNING int ERROR ON ERROR) FROM users

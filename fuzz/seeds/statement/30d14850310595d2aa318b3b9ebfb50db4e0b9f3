@@ -1,0 +1,1 @@
+SELECT xmlagg(xmlelement(name x, ssn)), xmlagg(xmlparse(content ssn)) FROM users

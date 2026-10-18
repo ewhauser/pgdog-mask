@@ -1,0 +1,1 @@
+SELECT * FROM stash_if('x', $1) s

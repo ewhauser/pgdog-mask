@@ -1,0 +1,1 @@
+SELECT stash_def(note => ssn, guess => 'a') FROM users

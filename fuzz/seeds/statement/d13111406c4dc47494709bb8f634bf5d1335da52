@@ -1,0 +1,1 @@
+SELECT stash_if(upper(ssn), ssn) FROM users

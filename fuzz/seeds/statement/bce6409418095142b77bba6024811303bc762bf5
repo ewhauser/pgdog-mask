@@ -1,0 +1,1 @@
+BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK

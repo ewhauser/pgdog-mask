@@ -1,0 +1,1 @@
+SELECT XMLEXISTS('//x' PASSING BY REF (SELECT xmlelement(name x, ssn) FROM users LIMIT 1))

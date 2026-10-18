@@ -1,0 +1,1 @@
+SELECT stash_if('x', ssn) FROM users; SELECT stash_if(name, ssn), stash_if(upper(name), ssn) FROM users

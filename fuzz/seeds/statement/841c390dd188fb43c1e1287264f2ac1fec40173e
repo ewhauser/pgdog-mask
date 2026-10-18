@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE (ssn, name) = (SELECT 'x', 'y')

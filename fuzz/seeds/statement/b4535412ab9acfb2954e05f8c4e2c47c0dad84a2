@@ -1,0 +1,1 @@
+SELECT 1, 'x'::text; SET client_min_messages TO notice

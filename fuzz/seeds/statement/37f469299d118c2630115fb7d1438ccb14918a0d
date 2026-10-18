@@ -1,0 +1,1 @@
+SELECT JSON_ARRAY(ssn, name) FROM users

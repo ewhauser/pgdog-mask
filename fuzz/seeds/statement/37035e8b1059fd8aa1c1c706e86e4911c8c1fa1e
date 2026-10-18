@@ -1,0 +1,1 @@
+SELECT takes_d(ssn) FROM users

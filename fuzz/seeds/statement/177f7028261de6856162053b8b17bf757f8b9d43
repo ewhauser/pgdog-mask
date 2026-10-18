@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT note WHERE guess IS NOT NULL RETURNING note

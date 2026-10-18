@@ -1,0 +1,1 @@
+BEGIN; SELECT name::checked_ssn, takes_d(name) FROM users; SELECT note FROM audit; ROLLBACK

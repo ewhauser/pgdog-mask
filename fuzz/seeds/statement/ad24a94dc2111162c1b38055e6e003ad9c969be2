@@ -1,0 +1,1 @@
+BEGIN; SELECT stash_tags(ssn, 'a', 'b') FROM users; SELECT note FROM audit; ROLLBACK

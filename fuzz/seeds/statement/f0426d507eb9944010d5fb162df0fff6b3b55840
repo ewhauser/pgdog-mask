@@ -1,0 +1,1 @@
+INSERT INTO public.audit (note) SELECT n::text WHERE g IS NOT NULL RETURNING note

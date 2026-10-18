@@ -1,0 +1,1 @@
+BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK

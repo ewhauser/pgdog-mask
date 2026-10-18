@@ -1,0 +1,1 @@
+SELECT length(upper(ssn)::checked_ssn) FROM users

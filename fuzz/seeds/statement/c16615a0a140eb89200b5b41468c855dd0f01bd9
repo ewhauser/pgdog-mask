@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE set_config(')', ssn, false) 'x' = 'x'

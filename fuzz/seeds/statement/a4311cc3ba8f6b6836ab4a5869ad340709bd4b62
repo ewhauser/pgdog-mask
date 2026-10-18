@@ -1,0 +1,1 @@
+UPDATE public.audit SET note = 'seen' WHERE note = guess RETURNING note

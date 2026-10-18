@@ -1,0 +1,1 @@
+SELECT JSON_OBJECT(ssn: 1) FROM users

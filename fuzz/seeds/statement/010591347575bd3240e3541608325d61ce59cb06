@@ -1,0 +1,1 @@
+SELECT (id::logged).v FROM orders WHERE id = 2
