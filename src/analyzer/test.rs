@@ -141,6 +141,23 @@ pub(crate) fn functions() -> Vec<Function> {
 
     let mut plpgsql = sql_function(5, "plpgsql_fn", &[], "integer", "BEGIN RETURN 1; END");
     plpgsql.language = "plpgsql".into();
+    // Row filters of security_barrier views, which can't be analyzed.
+    let mut can_see = sql_function(
+        61,
+        "can_see",
+        &[("uid", "bigint")],
+        "boolean",
+        "BEGIN RETURN uid > 0; END",
+    );
+    can_see.language = "plpgsql".into();
+    let mut can_see_ssn = sql_function(
+        62,
+        "can_see_ssn",
+        &[("v", "text")],
+        "boolean",
+        "BEGIN RETURN v IS NOT NULL; END",
+    );
+    can_see_ssn.language = "plpgsql".into();
 
     let mut ssns = sql_function(6, "ssns", &[], "record", "SELECT id, ssn FROM public.users");
     ssns.returns_set = true;
@@ -316,6 +333,8 @@ pub(crate) fn functions() -> Vec<Function> {
         ),
         definer,
         plpgsql,
+        can_see,
+        can_see_ssn,
         ssns,
         sql_function(
             7,
@@ -560,6 +579,52 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
     flags.definition = Some(
         " SELECT users.id, ((users.ssn)::text ~~ '9%'::text) AS starts_9 FROM public.users;".into(),
     );
+    // Definitions that move values elsewhere than their columns, and two
+    // that call functions that can't be analyzed.
+    let barrier_view = |name: &str, columns: &[&str], definition: &str| {
+        let mut view = view(name, columns, definition);
+        view.options = vec!["security_barrier=true".into()];
+        view
+    };
+    let notifies =
+        " SELECT users.id, (pg_notify('c'::text, (users.ssn)::text))::text AS n FROM public.users;";
+    let mut notify_mv = view("notify_mv", &["id", "n"], notifies);
+    notify_mv.kind = RelationKind::MaterializedView;
+    let sink_views = vec![
+        barrier_view("notify_sb", &["id", "n"], notifies),
+        barrier_view(
+            "notify_where_sb",
+            &["id", "name"],
+            " SELECT users.id, users.name FROM public.users WHERE (pg_notify('c'::text, users.email) IS NOT NULL);",
+        ),
+        barrier_view(
+            "stash_sb",
+            &["id"],
+            " SELECT users.id FROM public.users WHERE (public.stash(users.email) IS NOT NULL);",
+        ),
+        barrier_view(
+            "cast_sb",
+            &["id"],
+            " SELECT users.id FROM public.users WHERE (((users.ssn)::public.checked_ssn) IS NOT NULL);",
+        ),
+        view("notify_inline", &["id", "n"], notifies),
+        barrier_view(
+            "nested_sb",
+            &["id"],
+            " SELECT notify_inline.id FROM public.notify_inline;",
+        ),
+        notify_mv,
+        barrier_view(
+            "filtered_sb",
+            &["id", "ssn"],
+            " SELECT users.id, users.ssn FROM public.users WHERE public.can_see(users.id);",
+        ),
+        barrier_view(
+            "peek_sb",
+            &["id"],
+            " SELECT users.id FROM public.users WHERE public.can_see_ssn((users.ssn)::text);",
+        ),
+    ];
 
     let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
@@ -645,6 +710,7 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
             ),
         ]
         .into_iter()
+        .chain(sink_views)
         .chain(relations)
         .collect(),
     );

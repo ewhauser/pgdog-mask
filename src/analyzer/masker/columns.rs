@@ -57,6 +57,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 proxy,
                 type_oid: catalog_column.map(|c| c.type_oid).unwrap_or(0),
             },
+            (None, _) if self.real_values => TargetKind::AsIs,
             (None, sql) => TargetKind::Sql {
                 // Fail closed: a mask with neither reads NULL wherever it's
                 // rewritten.
@@ -134,24 +135,30 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// Does a relation have columns masked, or computed from columns masked,
-    /// by a proxy mask for this user?
+    /// by a proxy mask for this user? In what runs on real values, any mask
+    /// counts.
     pub(super) fn has_proxy_masks(&self, relation: &Relation) -> bool {
-        self.ctx
-            .assignments
-            .relation_policies(&relation.schema, &relation.name)
-            .any(|policy| self.ctx.profile.masks[policy].proxy().is_some())
-    }
-
-    /// Does a relation have columns masked, or computed from columns masked,
-    /// by a SQL mask for this user?
-    fn has_sql_masks(&self, relation: &Relation) -> bool {
         self.ctx
             .assignments
             .relation_policies(&relation.schema, &relation.name)
             .any(|policy| {
                 let mask = &self.ctx.profile.masks[policy];
-                mask.is_masked() && mask.proxy().is_none()
+                mask.proxy().is_some() || (self.real_values && mask.is_masked())
             })
+    }
+
+    /// Does a relation have columns masked, or computed from columns masked,
+    /// by a SQL mask for this user, which rewriting applies?
+    fn has_sql_masks(&self, relation: &Relation) -> bool {
+        !self.real_values
+            && self
+                .ctx
+                .assignments
+                .relation_policies(&relation.schema, &relation.name)
+                .any(|policy| {
+                    let mask = &self.ctx.profile.masks[policy];
+                    mask.is_masked() && mask.proxy().is_none()
+                })
     }
 
     /// Operators the raw value of the column a reference points to may be
@@ -163,7 +170,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .kind
         {
             TargetKind::Sql { raw_search, .. } => Some(raw_search),
-            TargetKind::Proxy { .. } => None,
+            TargetKind::Proxy { .. } | TargetKind::AsIs => None,
         }
     }
 
@@ -338,6 +345,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     /// How a table-like view's column computed from masked columns is masked.
+    /// In what runs on real values, it carries them, like a proxy-masked
+    /// column.
     fn derived_policy(&self, resolved: &ResolvedColumn<'_>) -> DerivedPolicy {
         let Some(policies) = self.ctx.assignments.derived(
             &resolved.relation.schema,
@@ -354,7 +363,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .peekable();
         if masked.peek().is_none() {
             DerivedPolicy::None
-        } else if masked.all(|mask| mask.proxy().is_some()) {
+        } else if self.real_values || masked.all(|mask| mask.proxy().is_some()) {
             DerivedPolicy::Proxy
         } else {
             DerivedPolicy::Sql

@@ -159,6 +159,9 @@ async fn setup(client: &Client) {
              -- Notifications on this schema's channel reach this connection.
              -- Channels are per database: the proxy canaries use others.
              LISTEN {SCHEMA};
+             -- Reading any of its columns notifies listeners of every ssn.
+             CREATE VIEW notify_sb WITH (security_barrier) AS
+                SELECT id, pg_notify('{SCHEMA}', ssn)::text AS n FROM users;
 
              CREATE FUNCTION last4(v TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT
                 AS $$ SELECT right(v, 4) $$;
@@ -664,6 +667,8 @@ const CORPUS: &[(&str, Expect)] = &[
     ("SELECT id FROM barrier", Expect::Runs),
     ("SELECT loud FROM barrier", Expect::Blocked),
     ("SELECT * FROM ssn_mv", Expect::Runs),
+    // Its definition runs on real values, and sends them elsewhere.
+    ("SELECT id FROM notify_sb", Expect::Blocked),
     // Writes through views over masked columns are blocked.
     (
         "BEGIN; UPDATE user_ssns SET email = email; ROLLBACK",
@@ -894,14 +899,17 @@ async fn test_no_canary_leaks() {
     .await
     .unwrap();
     assert!(leaked(&out).is_some(), "{out}");
-    // Control: so do notifications.
+    // Control: so do notifications, also those a view's definition sends
+    // when no masked column is read.
     let notify = format!("SELECT pg_notify('{SCHEMA}', ssn) FROM users");
-    let out = run(&conn, &notify, View::Raw).await.unwrap();
-    let notified: String = out
-        .lines()
-        .filter(|line| line.starts_with(&format!("NOTIFY {SCHEMA} ")))
-        .collect();
-    assert!(leaked(&notified).is_some(), "{out}");
+    for sql in [notify.as_str(), "SELECT id FROM notify_sb"] {
+        let out = run(&conn, sql, View::Raw).await.unwrap();
+        let notified: String = out
+            .lines()
+            .filter(|line| line.starts_with(&format!("NOTIFY {SCHEMA} ")))
+            .collect();
+        assert!(leaked(&notified).is_some(), "{sql}: {out}");
+    }
 
     let profile = policies.profile("anonymous", "pgdog");
     let ctx = Context {
@@ -1140,6 +1148,21 @@ async fn setup_proxy(client: &Client) {
              -- connection.
              LISTEN c;
              LISTEN ch;
+             -- Definitions that notify listeners of every ssn or email,
+             -- directly or through a row filter that can't be analyzed; and
+             -- a filter that's only passed ids.
+             CREATE VIEW notify_sb WITH (security_barrier) AS
+                SELECT id, pg_notify('c', ssn)::text AS n FROM users;
+             CREATE VIEW notify_where_sb WITH (security_barrier) AS
+                SELECT id, name FROM users WHERE pg_notify('c', email) IS NOT NULL;
+             CREATE FUNCTION can_see(uid BIGINT) RETURNS BOOLEAN LANGUAGE plpgsql
+                AS $$ BEGIN RETURN uid > 0; END $$;
+             CREATE FUNCTION can_see_ssn(v TEXT) RETURNS BOOLEAN LANGUAGE plpgsql
+                AS $$ BEGIN PERFORM pg_notify('c', v); RETURN true; END $$;
+             CREATE VIEW filtered_sb WITH (security_barrier) AS
+                SELECT id, ssn FROM users WHERE can_see(id);
+             CREATE VIEW peek_sb WITH (security_barrier) AS
+                SELECT id FROM users WHERE can_see_ssn(ssn);
 
              CREATE FUNCTION last4(v TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT
                 AS $$ SELECT right(v, 4) $$;
@@ -2750,6 +2773,17 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     ("Q12", "SELECT ssn FROM nested_v", Expect::Runs),
     ("Q13", "SELECT * FROM user_ssns", Expect::Runs),
     ("Q14", "LOCK TABLE user_ssns", Expect::Blocked),
+    // Definitions run on real values: what they send elsewhere can't be
+    // masked, for SQL-masked columns (email) too.
+    ("Q17", "SELECT id FROM notify_sb", Expect::Blocked),
+    ("Q17", "SELECT name FROM notify_where_sb", Expect::Blocked),
+    (
+        "Q17",
+        "BEGIN; UPDATE notify_where_sb SET name = name WHERE id = 1; COMMIT",
+        Expect::Blocked,
+    ),
+    ("Q18", "SELECT ssn FROM filtered_sb", Expect::Runs),
+    ("Q18", "SELECT id FROM peek_sb", Expect::Blocked),
     // EXPLAIN. Plans quote the statement's literals, so they're no canaries.
     (
         "R1",
@@ -3177,8 +3211,15 @@ async fn test_no_canary_leaks_proxy() {
         };
         assert!(leaked(text).is_some(), "{sql}: {text}");
     }
-    // Control: notifications carry the canaries too.
-    for sql in ["SELECT pg_notify('c', ssn) FROM users"] {
+    // Control: notifications carry the canaries too, also those views'
+    // definitions send when no masked column is read.
+    for sql in [
+        "SELECT pg_notify('c', ssn) FROM users",
+        "SELECT id FROM notify_sb",
+        "SELECT name FROM notify_where_sb",
+        "BEGIN; UPDATE notify_where_sb SET name = name WHERE id = 1; COMMIT",
+        "SELECT id FROM peek_sb",
+    ] {
         let out = run(&conn, sql, View::Raw).await.unwrap();
         let notified: String = out
             .lines()

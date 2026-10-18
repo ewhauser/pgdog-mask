@@ -20,7 +20,36 @@ Columns of a table-like view that pass a masked column through unchanged get its
 
 Writes through views that read masked columns are blocked, and views without a definition in the catalog are blocked. For users with proxy masks, every write has its [errors redacted](../errors/#per-statement-redaction), through a view or not: the triggers and constraints of the tables it writes run on real values.
 
-`view_allowlist` lists views masked users may query without analysis. Listing one attests that it doesn't return masked data.
+`view_allowlist` lists views masked users may query without analysis. Listing one attests that it doesn't return masked data, and, for a view queried like a table, that its definition doesn't send masked data anywhere else (below).
+
+### What a table-like view's definition does
+
+Only the columns of a table-like view are masked. Its definition runs on real values whenever the view is read or written through, whatever columns the statement uses. So the plugin analyzes the definition the way Postgres runs it: every masked column carries its real value, whether its mask is SQL or proxy, and nothing is rewritten. The view is blocked for every masked user if its definition would move those values anywhere but its columns:
+
+- to a built-in with a side effect, such as `pg_notify`, `set_config` or an advisory lock;
+- to a parameter of a SQL function that can reach a write or a side effect, directly or through another function;
+- to a type that isn't built in, by a cast or a function's parameter or result: a domain's checks and a user-defined cast's function run on the value.
+
+It's also blocked if the definition can't be analyzed, for instance if it calls a function that isn't in the catalog or one that's never allowed, such as `dblink`. Nested views and the bodies of SQL functions it calls are analyzed the same way.
+
+For example, with
+
+```sql
+CREATE VIEW notify_sb WITH (security_barrier) AS
+  SELECT id, pg_notify('c', ssn)::text AS n FROM users;
+```
+
+`SELECT id FROM notify_sb` would notify every listener of `c`, which a masked user can be, of every raw SSN. It's blocked:
+
+```text
+view public.notify_sb is queried like a table, so its definition runs on real values: pg_notify() would move values of masked columns (public.users.ssn) where PgDog can't mask them
+```
+
+Functions the plugin can't analyze, written in PL/pgSQL, C or another language, aggregates, and functions of extensions, are the exception. In a table-like view's definition, they may be called with values of unmasked columns, which is how `security_barrier` views usually filter rows: `WHERE can_see(id)` is fine. Each of their arguments counts as reaching a side effect, so `WHERE can_see(ssn)` blocks the view, and their result counts as computed from masked values. They may write, so for users with proxy masks, reading such a view has its errors redacted.
+
+This is a trade-off: a function the plugin can't analyze that reads masked columns on its own, and sends them somewhere, isn't caught. Masked users can't call such functions directly, but a table-like view can call them on their behalf. Functions in `udf_allowlist` or `extension_allowlist` are trusted as elsewhere, and may be passed values of masked columns.
+
+Materialized views aren't affected: their definition runs only on `REFRESH`, which masked users can't run.
 
 ## SQL functions
 
@@ -65,7 +94,7 @@ Pass every argument explicitly, by position, to keep a call inlinable. Blocked c
 
 ## Code the plugin can't analyze
 
-Functions in PL/pgSQL, C or other languages, functions of extensions, and functions not in the catalog are blocked for masked users. If such a function can't return masked data, allow it:
+Functions in PL/pgSQL, C or other languages, functions of extensions, and functions not in the catalog are blocked for masked users. Only the definition of a view queried like a table may call those in the catalog, with values of unmasked columns ([above](#what-a-table-like-views-definition-does)). If such a function can't return masked data, allow it:
 
 ```toml
 [general]

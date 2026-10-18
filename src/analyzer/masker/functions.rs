@@ -229,29 +229,53 @@ enum Reach {
 }
 
 impl Reach {
-    fn message(&self, function: &Function, name: &str) -> String {
+    /// Why, for arguments carrying values of `columns`.
+    fn message(&self, function: &Function, name: &str, columns: &str) -> String {
+        let can_pass = match unanalyzable(function) {
+            Some(why) => why,
+            None => format!(
+                "function {}() can pass a parameter to a write or a side effect",
+                function.qualified_name()
+            ),
+        };
         let function = function.qualified_name();
-        let can_pass =
-            format!("function {function}() can pass a parameter to a write or a side effect");
         let converting =
             "converting a value to it can run a user-defined cast function or domain check";
         match self {
-            Reach::Sink(param) => format!(
-                "{can_pass}, so its argument for {param} can't carry values of proxy-masked columns"
-            ),
+            Reach::Sink(param) => {
+                format!("{can_pass}, so its argument for {param} can't carry values of {columns}")
+            }
             Reach::Type(param, data_type) => format!(
-                "function {function}() takes {param} as {data_type}, which isn't a built-in type: {converting}, so its argument for {param} can't carry values of proxy-masked columns"
+                "function {function}() takes {param} as {data_type}, which isn't a built-in type: {converting}, so its argument for {param} can't carry values of {columns}"
             ),
             Reach::Operands(None) => format!(
-                "{can_pass}, and operator {name} may call it with either operand in either parameter (the planner can use an operator's commutator or negator), so it can't be applied to values of proxy-masked columns"
+                "{can_pass}, and operator {name} may call it with either operand in either parameter (the planner can use an operator's commutator or negator), so it can't be applied to values of {columns}"
             ),
             Reach::Operands(Some(data_type)) => format!(
-                "function {function}() takes {data_type}, which isn't a built-in type, and operator {name} may call it with either operand: {converting}, so {name} can't be applied to values of proxy-masked columns"
+                "function {function}() takes {data_type}, which isn't a built-in type, and operator {name} may call it with either operand: {converting}, so {name} can't be applied to values of {columns}"
             ),
             Reach::Unmatched => format!(
-                "{can_pass}, or takes a type that isn't built in, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
+                "{can_pass}, or takes a type that isn't built in, and the call's arguments can't be matched to its parameters, so it can't be called with values of {columns}"
             ),
         }
+    }
+}
+
+/// Why a function's body can't be analyzed, if it can't: it isn't a plain
+/// function, isn't written in SQL, or its body can't be read.
+fn unanalyzable(function: &Function) -> Option<String> {
+    let label = function.qualified_name();
+    if function.kind != "function" {
+        Some(format!("{} {label}() can't be analyzed", function.kind))
+    } else if function.language != "sql" {
+        Some(format!(
+            "function {label}() is written in {} and can't be analyzed",
+            function.language
+        ))
+    } else if function_body(function).is_none() {
+        Some(format!("function {label}() has an unreadable body"))
+    } else {
+        None
     }
 }
 
@@ -462,7 +486,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }) {
             let function = function.qualified_name();
             let why = format!(
-                "function {function}() returns {data_type}, which isn't a built-in type: converting its result can run a user-defined domain check on values of proxy-masked columns"
+                "function {function}() returns {data_type}, which isn't a built-in type: converting its result can run a user-defined domain check on values of {}",
+                self.sink_columns()
             );
             self.sink_with(args.taint().join(Taint::Computed), |_| why);
         }
@@ -472,18 +497,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if args.taint().is_clean() {
             return;
         }
+        let columns = self.sink_columns();
         let mut reaching = Taint::Clean;
         let mut why = None;
         for function in candidates {
             if let Some((taint, reach)) = self.reaching(function, args) {
                 reaching = reaching.join(taint);
-                why.get_or_insert_with(|| reach.message(function, name));
+                why.get_or_insert_with(|| reach.message(function, name, columns));
             }
         }
         if let Some(opaque) = &check.substitutes.opaque {
             reaching = reaching.join(args.taint());
             why.get_or_insert_with(|| format!(
-                "{opaque} may be run in place of operator {name} and can't be checked, so {name} can't be applied to values of proxy-masked columns"
+                "{opaque} may be run in place of operator {name} and can't be checked, so {name} can't be applied to values of {columns}"
             ));
         }
         if let Some(why) = why {
@@ -775,6 +801,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             BodyInfo::TRUSTED
         } else if self.memo.borrow().active.contains(&active) {
             BodyInfo::blocked(format!("function {label}() is recursive"))
+        } else if self.real_values && unanalyzable(function).is_some() {
+            // Where everything runs on real values, e.g. as a
+            // security_barrier view's row filter, it may be called, but
+            // only with values of unmasked columns: each parameter counts
+            // as a sink (`param_sinks`).
+            BodyInfo::OPAQUE
         } else if function.kind != "function" {
             BodyInfo::blocked(format!(
                 "{} {label}() is not allowed for masked users; add it to udf_allowlist if it's safe",

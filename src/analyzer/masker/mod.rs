@@ -62,13 +62,17 @@ enum TargetKind<'c> {
         /// Type OID of the column; 0 if unknown.
         type_oid: u32,
     },
+    /// SQL-masked, read where nothing is rewritten: by a table-like view's
+    /// definition, which runs on real values.
+    AsIs,
 }
 
 impl MaskTarget<'_> {
-    /// The value a reference reads, if the column is proxy-masked.
+    /// The value a reference reads, if it isn't rewritten.
     fn proxy(&self) -> Option<Taint> {
         match self.kind {
             TargetKind::Proxy { proxy, type_oid } => Some(Taint::Proxy { proxy, type_oid }),
+            TargetKind::AsIs => Some(Taint::Computed),
             TargetKind::Sql { .. } => None,
         }
     }
@@ -163,6 +167,16 @@ impl BodyInfo {
         redacts: false,
     };
 
+    /// A function that can't be analyzed, called where it runs on real
+    /// values: it may read and write anything.
+    const OPAQUE: Self = Self {
+        verdict: Verdict::Safe,
+        touched: false,
+        reads_proxies: true,
+        folds_proxies: false,
+        redacts: true,
+    };
+
     fn blocked(reason: impl Into<String>) -> Self {
         Self {
             verdict: Verdict::Blocked(reason.into()),
@@ -184,6 +198,9 @@ struct Memo {
     namesakes: HashMap<(String, String), Option<String>>,
     /// Views and functions being analyzed, to stop recursion.
     active: Vec<String>,
+    /// The verdicts of what runs on real values: table-like views'
+    /// definitions, and what they use.
+    real_values: Option<Rc<RefCell<Memo>>>,
     /// Bodies parsed to find where their parameters go.
     #[cfg(test)]
     param_parses: usize,
@@ -241,6 +258,10 @@ pub(super) struct Masker<'c, 'mem> {
     /// Analyzing a SQL function's body with parameters carrying values of
     /// proxy-masked columns, to find where they can go.
     params: Option<ParamMode>,
+    /// Analyzing what runs on real values: a table-like view's definition,
+    /// and what it uses. Nothing is rewritten, and masked columns of every
+    /// kind carry their values, like proxy-masked ones.
+    real_values: bool,
     /// Transforming a WINDOW clause, whose definitions are recorded by name.
     in_window_clause: bool,
     /// Transforming a set operation's ORDER BY, which sees only its outputs.
@@ -319,6 +340,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             executing: true,
             explaining: false,
             params: None,
+            real_values: false,
             in_window_clause: false,
             setop_sort: false,
             writing: None,
@@ -336,7 +358,33 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let mut nested = Masker::new(self.mem, ctx);
         nested.depth = self.depth + 1;
         nested.memo = self.memo.clone();
+        nested.real_values = self.real_values;
         nested
+    }
+
+    /// A masker for what runs on real values, sharing the verdicts of
+    /// others like it.
+    fn real_values_masker(&self) -> Masker<'c, 'mem> {
+        let mut masker = Masker::new(self.mem, self.ctx);
+        masker.depth = self.depth;
+        masker.real_values = true;
+        masker.memo = self
+            .memo
+            .borrow_mut()
+            .real_values
+            .get_or_insert_with(Rc::default)
+            .clone();
+        masker
+    }
+
+    /// The columns whose values can't reach a sink, for messages: in what
+    /// runs on real values, every masked column.
+    fn sink_columns(&self) -> &'static str {
+        if self.real_values {
+            "masked columns"
+        } else {
+            "proxy-masked columns"
+        }
     }
 
     /// The context of a view or function body.
@@ -1022,9 +1070,10 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         if let Some(data_type) = user_type
             && self.executing
         {
-            self.sink_with(taint, |_| {
+            self.sink_with(taint, |masker| {
                 format!(
-                    "a cast to {data_type}, which isn't a built-in type, can run a user-defined cast function or domain check on values of proxy-masked columns"
+                    "a cast to {data_type}, which isn't a built-in type, can run a user-defined cast function or domain check on values of {}",
+                    masker.sink_columns()
                 )
             });
         }

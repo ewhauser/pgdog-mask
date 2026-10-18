@@ -7,14 +7,23 @@
 //! `security_invoker`, materialized views, views with their own masked columns,
 //! or all views with `inline_views = false`) are queried like tables instead;
 //! their columns are masked by lineage (see `Assignments`).
+//!
+//! The definition of a table-like view runs on real values, whatever the
+//! user's masks: it's analyzed with every masked column carrying its value,
+//! like a proxy-masked one, and nothing rewritten. Its columns are masked,
+//! but nothing else is: if it would move values anywhere else, e.g. to
+//! `pg_notify()`, or can't be analyzed, the view can't be read. A function
+//! that can't be analyzed is the exception: it can be called there, but not
+//! with values of masked columns.
 use pg_raw_parse::{Node, make::Unique, nodes};
 
 use super::{BodyInfo, Masker, Verdict, find_cte, ident, names};
 use crate::catalog::{Relation, RelationKind};
 
 impl<'c, 'mem> Masker<'c, 'mem> {
-    /// What reading a view means for this user. Tables and table-like views are `Safe`:
-    /// their masked columns are handled like any table's.
+    /// What reading a view means for this user. Tables are `Safe`, and so
+    /// are table-like views their definition allows: their masked columns
+    /// are handled like any table's.
     pub(super) fn view_verdict(&mut self, relation: &Relation) -> Verdict {
         if !matches!(
             relation.kind,
@@ -33,22 +42,21 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             return Verdict::Safe;
         }
 
-        let info = self.view_info(relation);
+        let info = if table_like && !self.real_values {
+            self.real_values_masker().view_info(relation, true)
+        } else {
+            self.view_info(relation, table_like)
+        };
         self.touched |= info.touched;
         // Inlined or not, the definition runs on real values: a view calling
-        // a function that writes, or computing on proxy-masked values, may
-        // quote them in messages. One that can't be analyzed may do either.
-        let unknown = matches!(info.verdict, Verdict::Blocked(_));
-        self.state.writes |= info.redacts || (table_like && unknown);
-        if table_like {
-            Verdict::Safe
-        } else {
-            info.verdict
-        }
+        // a function that writes, or computing on values of masked columns
+        // that aren't rewritten, may quote them in messages.
+        self.state.writes |= info.redacts;
+        info.verdict
     }
 
     /// A view's definition, analyzed for this user. Memoized.
-    fn view_info(&mut self, relation: &Relation) -> BodyInfo {
+    fn view_info(&mut self, relation: &Relation, table_like: bool) -> BodyInfo {
         let key = (relation.schema.clone(), relation.name.clone());
         if let Some(info) = self.memo.borrow().views.get(&key).cloned() {
             return info;
@@ -69,9 +77,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 let mut info = self.analyze_body(definition, vec![], |_| Ok(()));
                 self.memo.borrow_mut().active.pop();
                 info.verdict = match info.verdict {
+                    Verdict::Blocked(reason) if table_like => Verdict::Blocked(format!(
+                        "view {label} is queried like a table, so its definition runs on real values: {reason}"
+                    )),
                     Verdict::Blocked(reason) => Verdict::Blocked(format!("view {label}: {reason}")),
                     // Inlined, so what its columns carry is known.
-                    Verdict::Safe if info.reads_proxies => Verdict::Inline,
+                    Verdict::Safe if info.reads_proxies && !table_like => Verdict::Inline,
                     verdict => verdict,
                 };
                 info

@@ -498,12 +498,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// non-Clean value may carry them.
     pub(super) fn sink_when_planned(&mut self, taint: Taint, what: &str) {
         self.sink_with(taint, |masker| {
-            let labels = &masker.state.proxy_labels;
+            let (columns, labels) = (masker.sink_columns(), &masker.state.proxy_labels);
             if labels.is_empty() {
-                format!("{what} would move values of proxy-masked columns where PgDog can't mask them")
+                format!("{what} would move values of {columns} where PgDog can't mask them")
             } else {
                 format!(
-                    "{what} would move values of proxy-masked columns ({}) where PgDog can't mask them",
+                    "{what} would move values of {columns} ({}) where PgDog can't mask them",
                     labels.iter().cloned().collect::<Vec<_>>().join(", ")
                 )
             }
@@ -547,7 +547,8 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             && (state.reads_proxies || !computes.is_clean())
         {
             self.block(format!(
-                "{data_type} isn't a built-in type: converting values to it can run a user-defined cast function or domain check, so statements that read proxy-masked columns can only use it in casts of other values"
+                "{data_type} isn't a built-in type: converting values to it can run a user-defined cast function or domain check, so statements that read {} can only use it in casts of other values",
+                self.sink_columns()
             ));
         }
         if relevant && let Some(reason) = state.deferred {

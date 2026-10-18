@@ -36,6 +36,7 @@ The plugin blocks what it can't prove safe. All of these fail with SQLSTATE `425
 
 - Writing through views that read masked columns.
 - Reading columns of table-like views computed from SQL-masked columns, unless they're assigned a policy. Columns computed only from proxy-masked columns return `NULL` instead.
+- Reading, or writing through, a table-like view whose definition would move values of masked columns, SQL or proxy, anywhere but its columns: to a built-in with a side effect such as `pg_notify`, to a SQL function's parameter that reaches a write or a side effect, to a function the plugin can't analyze, or to a type that isn't built in. So is one whose definition can't be analyzed. The definition runs on real values, whatever the statement selects. See [Views and functions](../../configure/views-functions/#what-a-table-like-views-definition-does).
 - Views missing from the catalog's definitions, and relations missing from the catalog (unless `on_unresolved = "allow"`).
 - `*` across `JOIN … USING` or `NATURAL` joins, and aliased joins, over masked columns. List the columns instead. An aliased join, `(a JOIN b ON …) AS j`, hides `a` and `b`: columns are read as `j.col`, and `*` over it is `j.*`.
 - Column alias lists on a table with masked columns, when they name its first masked column or a later one, such as `SELECT c FROM users AS x(a, b, c)`. Alias the columns in the select list instead: `SELECT ssn AS c FROM users x`.
@@ -82,6 +83,7 @@ Not supported:
 - **Inference through proxy-masked columns**, whose conditions and ordering use real values by design. See [Proxy masks](../../configure/proxy-masks/#security-model).
 - **Timing side channels.**
 - **Copies made by exempt users** into tables masked users can read.
+- **Functions the plugin can't analyze** (PL/pgSQL, C, extensions) **called by a table-like view's definition**, which may read masked columns on their own and send them anywhere. They can't be passed values of masked columns there, but what they do by themselves isn't checked. See [Views and functions](../../configure/views-functions/#what-a-table-like-views-definition-does).
 - **Sharding keys.** Masking a column PgDog shards by breaks routing for masked users; the plugin doesn't check this. See [Choose masked columns](../../configure/columns/#dont-mask-sharding-keys).
 
 See the [security model](../security/) for the assumptions masking relies on.

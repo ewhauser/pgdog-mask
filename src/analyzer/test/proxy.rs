@@ -2565,6 +2565,97 @@ fn views() -> Vec<Case> {
             "UPDATE user_names_v SET name = 'x' WHERE id = 1",
             Same(vec![], true),
         )
+        .config(tables.clone()),
+        // Queried like a table, a view's definition runs on real values, of
+        // SQL-masked columns too: it can't be read, whatever columns are,
+        // if it moves them anywhere but its columns.
+        case(
+            "Q17",
+            "SELECT id FROM notify_sb",
+            Block(
+                "view public.notify_sb is queried like a table, so its definition runs on real values: pg_notify() would move values of masked columns (public.users.ssn) where PgDog can't mask them",
+            ),
+        ),
+        case(
+            "Q17",
+            "SELECT id FROM notify_sb",
+            Block("pg_notify() would move values of masked columns (public.users.ssn)"),
+        )
+        .user("analyst"),
+        case("Q17", "SELECT id FROM notify_sb", allow()).user("admin"),
+        case(
+            "Q17",
+            "SELECT name FROM notify_where_sb",
+            Block("pg_notify() would move values of masked columns (public.users.email)"),
+        ),
+        // Writes through it run its condition.
+        case(
+            "Q17",
+            "UPDATE notify_where_sb SET name = 'x' WHERE id = 1",
+            Block("view public.notify_where_sb is queried like a table"),
+        ),
+        case(
+            "Q17",
+            "SELECT id FROM stash_sb",
+            Block(
+                "function public.stash() can pass a parameter to a write or a side effect, so its argument for v can't carry values of masked columns",
+            ),
+        )
+        .user("analyst"),
+        case(
+            "Q17",
+            "SELECT id FROM cast_sb",
+            Block("a cast to public.checked_ssn"),
+        ),
+        // Through a view it inlines, and through one queried like a table.
+        case(
+            "Q17",
+            "SELECT id FROM nested_sb",
+            Block("view public.nested_sb is queried like a table"),
+        )
+        .user("analyst"),
+        case(
+            "Q17",
+            "SELECT id FROM nested_sb",
+            Block("view public.notify_inline is queried like a table"),
+        )
+        .config(tables.clone()),
+        // Inlined, the definition is masked like the statement.
+        case(
+            "Q17",
+            "SELECT id FROM notify_inline",
+            Rewritten(vec!["pg_notify("], vec![], false),
+        )
+        .user("analyst"),
+        // A materialized view's definition only runs on REFRESH.
+        case("Q17", "SELECT id FROM notify_mv", allow()),
+        // Functions that can't be analyzed can run there, e.g. to filter
+        // rows, but can't be passed values of masked columns. They may
+        // write.
+        case(
+            "Q18",
+            "SELECT ssn FROM filtered_sb",
+            Same(vec![pt(0)], true),
+        ),
+        case(
+            "Q18",
+            "SELECT id, ssn FROM filtered_sb",
+            Rewritten(vec!["FROM filtered_sb"], vec![], false),
+        )
+        .user("analyst"),
+        case(
+            "Q18",
+            "SELECT id FROM peek_sb",
+            Block(
+                "function public.can_see_ssn() is written in plpgsql and can't be analyzed, so its argument for v can't carry values of masked columns",
+            ),
+        ),
+        case(
+            "Q18",
+            "SELECT id FROM peek_sb",
+            Block("function public.can_see_ssn() is written in plpgsql"),
+        )
+        .user("analyst")
         .config(tables),
     ]
 }
