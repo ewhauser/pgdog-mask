@@ -10,7 +10,7 @@ use pgdog_mask::config::Config;
 use pgdog_mask::engine::Engine;
 use pgdog_mask::pgdog_plugin::redact::field;
 use pgdog_mask::pgdog_plugin::{
-    Catalog, ErrorField, ErrorFields, MaskBatch, MaskColumn, MaskOutput, Value, Verdict,
+    Catalog, ErrorField, ErrorFields, TransformBatch, TransformColumn, TransformOutput, Value, Verdict,
     types::Format,
 };
 use pgdog_mask_fuzz::fixture::{
@@ -92,10 +92,10 @@ fuzz_target!(|data: &[u8]| {
                     let batch_columns: Vec<_> = columns
                         .iter()
                         .filter(|mask| !mask.is_null())
-                        .map(|mask| MaskColumn::new(mask, format, &values))
+                        .map(|mask| TransformColumn::new(mask, format, &values))
                         .collect();
-                    let batch = MaskBatch::new(values.len() as u32, &batch_columns);
-                    let mut out = MaskOutput::default();
+                    let batch = TransformBatch::new(values.len() as u32, &batch_columns);
+                    let mut out = TransformOutput::default();
                     if engine.mask_rows(&batch, &mut out).is_ok() {
                         assert_eq!(out.len(), batch_columns.len() * values.len());
                     }

@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use pgdog_mask::config::Config;
 use pgdog_mask::engine::Engine;
 use pgdog_plugin::{
-    Catalog, CatalogParts, MaskBatch, MaskColumn, MaskOutput, Session, Value, Verdict,
+    Catalog, CatalogParts, Session, TransformBatch, TransformColumn, TransformOutput, Value,
+    Verdict,
     catalog::{Column, Relation, RelationKind},
     types::Format,
 };
@@ -217,10 +218,10 @@ fn main() {
         .iter()
         .map(|tax_id| Value::new(Some(tax_id.as_bytes())))
         .collect();
-    let batch_columns = [MaskColumn::new(&columns[0], Format::Text, &values)];
-    let batch = MaskBatch::new(values.len() as u32, &batch_columns);
+    let batch_columns = [TransformColumn::new(&columns[0], Format::Text, &values)];
+    let batch = TransformBatch::new(values.len() as u32, &batch_columns);
     let per = measure("hmac_sha256, a batch of 500 values", |_| {
-        let mut out = MaskOutput::default();
+        let mut out = TransformOutput::default();
         engine.mask_rows(&batch, &mut out).unwrap();
         black_box(out);
     });

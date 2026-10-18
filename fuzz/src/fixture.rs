@@ -8,7 +8,7 @@ use pgdog_mask::pgdog_plugin::catalog::{
     Column, Function, Operator, Relation, RelationKind, SecurityLabel,
 };
 use pgdog_mask::pgdog_plugin::{
-    Catalog, CatalogParts, ColumnMask, Config, PluginVtable, Session, Verdict,
+    Catalog, CatalogParts, ColumnTransform, Config, PluginVtable, Session, Verdict,
 };
 use pgdog_mask::proxy::Registry;
 
@@ -267,8 +267,8 @@ pub fn plugin() -> &'static PluginVtable {
 }
 
 /// Proxy masks of [`PROXY_STATEMENT`]: valid mask IDs for `mask_rows`.
-pub fn proxy_masks() -> &'static [ColumnMask] {
-    static MASKS: LazyLock<Vec<ColumnMask>> = LazyLock::new(|| {
+pub fn proxy_masks() -> &'static [ColumnTransform] {
+    static MASKS: LazyLock<Vec<ColumnTransform>> = LazyLock::new(|| {
         let session = Session::new(MASKED_USER.into(), DATABASE.into());
         match plugin().statement(&session, PROXY_STATEMENT) {
             Ok(Verdict::Rewrite { columns, .. }) if columns.len() == 4 => columns,

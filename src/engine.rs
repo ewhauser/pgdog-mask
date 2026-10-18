@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use pgdog_plugin::{
-    Access, ColumnMask, Deny, ErrorFields, MaskBatch, MaskError, MaskId, MaskOutput, Redaction,
-    Session, SqlState, Verdict, redact::field::DETAIL,
+    Access, ColumnTransform, Deny, ErrorFields, Redaction, Session, SqlState, TransformBatch,
+    TransformId, TransformOutput, Verdict, redact::field::DETAIL,
 };
 use tracing::{Level, debug, enabled, error, info, warn};
 
@@ -17,7 +17,7 @@ use crate::analyzer::{self, Context, Outcome, ResultMask, analyze, deparsable, s
 use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies, Profile, ProxyInstance};
-use crate::proxy::{self, Registry};
+use crate::proxy::{self, MaskError, Registry};
 use crate::tags;
 
 /// `cannot_connect_now`: the schema of the database isn't loaded yet.
@@ -50,11 +50,11 @@ impl Settings {
             .columns
             .iter()
             .map(|column| match column.mask {
-                ResultMask::Null => ColumnMask::null(column.column).in_result(column.result),
+                ResultMask::Null => ColumnTransform::null(column.column).in_result(column.result),
                 ResultMask::Proxy { proxy, type_oid } => {
-                    let mask = ColumnMask::new(
+                    let mask = ColumnTransform::new(
                         column.column,
-                        MaskId(self.proxy_base + proxy as u64),
+                        TransformId(self.proxy_base + proxy as u64),
                         type_oid,
                     )
                     .in_result(column.result);
@@ -203,7 +203,7 @@ struct Database {
 /// How PgDog masks a statement's results.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Results {
-    columns: Arc<[ColumnMask]>,
+    columns: Arc<[ColumnTransform]>,
     /// Errors may quote values of proxy-masked columns.
     redact_errors: bool,
 }
@@ -465,11 +465,11 @@ impl Engine {
 
             match (self.decide(session, sql, &settings, profile), mode) {
                 (Decision::Continue(results), Mode::Enforce) if !results.is_empty() => {
-                    Verdict::rewrite_masked(sql, results.columns.to_vec())
+                    Verdict::transform(sql, results.columns.to_vec())
                         .redact_errors(results.redact_errors)
                 }
                 (Decision::Rewrite(sql, results), Mode::Enforce) => {
-                    Verdict::rewrite_masked(sql, results.columns.to_vec())
+                    Verdict::transform(sql, results.columns.to_vec())
                         .redact_errors(results.redact_errors)
                 }
                 (Decision::Block(reason), Mode::Enforce) => Verdict::Deny(denied(reason)),
@@ -506,20 +506,24 @@ impl Engine {
     }
 
     /// Mask a batch of result rows with proxy masks. See [`crate::proxy`].
-    pub fn mask_rows(&self, batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+    pub fn mask_rows(
+        &self,
+        batch: &TransformBatch<'_>,
+        out: &mut TransformOutput,
+    ) -> Result<(), MaskError> {
         let proxies = self.proxies.load();
         for column in batch.columns() {
             // PgDog applies NULL masks itself; never mask with whatever has
             // that ID if one arrives anyway.
-            if column.mask == MaskId::NULL {
+            if column.transform == TransformId::NULL {
                 for _ in column.values() {
                     out.push(None);
                 }
                 continue;
             }
             let instance = proxies
-                .get(column.mask.0 as usize)
-                .ok_or_else(|| MaskError::new(format!("unknown mask ID {}", column.mask.0)))?;
+                .get(column.transform.0 as usize)
+                .ok_or_else(|| MaskError::new(format!("unknown mask ID {}", column.transform.0)))?;
             let failed = |err: MaskError| MaskError::new(format!("{}: {}", instance.name, err.0));
             if proxy::mask_text_column(instance.mask.as_ref(), column, out).map_err(failed)? {
                 continue;
@@ -829,7 +833,7 @@ fn normalized(sql: &str) -> String {
 mod test {
     use std::collections::HashSet;
 
-    use pgdog_plugin::{ErrorField, MaskColumn, Value, redact::field, types::Format};
+    use pgdog_plugin::{ErrorField, TransformColumn, Value, redact::field, types::Format};
 
     use super::*;
     use crate::analyzer::test::proxy::{PROXY_CONFIG, proxy_registry, rows};
@@ -1163,16 +1167,16 @@ mod test {
     /// Mask `values` with each of `masks`, as PgDog batches them.
     fn mask_rows(
         engine: &Engine,
-        masks: &[ColumnMask],
+        masks: &[ColumnTransform],
         format: Format,
         values: &[Value<'_>],
-    ) -> Result<MaskOutput, MaskError> {
+    ) -> Result<TransformOutput, MaskError> {
         let columns: Vec<_> = masks
             .iter()
-            .map(|mask| MaskColumn::new(mask, format, values))
+            .map(|mask| TransformColumn::new(mask, format, values))
             .collect();
-        let batch = MaskBatch::new(values.len() as u32, &columns);
-        let mut out = MaskOutput::default();
+        let batch = TransformBatch::new(values.len() as u32, &columns);
+        let mut out = TransformOutput::default();
         engine.mask_rows(&batch, &mut out).map(|_| out)
     }
 
@@ -1221,7 +1225,10 @@ policy = "ssn"
         else {
             panic!("rewrite");
         };
-        assert_ne!(columns[0].mask, mask.mask, "new settings, new mask IDs");
+        assert_ne!(
+            columns[0].transform, mask.transform,
+            "new settings, new mask IDs"
+        );
         assert!(mask_rows(&engine, &columns, Format::Text, &values).is_ok());
     }
 
@@ -1240,9 +1247,9 @@ policy = "ssn"
         // A1: the original SQL, with a proxy mask.
         assert_eq!(
             engine.statement(&engineer, "SELECT ssn FROM users"),
-            Verdict::rewrite_masked(
+            Verdict::transform(
                 "SELECT ssn FROM users",
-                vec![ColumnMask::new(0, MaskId(0), 1043)]
+                vec![ColumnTransform::new(0, TransformId(0), 1043)]
             )
         );
 
@@ -1252,11 +1259,11 @@ policy = "ssn"
         let verdict = engine.statement(&engineer, sql);
         assert_eq!(
             verdict,
-            Verdict::rewrite_masked(
+            Verdict::transform(
                 sql,
                 vec![
-                    ColumnMask::new(0, MaskId(0), 1043),
-                    ColumnMask::null(0).in_result(1)
+                    ColumnTransform::new(0, TransformId(0), 1043),
+                    ColumnTransform::null(0).in_result(1)
                 ]
             )
             .redact_errors(true)
@@ -1266,7 +1273,7 @@ policy = "ssn"
         };
         let null = columns[1];
         assert!(null.is_null());
-        assert_eq!((null.mask, null.type_oid), (MaskId::NULL, 0));
+        assert_eq!((null.transform, null.type_oid), (TransformId::NULL, 0));
         let pairs: HashSet<_> = columns.iter().map(|m| (m.result, m.column)).collect();
         assert_eq!(pairs.len(), columns.len(), "one mask per result column");
 
@@ -1276,20 +1283,20 @@ policy = "ssn"
         let blocking = engine_with(PROXY_CONFIG, registry, catalog());
         assert_eq!(
             blocking.statement(&engineer, "SELECT ssn, upper(ssn) FROM users"),
-            Verdict::rewrite_masked(
+            Verdict::transform(
                 "SELECT ssn, upper(ssn) FROM users",
                 vec![
-                    ColumnMask::new(0, MaskId(0), 1043).blocking(),
-                    ColumnMask::null(1)
+                    ColumnTransform::new(0, TransformId(0), 1043).blocking(),
+                    ColumnTransform::null(1)
                 ]
             )
             .redact_errors(true)
         );
         assert_eq!(
             blocking.statement(&engineer, "SELECT mrn FROM patients"),
-            Verdict::rewrite_masked(
+            Verdict::transform(
                 "SELECT mrn FROM patients",
-                vec![ColumnMask::new(0, MaskId(1), 25)]
+                vec![ColumnTransform::new(0, TransformId(1), 25)]
             )
         );
     }
@@ -1304,12 +1311,12 @@ policy = "ssn"
         let sql = "SELECT id FROM users WHERE ssn = $1";
         assert_eq!(
             engine.statement(&session("engineer"), sql),
-            Verdict::rewrite_masked(sql, vec![]).redact_errors(true)
+            Verdict::transform(sql, vec![]).redact_errors(true)
         );
         let sql = "SELECT id FROM err_sb";
         assert_eq!(
             engine.statement(&session("analyst"), sql),
-            Verdict::rewrite_masked(sql, vec![]).redact_errors(true)
+            Verdict::transform(sql, vec![]).redact_errors(true)
         );
     }
 
@@ -1417,7 +1424,10 @@ policy = "ssn"
             Value::new(None),
             Value::new(Some(b"x")),
         ];
-        let masks = [ColumnMask::null(0), ColumnMask::new(1, MaskId(0), 1043)];
+        let masks = [
+            ColumnTransform::null(0),
+            ColumnTransform::new(1, TransformId(0), 1043),
+        ];
         let out = mask_rows(&engine, &masks, Format::Text, &values).unwrap();
         assert_eq!(out.len(), 6);
         let debug = format!("{out:?}");

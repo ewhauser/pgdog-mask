@@ -20,7 +20,7 @@ and operators.
 | --- | --- | --- |
 | `statement` | `statement` | Raw SQL in every standard session, seeded with the analyzer's test statements. Exempt users are allowed. Databases without a catalog fail closed with `57P03`. Rewrites parse. Verdicts are deterministic. |
 | `statement_grammar` | `statement`, `function_call` | SQL generated over the fixture schema ([`src/grammar.rs`](src/grammar.rs)). Same checks, plus a leak oracle: a statement that reads a masked column is never allowed as is for the masked user. Only exempt users may make fast-path calls. |
-| `mask_rows` | `mask_rows` | Batches with valid and unknown mask IDs, declared and mismatched types, both formats, and arbitrary values. Unknown masks fail. NULL stays NULL. Masked values decode as the column's type. |
+| `mask_rows` | `transform_rows` | Batches with valid and unknown mask IDs, declared and mismatched types, both formats, and arbitrary values. Unknown masks fail. NULL stays NULL. Masked values decode as the column's type. |
 | `redact_error` | `redact_error` | Errors and notices with arbitrary fields. Masked users lose `DETAIL` and nothing else. Exempt users keep everything. |
 | `catalog` | `catalog`, `statement` | Arbitrary relations, columns, tags, view definitions, functions and operators. The generation changes on every catalog, and statements against the catalog pass the `statement` checks. |
 | `config` | `config` and all others | Arbitrary TOML, loaded like the config file, then every hook run with it. |

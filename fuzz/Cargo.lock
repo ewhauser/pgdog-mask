@@ -828,7 +828,7 @@ dependencies = [
 [[package]]
 name = "pgdog-plugin"
 version = "0.8.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=ebfa85d6#ebfa85d6ff54e8a1d2e8df24bc75a3d17d52a805"
+source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
 dependencies = [
  "bindgen 0.71.1",
  "libloading",
@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "pgdog-postgres-types"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=ebfa85d6#ebfa85d6ff54e8a1d2e8df24bc75a3d17d52a805"
+source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
 dependencies = [
  "bytes",
  "chrono",
@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "pgdog-vector"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=ebfa85d6#ebfa85d6ff54e8a1d2e8df24bc75a3d17d52a805"
+source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
 dependencies = [
  "schemars",
  "serde",

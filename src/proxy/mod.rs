@@ -57,9 +57,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pgdog_plugin::{MaskColumn, MaskOutput};
+use pgdog_plugin::{TransformColumn, TransformOutput};
 
-pub use pgdog_plugin::MaskError;
+/// Why a proxy mask failed: the plugin API's column transform error.
+pub use pgdog_plugin::TransformError as MaskError;
 pub use pgdog_plugin::types::{DataType, Datum, Format};
 
 mod builtin;
@@ -228,8 +229,8 @@ impl Registry {
 /// value is NULL: the column then goes through [`ProxyMask::mask_batch`].
 pub(crate) fn mask_text_column(
     mask: &dyn ProxyMask,
-    column: &MaskColumn<'_>,
-    out: &mut MaskOutput,
+    column: &TransformColumn<'_>,
+    out: &mut TransformOutput,
 ) -> Result<bool, MaskError> {
     if data_type(column.type_oid) != DataType::Text {
         return Ok(false);
@@ -381,17 +382,17 @@ mod test {
 
     #[test]
     fn test_mask_text_column() {
-        use pgdog_plugin::{ColumnMask, MaskId, Value};
+        use pgdog_plugin::{ColumnTransform, TransformId, Value};
 
         let column_of = |type_oid, values| {
-            MaskColumn::new(
-                &ColumnMask::new(0, MaskId(0), type_oid),
+            TransformColumn::new(
+                &ColumnTransform::new(0, TransformId(0), type_oid),
                 Format::Text,
                 values,
             )
         };
-        let masked = |mask: &dyn ProxyMask, column: &MaskColumn<'_>| {
-            let mut out = MaskOutput::default();
+        let masked = |mask: &dyn ProxyMask, column: &TransformColumn<'_>| {
+            let mut out = TransformOutput::default();
             let fast = mask_text_column(mask, column, &mut out).unwrap();
             (fast, format!("{out:?}"))
         };
@@ -405,7 +406,7 @@ mod test {
 
         // Same output as masking through mask_batch.
         let text = column_of(25, &values);
-        let mut expected = MaskOutput::default();
+        let mut expected = TransformOutput::default();
         let decoded = text
             .values()
             .map(|value| decode(value, 25, Format::Text).unwrap());
@@ -419,7 +420,7 @@ mod test {
         );
 
         // Falls back to mask_batch, with nothing written.
-        let empty = format!("{:?}", MaskOutput::default());
+        let empty = format!("{:?}", TransformOutput::default());
         assert_eq!(masked(&Reverse, &text), (false, empty.clone()));
         let nulls = [Value::new(None), Value::new(None)];
         assert_eq!(
@@ -433,7 +434,7 @@ mod test {
 
         // Not UTF-8.
         let invalid = [Value::new(Some(b"\xff"))];
-        let mut out = MaskOutput::default();
+        let mut out = TransformOutput::default();
         assert!(mask_text_column(&FastReverse, &column_of(25, &invalid), &mut out).is_err());
     }
 

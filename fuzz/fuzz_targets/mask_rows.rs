@@ -6,7 +6,7 @@
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use pgdog_mask::pgdog_plugin::types::{DataType, Datum, Format};
-use pgdog_mask::pgdog_plugin::{ColumnMask, HookError, MaskBatch, MaskColumn, MaskId, Value};
+use pgdog_mask::pgdog_plugin::{ColumnTransform, HookError, TransformBatch, TransformColumn, TransformId, Value};
 use pgdog_mask_fuzz::fixture::{proxy_masks, type_oid};
 use pgdog_mask_fuzz::plugin;
 
@@ -93,15 +93,15 @@ fuzz_target!(|input: Input| {
     let proxies = proxy_masks();
     let rows = input.rows as usize % (MAX_ROWS + 1);
 
-    let masks: Vec<(ColumnMask, Format)> = input
+    let masks: Vec<(ColumnTransform, Format)> = input
         .columns
         .iter()
         .take(MAX_COLUMNS)
         .map(|column| {
             let mut mask = match column.mask {
                 MaskChoice::Proxy(i) => proxies[i as usize % proxies.len()],
-                MaskChoice::Null => ColumnMask::null(0),
-                MaskChoice::Id(id) => ColumnMask::new(0, MaskId(id), 25),
+                MaskChoice::Null => ColumnTransform::null(0),
+                MaskChoice::Id(id) => ColumnTransform::new(0, TransformId(id), 25),
             };
             mask.type_oid = match column.type_oid {
                 TypeChoice::Declared => mask.type_oid,
@@ -136,16 +136,16 @@ fuzz_target!(|input: Input| {
     if known_issue {
         return;
     }
-    let columns: Vec<MaskColumn<'_>> = masks
+    let columns: Vec<TransformColumn<'_>> = masks
         .iter()
         .zip(&values)
-        .map(|((mask, format), values)| MaskColumn::new(mask, *format, values))
+        .map(|((mask, format), values)| TransformColumn::new(mask, *format, values))
         .collect();
-    let batch = MaskBatch::new(rows as u32, &columns);
+    let batch = TransformBatch::new(rows as u32, &columns);
 
     let known =
-        |mask: &ColumnMask| mask.is_null() || proxies.iter().any(|proxy| proxy.mask == mask.mask);
-    let masked = match plugin.mask_rows(&batch) {
+        |mask: &ColumnTransform| mask.is_null() || proxies.iter().any(|proxy| proxy.transform == mask.transform);
+    let masked = match plugin.transform_rows(&batch) {
         Ok(masked) => masked,
         // Unmaskable values fail the result; that's the contract.
         Err(HookError::Failed(_)) => return,
