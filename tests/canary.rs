@@ -17,7 +17,9 @@ mod support;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt as _, pin_mut, stream};
-use pgdog_mask::analyzer::{Context, Outcome, ResultMask, Results, analyze, analyze_shape};
+use pgdog_mask::analyzer::{
+    Context, Outcome, ResultColumn, ResultMask, Results, analyze, analyze_shape,
+};
 use pgdog_mask::catalog::Catalog;
 use pgdog_mask::config::Config;
 use pgdog_mask::profile::{Assignments, Policies, ProxyInstance};
@@ -3234,4 +3236,60 @@ async fn test_proxy_filters_find_rows() {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+/// The harness refuses masks the way PgDog does: on a column the result
+/// doesn't have, on a statement that returns no rows, and a proxy mask on a
+/// column of another type. A NULL mask fits any type.
+#[tokio::test]
+async fn test_harness_refuses_bad_masks() {
+    let conn = connect().await;
+    let mask = |result, column, mask| ResultColumn {
+        result,
+        column,
+        mask,
+    };
+    let proxy = |type_oid| ResultMask::Proxy { proxy: 0, type_oid };
+    let check = |columns: Vec<ResultColumn>| Results {
+        columns,
+        redact_errors: false,
+    };
+    let sql = "SELECT 1, 'x'::text; SET client_min_messages TO notice";
+
+    let results = check(vec![mask(0, 2, ResultMask::Null)]);
+    let view = View::Masked {
+        results: &results,
+        proxies: &[],
+    };
+    let err = run(&conn, sql, view).await.unwrap_err();
+    assert!(
+        err.contains("masked column 2 of result 0 doesn't exist"),
+        "{err}"
+    );
+
+    let results = check(vec![mask(1, 0, ResultMask::Null)]);
+    let view = View::Masked {
+        results: &results,
+        proxies: &[],
+    };
+    let err = run(&conn, sql, view).await.unwrap_err();
+    assert!(
+        err.contains("result 1 has masks but returns no rows"),
+        "{err}"
+    );
+
+    // Varchar where the column is text: refused. NULL anywhere: fine.
+    let types = connect().await;
+    let results = check(vec![mask(0, 1, proxy(1043)), mask(0, 0, ResultMask::Null)]);
+    let problems = mistyped_masks(&types.client, sql, &results).await;
+    assert_eq!(
+        problems,
+        ["result 0 column 1: proxy mask for type 1043, column Some(25)"]
+    );
+    let results = check(vec![mask(0, 1, proxy(25))]);
+    assert!(
+        mistyped_masks(&types.client, sql, &results)
+            .await
+            .is_empty()
+    );
 }
