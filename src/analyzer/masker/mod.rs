@@ -28,6 +28,7 @@ use super::taint::{Lookup, OutputColumn, Outputs, Taint};
 use crate::mask::SearchOp;
 use functions::{CallArgs, CallCheck, CallUse, ParamMode, ParamSinks};
 use results::{OutputRef, StatementState};
+pub(super) use views::{view_allowlisted, view_outputs};
 
 /// Why statements after one that may change name resolution are blocked.
 const RESOLUTION_CHANGED: &str = "statements after one that may change name resolution (search_path, role or DDL) can't be checked in the same query; send them separately";
@@ -262,6 +263,10 @@ pub(super) struct Masker<'c, 'mem> {
     /// and what it uses. Nothing is rewritten, and masked columns of every
     /// kind carry their values, like proxy-masked ones.
     real_values: bool,
+    /// Analyzing only what a table-like view's definition puts in its
+    /// columns (`view_outputs`): where else it moves values is
+    /// `view_verdict`'s concern, so sinks don't block.
+    outputs_only: bool,
     /// Transforming a WINDOW clause, whose definitions are recorded by name.
     in_window_clause: bool,
     /// Transforming a set operation's ORDER BY, which sees only its outputs.
@@ -341,6 +346,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             explaining: false,
             params: None,
             real_values: false,
+            outputs_only: false,
             in_window_clause: false,
             setop_sort: false,
             writing: None,
@@ -359,6 +365,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         nested.depth = self.depth + 1;
         nested.memo = self.memo.clone();
         nested.real_values = self.real_values;
+        nested.outputs_only = self.outputs_only;
         nested
     }
 

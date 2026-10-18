@@ -15,10 +15,51 @@
 //! `pg_notify()`, or can't be analyzed, the view can't be read. A function
 //! that can't be analyzed is the exception: it can be called there, but not
 //! with values of masked columns.
-use pg_raw_parse::{Node, make::Unique, nodes};
+//!
+//! Lineage only follows column references, so the same analysis also tells,
+//! at catalog load, which of a table-like view's columns its definition
+//! fills with values of masked columns some other way, e.g. through a
+//! function's body (`view_outputs`). Materialized views hold what their
+//! definition computed, so theirs are analyzed too.
+use std::cell::RefCell;
+use std::rc::Rc;
 
-use super::{BodyInfo, Masker, Verdict, find_cte, ident, names};
+use pg_raw_parse::{Node, make::MemoryToken, make::Unique, nodes};
+
+use super::{BodyInfo, Masker, Memo, Verdict, find_cte, ident, names};
+use crate::analyzer::Context;
 use crate::catalog::{Relation, RelationKind};
+use crate::config::General;
+
+/// Is a view trusted by the configuration?
+pub(in crate::analyzer) fn view_allowlisted(general: &General, relation: &Relation) -> bool {
+    let qualified = relation.qualified_name();
+    general
+        .view_allowlist
+        .iter()
+        .any(|v| *v == qualified || *v == relation.name)
+}
+
+/// For each table-like view, which of its columns its definition, run on
+/// real values, fills with values of the columns `ctx.profile` masks: `None`
+/// if that can't be told.
+pub(in crate::analyzer) fn view_outputs<'c>(
+    mem: MemoryToken<'_>,
+    ctx: &'c Context<'c>,
+    views: &[&'c Relation],
+) -> Vec<Option<Vec<bool>>> {
+    let memo: Rc<RefCell<Memo>> = Rc::default();
+    views
+        .iter()
+        .map(|relation| {
+            let mut masker = Masker::new(mem, ctx);
+            masker.real_values = true;
+            masker.outputs_only = true;
+            masker.memo = memo.clone();
+            masker.definition_outputs(relation)
+        })
+        .collect()
+}
 
 impl<'c, 'mem> Masker<'c, 'mem> {
     /// What reading a view means for this user. Tables are `Safe`, and so
@@ -94,14 +135,34 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 
     fn view_allowlisted(&self, relation: &Relation) -> bool {
-        let qualified = relation.qualified_name();
-        self.ctx
-            .policies
-            .config
-            .general
-            .view_allowlist
-            .iter()
-            .any(|v| *v == qualified || *v == relation.name)
+        view_allowlisted(&self.ctx.policies.config.general, relation)
+    }
+
+    /// Which columns a view's definition fills with values of masked
+    /// columns, analyzed as the top-level statement it is when the view is
+    /// queried like a table: its result masks are those columns. `None` if
+    /// it has no definition or can't be analyzed.
+    fn definition_outputs(&mut self, relation: &Relation) -> Option<Vec<bool>> {
+        let definition = relation.definition.as_deref()?;
+        let mut stmts = self.mem.parse(definition).ok()?;
+        if stmts.as_ref().iter().count() != 1 {
+            return None;
+        }
+        let active = format!("view {}", relation.qualified_name());
+        self.memo.borrow_mut().active.push(active);
+        for stmt in stmts.as_mut() {
+            self.statement(stmt);
+            self.finish_statement(0);
+        }
+        self.memo.borrow_mut().active.pop();
+        if self.blocked.is_some() {
+            return None;
+        }
+        let mut tainted = vec![false; relation.columns.len()];
+        for column in &self.results.columns {
+            *tainted.get_mut(usize::from(column.column))? = true;
+        }
+        Some(tainted)
     }
 
     /// `FROM v` for a view over masked columns: `(<definition>) AS v(columns)`.

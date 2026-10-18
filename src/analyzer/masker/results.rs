@@ -516,6 +516,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             params.sinks |= !taint.is_clean();
             return;
         }
+        if self.outputs_only {
+            return;
+        }
         self.check_taint(taint, reason);
     }
 

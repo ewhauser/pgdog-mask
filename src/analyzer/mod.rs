@@ -8,11 +8,12 @@ mod scope;
 pub mod shape;
 mod taint;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use pg_raw_parse::{Node, make};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Relation};
+use crate::mask::Mask;
 use crate::profile::{Assignments, Policies, Profile};
 use masker::Masker;
 pub(crate) use rules::deparsable;
@@ -154,6 +155,123 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             reason: format!("failed to build the masked statement: {err}"),
         },
     }
+}
+
+/// For each table-like view, by column, the policies whose columns' values
+/// its definition, run on real values, may put there: through the body of a
+/// function, a function in FROM, a column of another table-like view
+/// computed from them, or anything else lineage doesn't follow. A view whose
+/// definition can't be analyzed for a policy may hold that policy's values
+/// in any column. Views in `view_allowlist` aren't analyzed.
+///
+/// A definition is analyzed with only one policy's columns masked at a
+/// time, so a column is attributed to exactly the policies whose values
+/// reach it, whoever the user is. Taint only grows with what's masked, so
+/// one analysis with every policy masked first rules out views whose
+/// columns hold no such values, or only have policies of their own, which
+/// mask them whatever they hold.
+pub(crate) fn view_outputs(
+    catalog: &Catalog,
+    assignments: &Assignments,
+    policies: &Policies,
+    views: &[&Relation],
+) -> Vec<Vec<BTreeSet<usize>>> {
+    let mut found: Vec<Vec<BTreeSet<usize>>> = views
+        .iter()
+        .map(|view| vec![BTreeSet::new(); view.columns.len()])
+        .collect();
+    let used = assignments.policies();
+    let general = &policies.config.general;
+    let candidates: Vec<usize> = (0..views.len())
+        .filter(|&i| !masker::view_allowlisted(general, views[i]))
+        .collect();
+    if used.is_empty() || candidates.is_empty() {
+        return found;
+    }
+
+    // Views with a column that may hold masked values and has no policy.
+    let unexplained = |view: &Relation, outputs: &Option<Vec<bool>>| match outputs {
+        None => true,
+        Some(tainted) => view.columns.iter().zip(tainted).any(|(column, tainted)| {
+            *tainted
+                && assignments
+                    .column(&view.schema, &view.name, &column.name)
+                    .is_none()
+        }),
+    };
+    let screened = analyze_views(catalog, assignments, policies, &used, views, &candidates);
+    let (suspects, screened): (Vec<usize>, Vec<_>) = candidates
+        .into_iter()
+        .zip(screened)
+        .filter(|(i, outputs)| unexplained(views[*i], outputs))
+        .unzip();
+
+    for &policy in &used {
+        let outputs = match used.len() {
+            1 => screened.clone(),
+            _ => analyze_views(
+                catalog,
+                assignments,
+                policies,
+                &BTreeSet::from([policy]),
+                views,
+                &suspects,
+            ),
+        };
+        for (&i, outputs) in suspects.iter().zip(&outputs) {
+            for (column, policies) in found[i].iter_mut().enumerate() {
+                if outputs.as_ref().is_none_or(|tainted| tainted[column]) {
+                    policies.insert(policy);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// `masker::view_outputs` for `views[i]` of each `i` in `which`, with the
+/// columns of `masked` policies masked.
+fn analyze_views(
+    catalog: &Catalog,
+    assignments: &Assignments,
+    policies: &Policies,
+    masked: &BTreeSet<usize>,
+    views: &[&Relation],
+    which: &[usize],
+) -> Vec<Option<Vec<bool>>> {
+    // In what runs on real values, any mask carries the column's values.
+    let masks = (0..policies.policies.len())
+        .map(|i| {
+            if masked.contains(&i) {
+                Mask::Sql {
+                    template: "NULL".into(),
+                    raw_search: HashSet::new(),
+                }
+            } else {
+                Mask::Unmasked
+            }
+        })
+        .collect();
+    let profile = Profile {
+        masks,
+        hash: 0,
+        exempt: false,
+        proxies: true,
+    };
+    let ctx = Context {
+        catalog,
+        assignments,
+        policies,
+        profile: &profile,
+        search_path: vec![],
+    };
+    let relations: Vec<&Relation> = which.iter().map(|&i| views[i]).collect();
+    let mut outputs = vec![];
+    make::owned(|mem| {
+        outputs = masker::view_outputs(mem, &ctx, &relations);
+        mem.empty()
+    });
+    outputs
 }
 
 /// Analyze a statement through its shape: analyze the statement with literals

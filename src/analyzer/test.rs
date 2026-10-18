@@ -158,6 +158,14 @@ pub(crate) fn functions() -> Vec<Function> {
         "BEGIN RETURN v IS NOT NULL; END",
     );
     can_see_ssn.language = "plpgsql".into();
+    let mut ssn_plpgsql = sql_function(
+        63,
+        "ssn_plpgsql",
+        &[("uid", "bigint")],
+        "text",
+        "BEGIN RETURN (SELECT ssn FROM public.users WHERE id = uid); END",
+    );
+    ssn_plpgsql.language = "plpgsql".into();
 
     let mut ssns = sql_function(6, "ssns", &[], "record", "SELECT id, ssn FROM public.users");
     ssns.returns_set = true;
@@ -335,6 +343,7 @@ pub(crate) fn functions() -> Vec<Function> {
         plpgsql,
         can_see,
         can_see_ssn,
+        ssn_plpgsql,
         ssns,
         sql_function(
             7,
@@ -625,6 +634,60 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
             " SELECT users.id FROM public.users WHERE public.can_see_ssn((users.ssn)::text);",
         ),
     ];
+    // Columns that functions, or what they're read from, fill with masked
+    // values that their lineage doesn't show.
+    let reads_ssn = " SELECT users.id, public.user_ssn(users.id) AS s FROM public.users;";
+    let mut fn_mv = view("fn_mv", &["id", "s"], reads_ssn);
+    fn_mv.kind = RelationKind::MaterializedView;
+    let mut xml_mv = view(
+        "xml_mv",
+        &["id", "x"],
+        " SELECT users.id, query_to_xml('SELECT ssn FROM public.users'::text, true, false, ''::text) AS x FROM public.users;",
+    );
+    xml_mv.kind = RelationKind::MaterializedView;
+    let mut loud_mv = view(
+        "loud_mv",
+        &["id", "loud"],
+        " SELECT users.id, upper((users.ssn)::text) AS loud FROM public.users;",
+    );
+    loud_mv.kind = RelationKind::MaterializedView;
+    let function_views = vec![
+        barrier_view("fn_sb", &["id", "s"], reads_ssn),
+        fn_mv,
+        barrier_view(
+            "email_fn_sb",
+            &["id", "e"],
+            " SELECT users.id, public.email_of(users.id) AS e FROM public.users;",
+        ),
+        barrier_view(
+            "opaque_sb",
+            &["id", "x"],
+            " SELECT users.id, public.ssn_plpgsql(users.id) AS x FROM public.users;",
+        ),
+        barrier_view(
+            "fn_from_sb",
+            &["id", "v"],
+            " SELECT ssns.id, ssns.ssn AS v FROM public.ssns() ssns(id, ssn);",
+        ),
+        xml_mv,
+        loud_mv,
+        barrier_view(
+            "loud_sb",
+            &["id", "loud"],
+            " SELECT loud_mv.id, loud_mv.loud FROM public.loud_mv;",
+        ),
+        barrier_view(
+            "fn_sb_v",
+            &["id", "s"],
+            " SELECT fn_sb.id, fn_sb.s FROM public.fn_sb;",
+        ),
+        view("fn_v", &["s"], " SELECT fn_sb.s FROM public.fn_sb;"),
+        barrier_view(
+            "upper_sb",
+            &["id", "u"],
+            " SELECT users.id, public.upper_safe(users.name) AS u FROM public.users;",
+        ),
+    ];
 
     let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
@@ -711,6 +774,7 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
         ]
         .into_iter()
         .chain(sink_views)
+        .chain(function_views)
         .chain(relations)
         .collect(),
     );
@@ -1307,6 +1371,96 @@ fn test_views_as_tables() {
     };
     assert!(sql.ends_with("FROM user_ssns"), "{sql}");
     assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+#[test]
+fn test_view_columns_lineage_misses() {
+    // Lineage follows column references only. Columns a table-like view's
+    // definition fills with masked values some other way are computed from
+    // the masked columns whose values reach them, and can't be masked:
+    // through a function's body, a function in FROM, a function that can't
+    // be analyzed, a computed column of a materialized view, or another
+    // such view. A definition that can't be analyzed may hold them anywhere.
+    for (sql, column) in [
+        ("SELECT s FROM fn_sb", "public.fn_sb.s"),
+        ("SELECT * FROM fn_sb", "public.fn_sb.s"),
+        (
+            "SELECT id FROM fn_sb WHERE s LIKE 'CANARY%'",
+            "public.fn_sb.s",
+        ),
+        (
+            "SELECT f.s FROM fn_sb f JOIN orders o ON o.user_id = f.id",
+            "public.fn_sb.s",
+        ),
+        ("SELECT s FROM fn_mv", "public.fn_mv.s"),
+        ("SELECT e FROM email_fn_sb", "public.email_fn_sb.e"),
+        ("SELECT x FROM opaque_sb", "public.opaque_sb.x"),
+        ("SELECT v FROM fn_from_sb", "public.fn_from_sb.v"),
+        ("SELECT id FROM xml_mv", "public.xml_mv.id"),
+        ("SELECT loud FROM loud_sb", "public.loud_sb.loud"),
+        ("SELECT s FROM fn_sb_v", "public.fn_sb_v.s"),
+        ("SELECT s FROM fn_v", "public.fn_sb.s"),
+    ] {
+        for user in ["anonymous", "support"] {
+            let reason = blocked(user, sql);
+            assert!(
+                reason.contains(&format!(
+                    "column {column} is computed from masked columns and can't be masked"
+                )),
+                "{user} {sql}: {reason}"
+            );
+        }
+        unchanged("admin", sql);
+    }
+    // The other columns, and functions that read no masked columns.
+    unchanged("anonymous", "SELECT id FROM fn_sb");
+    unchanged("anonymous", "SELECT id FROM fn_mv");
+    unchanged("anonymous", "SELECT id FROM loud_sb");
+    unchanged("anonymous", "SELECT id, u FROM upper_sb");
+
+    // Only the policies whose values reach a column count, for any user.
+    let hr = CONFIG.replacen(
+        "[[policies.rules]]\nroles = [\"pii_admin\"]",
+        "[[policies.rules]]\nroles = [\"pii_admin\", \"hr\"]",
+        1,
+    ) + "\n[[users]]\nname = \"hr\"\nroles = [\"hr\"]\n";
+    for sql in ["SELECT s FROM fn_sb", "SELECT s FROM fn_mv"] {
+        let outcome = analyze_with(&hr, "hr", sql);
+        assert!(
+            matches!(outcome, Outcome::Unchanged { .. }),
+            "{sql}: {outcome:?}"
+        );
+    }
+    for sql in ["SELECT e FROM email_fn_sb", "SELECT x FROM opaque_sb"] {
+        assert!(
+            matches!(analyze_with(&hr, "hr", sql), Outcome::Blocked { .. }),
+            "{sql}"
+        );
+    }
+
+    // A policy of its own masks the column, whatever it holds.
+    let own = format!(
+        "{CONFIG}\n[[masked_columns]]\nname = \"fn_sb\"\ncolumn = \"s\"\npolicy = \"ssn\"\n"
+    );
+    let Outcome::Rewritten { sql, .. } = analyze_with(&own, "anonymous", "SELECT s FROM fn_sb")
+    else {
+        panic!("rewrite");
+    };
+    assert!(
+        sql.contains("'XXX-XX-'") && sql.ends_with("FROM fn_sb"),
+        "{sql}"
+    );
+
+    // Listing the view attests that it returns no masked data.
+    let listed = CONFIG.replacen(
+        "[general]",
+        "[general]\nview_allowlist = [\"public.fn_sb\"]",
+        1,
+    );
+    assert!(matches!(
+        analyze_with(&listed, "anonymous", "SELECT s FROM fn_sb"),
+        Outcome::Unchanged { .. }
+    ));
 }
 
 #[test]

@@ -9,8 +9,9 @@ use std::sync::Arc;
 use tracing::error;
 
 use crate::analyzer::lineage::{Lineage, view_lineage, view_relations};
+use crate::analyzer::view_outputs;
 use crate::catalog::{Catalog, Relation, RelationKind};
-use crate::config::{Config, Error, General, MaskKind, MaskSpec, Policy};
+use crate::config::{Config, Error, MaskKind, MaskSpec, Policy};
 use crate::mask::{Mask, check_proxy, compile};
 use crate::proxy::{Options, ProxyMask, Registry};
 use crate::tags::{self, DatabaseTags};
@@ -364,7 +365,7 @@ impl Assignments {
 
         this.database_tags = database_tags;
         this.inherit_partitions(catalog);
-        this.views(&config.general, catalog);
+        this.views(policies, catalog);
         this
     }
 
@@ -414,7 +415,8 @@ impl Assignments {
     /// `security_invoker` views would change meaning if inlined. Views with masked
     /// columns of their own keep them. With `inline_views` off, every view is
     /// treated like a table.
-    fn views(&mut self, general: &General, catalog: &Catalog) {
+    fn views(&mut self, policies: &Policies, catalog: &Catalog) {
+        let general = &policies.config.general;
         let explicit = self.relations.clone();
         let table_like: Vec<&Relation> = catalog
             .relations()
@@ -465,8 +467,41 @@ impl Assignments {
             }
         }
 
+        self.computed_columns(policies, catalog, &table_like);
         self.relations.retain(|_, columns| !columns.is_empty());
         self.derived.retain(|_, columns| !columns.is_empty());
+    }
+
+    /// Columns of table-like views that their definition fills with values
+    /// of masked columns lineage doesn't show, e.g. through a function's
+    /// body, are computed from those columns' policies (`view_outputs`).
+    /// Columns with a policy are masked whatever they hold. Passes repeat
+    /// while they find more, so views over these views see them.
+    fn computed_columns(&mut self, policies: &Policies, catalog: &Catalog, views: &[&Relation]) {
+        for _ in 0..VIEW_PASSES {
+            let mut changed = false;
+            let outputs = view_outputs(catalog, self, policies, views);
+            for (relation, columns) in views.iter().zip(outputs) {
+                let key = (relation.schema.clone(), relation.name.clone());
+                for (column, found) in relation.columns.iter().zip(columns) {
+                    if found.is_empty() || self.column(&key.0, &key.1, &column.name).is_some() {
+                        continue;
+                    }
+                    let derived = self
+                        .derived
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(column.name.clone())
+                        .or_default();
+                    let known = derived.len();
+                    derived.extend(found);
+                    changed |= derived.len() > known;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     /// Masks of a table-like view's columns, from what they're computed from.
@@ -578,6 +613,14 @@ impl Assignments {
             .into_iter()
             .flat_map(|columns| columns.values().flatten().copied());
         assigned.chain(derived).collect::<Vec<_>>().into_iter()
+    }
+
+    /// Policies that mask some column.
+    pub fn policies(&self) -> BTreeSet<usize> {
+        self.relations
+            .values()
+            .flat_map(|columns| columns.values().map(|a| a.policy))
+            .collect()
     }
 
     /// Is this view queried like a table?

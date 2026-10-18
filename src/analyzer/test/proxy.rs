@@ -2657,6 +2657,106 @@ fn views() -> Vec<Case> {
         )
         .user("analyst")
         .config(tables),
+        // Lineage follows column references only. A column its definition
+        // fills with masked values some other way, e.g. through a function's
+        // body, is computed from the masked columns whose values reach it:
+        // NULL for proxy masks, blocked for SQL masks.
+        case("Q19", "SELECT s FROM fn_sb", Same(vec![n(0)], true)),
+        case(
+            "Q19",
+            "SELECT s FROM fn_sb",
+            Block("column public.fn_sb.s is computed from masked columns"),
+        )
+        .user("analyst"),
+        case("Q19", "SELECT s FROM fn_sb", allow()).user("admin"),
+        case("Q19", "SELECT id FROM fn_sb", Same(vec![], true)),
+        case("Q19", "SELECT id FROM fn_sb", allow()).user("analyst"),
+        case(
+            "Q19",
+            "SELECT * FROM fn_sb",
+            Rewritten(vec!["fn_sb.s AS s FROM fn_sb"], vec![n(1)], true),
+        ),
+        case(
+            "Q19",
+            "SELECT id FROM fn_sb WHERE s = $1",
+            Block("column public.fn_sb.s is computed from masked columns"),
+        )
+        .user("analyst"),
+        // Materialized views hold what their definition computed.
+        case("Q19", "SELECT s FROM fn_mv", Same(vec![n(0)], true)),
+        case(
+            "Q19",
+            "SELECT s FROM fn_mv",
+            Block("column public.fn_mv.s is computed from masked columns"),
+        )
+        .user("analyst"),
+        case("Q19", "SELECT id FROM fn_mv", allow()).user("analyst"),
+        // Only the policies whose values reach a column count: email is
+        // SQL-masked.
+        case(
+            "Q19",
+            "SELECT e FROM email_fn_sb",
+            Block("column public.email_fn_sb.e is computed from masked columns"),
+        ),
+        // A function that can't be analyzed may read any masked column.
+        case(
+            "Q19",
+            "SELECT x FROM opaque_sb",
+            Block("column public.opaque_sb.x is computed from masked columns"),
+        ),
+        case("Q19", "SELECT x FROM opaque_sb", allow()).user("admin"),
+        // A function in FROM.
+        case("Q19", "SELECT v FROM fn_from_sb", Same(vec![n(0)], true)),
+        // A definition that can't be analyzed may hold masked values in
+        // any column.
+        case(
+            "Q19",
+            "SELECT id FROM xml_mv",
+            Block("column public.xml_mv.id is computed from masked columns"),
+        )
+        .user("analyst"),
+        // A computed column of a materialized view, and of a view over one
+        // of these views, inlined or not.
+        case("Q19", "SELECT loud FROM loud_sb", Same(vec![n(0)], true)),
+        case(
+            "Q19",
+            "SELECT loud FROM loud_sb",
+            Block("column public.loud_sb.loud is computed from masked columns"),
+        )
+        .user("analyst"),
+        case("Q19", "SELECT s FROM fn_sb_v", Same(vec![n(0)], true)),
+        case(
+            "Q19",
+            "SELECT s FROM fn_sb_v",
+            Block("column public.fn_sb_v.s is computed from masked columns"),
+        )
+        .user("analyst"),
+        case(
+            "Q19",
+            "SELECT s FROM fn_v",
+            Rewritten(vec!["FROM public.fn_sb"], vec![n(0)], true),
+        ),
+        case(
+            "Q19",
+            "SELECT s FROM fn_v",
+            Block("column public.fn_sb.s is computed from masked columns"),
+        )
+        .user("analyst"),
+        // Functions that read no masked columns.
+        case("Q19", "SELECT u FROM upper_sb", allow()),
+        case("Q19", "SELECT u FROM upper_sb", allow()).user("analyst"),
+        // A policy of its own masks the column, whatever it holds.
+        case("Q19", "SELECT s FROM fn_sb", Same(vec![pt(0)], true)).config(format!(
+            "{PROXY_CONFIG}\n[[masked_columns]]\nname = \"fn_sb\"\ncolumn = \"s\"\npolicy = \"ssn\"\n"
+        )),
+        // Listing the view attests that it returns no masked data.
+        case("Q19", "SELECT s FROM fn_sb", allow())
+            .user("analyst")
+            .config(PROXY_CONFIG.replacen(
+                "[general]",
+                "[general]\nview_allowlist = [\"public.fn_sb\"]",
+                1,
+            )),
     ]
 }
 
@@ -3213,7 +3313,7 @@ fn param_parses(sql: &str) -> (usize, Option<String>) {
     let policies =
         Policies::with_registry(Config::from_toml(PROXY_CONFIG).unwrap(), &proxy_registry())
             .unwrap();
-    let catalog = catalog();
+    let catalog = super::catalog();
     let assignments = Assignments::new(&policies, "db", &catalog);
     let profile = policies.profile("engineer", "db");
     let ctx = Context {
@@ -3334,7 +3434,7 @@ fn test_proxy_columns_not_listed_as_rewritten() {
     let policies =
         Policies::with_registry(Config::from_toml(PROXY_CONFIG).unwrap(), &proxy_registry())
             .unwrap();
-    let catalog = catalog();
+    let catalog = super::catalog();
     let assignments = Assignments::new(&policies, "db", &catalog);
     let profile = policies.profile("engineer", "db");
     let ctx = Context {
