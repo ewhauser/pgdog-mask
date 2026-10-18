@@ -1869,6 +1869,33 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         Expect::Blocked,
     ),
     ("H29", "SELECT o.row_to_json FROM orders o", Expect::Runs),
+    // Names Postgres gives unnamed columns: a call's, a cast column's.
+    (
+        "H30",
+        "SELECT s.btrim, s.upper FROM (SELECT trim(ssn), upper(ssn) FROM users) s",
+        Expect::Runs,
+    ),
+    (
+        "H30",
+        "SELECT s.ssn FROM (SELECT ssn::text FROM users) s",
+        Expect::Runs,
+    ),
+    // Other names call a function, or a cast, on the whole row.
+    (
+        "H30",
+        "SELECT s.text FROM (SELECT ssn::text FROM users) s",
+        Expect::Blocked,
+    ),
+    (
+        "H30",
+        "SELECT s.concat FROM (SELECT ssn FROM users) s",
+        Expect::Blocked,
+    ),
+    (
+        "H30",
+        "SELECT s.case FROM (SELECT CASE WHEN true THEN ssn END FROM users) s",
+        Expect::Blocked,
+    ),
     // Sublinks in outputs.
     (
         "I1",
