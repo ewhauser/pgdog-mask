@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, Once};
 
 use pgdog_plugin::{
-    Access, Capabilities, Catalog, CatalogParts, Config as PluginConfig, ErrorFields, MaskBatch,
-    MaskError, MaskOutput, Redaction, Session, Verdict,
+    Access, Capabilities, Catalog, CatalogParts, Config as PluginConfig, ErrorFields, Redaction,
+    Session, TransformBatch, TransformError, TransformOutput, Verdict,
 };
 use tracing::error;
 
@@ -18,7 +18,7 @@ static REGISTRY: Once = Once::new();
 // Configure the plugin with `required = true` in `[[plugins]]`: PgDog must
 // never serve traffic without masking once it's configured.
 pub fn capabilities() -> Capabilities {
-    Capabilities::STATEMENT | Capabilities::MASK | Capabilities::ERRORS | Capabilities::CATALOG
+    Capabilities::STATEMENT | Capabilities::TRANSFORM | Capabilities::ERRORS | Capabilities::CATALOG
 }
 
 /// Load the configuration file, with the proxy masks `register` adds to the
@@ -56,7 +56,10 @@ pub fn generation() -> u64 {
     ENGINE.generation()
 }
 
-pub fn mask_rows(batch: &MaskBatch<'_>, out: &mut MaskOutput) -> Result<(), MaskError> {
+pub fn mask_rows(
+    batch: &TransformBatch<'_>,
+    out: &mut TransformOutput,
+) -> Result<(), TransformError> {
     ENGINE.mask_rows(batch, out)
 }
 
@@ -136,10 +139,10 @@ macro_rules! masking_plugin {
                 $crate::plugin::generation()
             }
 
-            fn mask_rows(
-                batch: &$crate::pgdog_plugin::MaskBatch<'_>,
-                out: &mut $crate::pgdog_plugin::MaskOutput,
-            ) -> Result<(), $crate::pgdog_plugin::MaskError> {
+            fn transform_rows(
+                batch: &$crate::pgdog_plugin::TransformBatch<'_>,
+                out: &mut $crate::pgdog_plugin::TransformOutput,
+            ) -> Result<(), $crate::pgdog_plugin::TransformError> {
                 $crate::plugin::mask_rows(batch, out)
             }
 
