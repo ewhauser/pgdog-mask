@@ -1,0 +1,1 @@
+EXPLAIN (ANALYZE false) UPDATE users SET name = ssn

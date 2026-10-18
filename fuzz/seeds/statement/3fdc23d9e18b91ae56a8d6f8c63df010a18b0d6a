@@ -1,0 +1,1 @@
+SELECT id FROM users GROUP BY id HAVING max(ssn) > 'C'

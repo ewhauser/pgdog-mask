@@ -1,0 +1,1 @@
+UPDATE users SET name = CASE WHEN ssn LIKE 'C%' THEN 'c' ELSE name END

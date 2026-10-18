@@ -1,0 +1,1 @@
+WITH RECURSIVE d AS (INSERT INTO audit (note) SELECT x FROM t RETURNING 1), t AS (SELECT ssn AS x FROM users) SELECT count(*) FROM d

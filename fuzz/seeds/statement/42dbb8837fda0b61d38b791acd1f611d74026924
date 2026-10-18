@@ -1,0 +1,1 @@
+SELECT (SELECT count(*) FROM archive a, orders b JOIN orders c ON c.id = length(ssn) + 1) FROM users u

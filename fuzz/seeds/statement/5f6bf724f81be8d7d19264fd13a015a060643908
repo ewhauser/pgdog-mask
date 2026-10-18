@@ -1,0 +1,1 @@
+SELECT ssn INTO copy FROM users

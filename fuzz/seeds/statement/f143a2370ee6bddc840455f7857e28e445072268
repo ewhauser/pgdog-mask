@@ -1,0 +1,1 @@
+EXPLAIN ANALYZE SELECT id FROM orders WHERE imm_ssn(1) = 'x'

@@ -1,0 +1,1 @@
+BEGIN; INSERT INTO users (id, name, ssn) VALUES (9, 'z', 'CANARYSSN-9999') RETURNING id, ssn; ROLLBACK

@@ -1,0 +1,1 @@
+SELECT g.x FROM users u, unnest(ARRAY[u.ssn]) g(x)

@@ -1,0 +1,1 @@
+ALTER TABLE orders ADD COLUMN x text DEFAULT public.user_ssn(1)

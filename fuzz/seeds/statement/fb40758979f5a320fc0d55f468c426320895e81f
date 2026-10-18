@@ -1,0 +1,1 @@
+SELECT (SELECT ssn FROM archive LIMIT 1) FROM users

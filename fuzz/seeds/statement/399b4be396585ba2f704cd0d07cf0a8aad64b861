@@ -1,0 +1,1 @@
+SELECT pg_catalog.set_config('app.x', upper(ssn), true) FROM users

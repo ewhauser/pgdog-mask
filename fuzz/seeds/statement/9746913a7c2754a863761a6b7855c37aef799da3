@@ -1,0 +1,1 @@
+SELECT g FROM users u, generate_series(1, length(ssn)) g

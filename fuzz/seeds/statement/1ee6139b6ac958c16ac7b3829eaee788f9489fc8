@@ -1,0 +1,1 @@
+SELECT count(s.ssn) FROM (SELECT ssn FROM users) s

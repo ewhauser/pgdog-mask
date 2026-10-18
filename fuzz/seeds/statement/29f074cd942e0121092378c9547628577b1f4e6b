@@ -1,0 +1,1 @@
+SELECT notify_fn(name) FROM users

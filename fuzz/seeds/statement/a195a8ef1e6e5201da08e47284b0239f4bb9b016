@@ -1,0 +1,1 @@
+SELECT l.v FROM users u, LATERAL (SELECT u.salary AS v FROM (orders u CROSS JOIN orders o) AS j) l

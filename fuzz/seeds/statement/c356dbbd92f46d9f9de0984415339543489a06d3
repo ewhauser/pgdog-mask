@@ -1,0 +1,1 @@
+INSERT INTO users (id, name) SELECT id + 100, name FROM users WHERE ssn LIKE '9%' RETURNING ssn

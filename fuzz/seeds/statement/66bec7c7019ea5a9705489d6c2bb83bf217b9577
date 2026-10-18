@@ -1,0 +1,1 @@
+EXPLAIN EXECUTE p((SELECT ssn FROM users LIMIT 1))

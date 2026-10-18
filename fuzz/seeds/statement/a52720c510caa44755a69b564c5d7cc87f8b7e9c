@@ -1,0 +1,1 @@
+ SELECT users.id, ((users.ssn)::text ~~ '9%'::text) AS starts_9 FROM public.users;

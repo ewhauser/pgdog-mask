@@ -1,0 +1,1 @@
+EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM users WHERE ssn::int > 5

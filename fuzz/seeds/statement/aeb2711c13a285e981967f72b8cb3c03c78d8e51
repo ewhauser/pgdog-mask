@@ -1,0 +1,1 @@
+SELECT id, name FROM users WHERE upper(ssn) LIKE upper($1) AND name = $2

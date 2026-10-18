@@ -1,0 +1,1 @@
+SELECT upper(name) AS n FROM users ORDER BY n

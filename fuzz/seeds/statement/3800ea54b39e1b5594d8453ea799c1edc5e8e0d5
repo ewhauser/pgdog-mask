@@ -1,0 +1,1 @@
+SELECT user_ssn(1)::text FROM orders

@@ -1,0 +1,1 @@
+SELECT CASE WHEN ssn LIKE '9%' THEN 'nine' ELSE 'other' END FROM users

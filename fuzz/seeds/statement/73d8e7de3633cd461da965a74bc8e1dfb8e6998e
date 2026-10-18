@@ -1,0 +1,1 @@
+SELECT set_config('search_path', 'masking_canary_proxy', false); SELECT ssn FROM users

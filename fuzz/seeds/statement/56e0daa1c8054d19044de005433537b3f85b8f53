@@ -1,0 +1,1 @@
+SELECT count(*) FROM ssn_flags GROUP BY starts_9 HAVING starts_9

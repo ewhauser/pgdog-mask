@@ -1,0 +1,1 @@
+WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT t.n, u.ssn FROM t, users u

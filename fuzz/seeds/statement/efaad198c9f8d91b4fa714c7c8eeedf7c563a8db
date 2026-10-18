@@ -1,0 +1,1 @@
+SELECT l.v FROM users u, LATERAL (SELECT ssn AS v) l

@@ -1,0 +1,1 @@
+SELECT pg_notify('c', JSON_ARRAY(SELECT ssn FROM users)::text)

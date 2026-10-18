@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE last4(ssn) = $1

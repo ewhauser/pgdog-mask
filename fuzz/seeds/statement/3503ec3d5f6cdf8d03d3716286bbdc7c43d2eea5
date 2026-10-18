@@ -1,0 +1,1 @@
+SELECT a = b FROM (SELECT pg_notify('c', a)) AS n

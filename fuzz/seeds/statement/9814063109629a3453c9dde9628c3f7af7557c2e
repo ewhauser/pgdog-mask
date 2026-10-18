@@ -1,0 +1,1 @@
+SELECT ROW(id, ssn), ARRAY[ssn] FROM users

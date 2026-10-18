@@ -1,0 +1,1 @@
+INSERT INTO users (id, name, ssn) VALUES (1, 'z', 'x') ON CONFLICT (id) DO UPDATE SET name = users.ssn

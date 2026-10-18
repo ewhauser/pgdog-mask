@@ -1,0 +1,1 @@
+CREATE INDEX ON audit ((masking_canary_proxy.user_ssn(id)))

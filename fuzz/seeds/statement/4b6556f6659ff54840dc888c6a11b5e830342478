@@ -1,0 +1,1 @@
+COPY (SELECT id FROM users WHERE ssn = '1') TO STDOUT

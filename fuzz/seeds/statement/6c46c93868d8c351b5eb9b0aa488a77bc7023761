@@ -1,0 +1,1 @@
+SELECT last4(name), upper_safe($1) FROM users

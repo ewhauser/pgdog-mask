@@ -1,0 +1,1 @@
+SELECT id, pg_catalog.set_config('SEARCH_PATH', 'other', true) FROM orders

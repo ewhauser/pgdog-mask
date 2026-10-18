@@ -1,0 +1,1 @@
+ SELECT users.id, users.ssn, users.email FROM public.users;

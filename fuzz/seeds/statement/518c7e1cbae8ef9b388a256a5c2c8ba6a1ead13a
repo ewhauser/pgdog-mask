@@ -1,0 +1,1 @@
+SELECT ssn_is(id, ssn) FROM users

@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE pg_advisory_xact_lock(hashtext(ssn)) IS NOT NULL

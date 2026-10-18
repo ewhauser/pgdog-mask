@@ -1,0 +1,1 @@
+SELECT id, set_config('search_path', 'other', false) FROM orders

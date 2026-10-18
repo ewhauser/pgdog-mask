@@ -1,0 +1,1 @@
+SELECT upper(name) AS n, count(*) FROM users GROUP BY n

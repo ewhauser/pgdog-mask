@@ -1,0 +1,1 @@
+INSERT INTO users_2024 (id, name) SELECT id, ssn FROM users

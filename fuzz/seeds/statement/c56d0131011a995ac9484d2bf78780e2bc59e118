@@ -1,0 +1,1 @@
+SELECT setseed(length(ssn) / 100.0) FROM users

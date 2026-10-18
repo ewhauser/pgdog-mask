@@ -1,0 +1,1 @@
+SELECT (SELECT u.ssn FROM (orders u JOIN orders o ON true) AS j LIMIT 1) FROM users u

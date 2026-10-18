@@ -1,0 +1,1 @@
+SELECT l.v FROM (SELECT 'c'::varchar AS ssn) x, LATERAL (SELECT x.ssn AS v FROM (SELECT ssn FROM users) a JOIN (SELECT ssn FROM users) b USING (ssn) AS x) l

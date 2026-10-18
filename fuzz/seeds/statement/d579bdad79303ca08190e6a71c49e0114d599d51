@@ -1,0 +1,1 @@
+SELECT (x).* FROM (SELECT o AS x FROM orders o) s

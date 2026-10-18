@@ -1,0 +1,1 @@
+SELECT s.c FROM (SELECT CASE WHEN true THEN ssn END AS c FROM users) s

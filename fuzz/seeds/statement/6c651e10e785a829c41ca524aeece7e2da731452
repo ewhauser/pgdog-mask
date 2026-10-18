@@ -1,0 +1,1 @@
+SELECT CASE WHEN ssn IS NULL THEN 'none' ELSE ssn END FROM users

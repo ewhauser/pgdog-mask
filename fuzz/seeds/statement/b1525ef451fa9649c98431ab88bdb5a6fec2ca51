@@ -1,0 +1,1 @@
+SELECT l.x FROM users u CROSS JOIN LATERAL (SELECT upper(u.ssn) AS x) l

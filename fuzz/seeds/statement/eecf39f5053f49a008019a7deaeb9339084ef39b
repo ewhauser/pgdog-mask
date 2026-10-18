@@ -1,0 +1,1 @@
+SELECT u.ctid, u.xmin FROM users u

@@ -1,0 +1,1 @@
+BEGIN; DECLARE c CURSOR FOR SELECT 1 / (id - id) FROM masking_e2e.users

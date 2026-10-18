@@ -1,0 +1,1 @@
+SELECT id FROM ssn_flags WHERE starts_9 = true

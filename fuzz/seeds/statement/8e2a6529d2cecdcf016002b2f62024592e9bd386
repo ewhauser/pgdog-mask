@@ -1,0 +1,1 @@
+SELECT max(ssn), count(ssn), count(*) FROM users

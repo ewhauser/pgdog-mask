@@ -1,0 +1,1 @@
+INSERT INTO audit_log VALUES (1, 2)

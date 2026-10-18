@@ -1,0 +1,1 @@
+SELECT s.*, upper(u.ssn) FROM (SELECT * FROM orders) s, users u

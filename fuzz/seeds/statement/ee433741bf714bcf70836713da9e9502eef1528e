@@ -1,0 +1,1 @@
+SELECT o.id, o.user_id, o.total, u.ssn AS ssn FROM

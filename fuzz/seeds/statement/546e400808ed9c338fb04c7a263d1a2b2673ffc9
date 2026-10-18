@@ -1,0 +1,1 @@
+SELECT digest(ssn, 'sha256') FROM users

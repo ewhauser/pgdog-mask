@@ -1,0 +1,1 @@
+SELECT s.x FROM (SELECT ssn AS x, id FROM users WHERE id > 5) s

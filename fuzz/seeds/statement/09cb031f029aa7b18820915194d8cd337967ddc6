@@ -1,0 +1,1 @@
+BEGIN; INSERT INTO orders (id, user_id, total) VALUES (100, (SELECT id FROM users WHERE ssn = 'CANARYSSN-1111'), 0); ROLLBACK

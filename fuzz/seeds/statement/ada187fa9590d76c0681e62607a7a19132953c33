@@ -1,0 +1,1 @@
+SELECT recursive_fn(length(ssn)) FROM users

@@ -1,0 +1,1 @@
+SELECT 'lit', ssn FROM users WHERE id = 1

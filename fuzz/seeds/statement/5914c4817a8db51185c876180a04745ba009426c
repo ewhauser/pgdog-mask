@@ -1,0 +1,1 @@
+INSERT INTO audit_log SELECT 1, id FROM users WHERE name = 'bob'

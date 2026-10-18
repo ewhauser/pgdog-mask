@@ -1,0 +1,1 @@
+EXPLAIN SELECT ssn INTO scratch FROM users

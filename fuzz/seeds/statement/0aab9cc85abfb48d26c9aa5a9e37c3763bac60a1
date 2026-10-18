@@ -1,1 +1,0 @@
-INSERT INTO orders (id) SELECT id FROM users WHERE ssn = '1' RETURNING id

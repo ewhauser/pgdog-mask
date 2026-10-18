@@ -1,0 +1,1 @@
+SELECT pg_replication_slot_advance('s', ssn::pg_lsn) FROM users

@@ -1,0 +1,1 @@
+SELECT count(*) FILTER (WHERE ssn LIKE '9%') FROM users

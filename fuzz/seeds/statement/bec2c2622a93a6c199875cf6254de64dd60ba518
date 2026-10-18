@@ -1,0 +1,1 @@
+SELECT email AS ssn FROM users ORDER BY ssn

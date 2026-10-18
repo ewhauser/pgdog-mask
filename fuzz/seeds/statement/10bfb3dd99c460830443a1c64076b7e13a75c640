@@ -1,0 +1,1 @@
+DECLARE c CURSOR FOR SELECT id FROM masking_e2e.users WHERE card::int > 0

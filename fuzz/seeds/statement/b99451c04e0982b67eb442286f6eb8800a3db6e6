@@ -1,0 +1,1 @@
+WITH RECURSIVE r(n, v) AS (SELECT 1, ''::varchar UNION ALL SELECT n + 1, JSON_ARRAY(SELECT ssn FROM users)::varchar FROM r WHERE n < 2) SELECT v FROM r

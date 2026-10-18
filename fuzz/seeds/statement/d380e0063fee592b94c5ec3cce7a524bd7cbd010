@@ -1,0 +1,1 @@
+PREPARE n5 AS SELECT id, name FROM users WHERE id = $1; DEALLOCATE n5

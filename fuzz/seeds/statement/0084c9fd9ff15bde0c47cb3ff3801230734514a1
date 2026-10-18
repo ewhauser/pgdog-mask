@@ -1,0 +1,1 @@
+SELECT id, set_config('search_path', 'masking_canary_proxy', false) FROM orders

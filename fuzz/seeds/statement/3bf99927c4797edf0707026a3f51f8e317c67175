@@ -1,0 +1,1 @@
+SELECT l.v FROM orders o2, LATERAL (SELECT total AS v FROM ((SELECT ssn FROM users) s CROSS JOIN (SELECT 1 AS k) k) AS j(total)) l

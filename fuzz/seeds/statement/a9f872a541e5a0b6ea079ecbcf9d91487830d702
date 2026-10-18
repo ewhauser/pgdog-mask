@@ -1,0 +1,1 @@
+SELECT ssn::varchar FROM users

@@ -1,0 +1,1 @@
+SELECT last4(ssn), upper_safe(ssn), last4(upper(ssn)) FROM users; SELECT last4(ssn) FROM users WHERE upper_safe(ssn) = $1

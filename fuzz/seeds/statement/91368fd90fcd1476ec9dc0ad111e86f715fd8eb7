@@ -1,0 +1,1 @@
+SELECT pg_logical_slot_peek_changes('s', NULL, NULL)

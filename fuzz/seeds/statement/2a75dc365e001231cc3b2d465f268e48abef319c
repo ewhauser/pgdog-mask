@@ -1,0 +1,1 @@
+SELECT CASE WHEN ssn LIKE 'C%' THEN 'c' ELSE 'other' END FROM users

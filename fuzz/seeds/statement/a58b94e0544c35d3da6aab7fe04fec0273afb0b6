@@ -1,0 +1,1 @@
+SELECT u.ssn FROM orders o LEFT JOIN users u ON u.id = o.user_id

@@ -1,0 +1,1 @@
+SELECT ssn FROM users EXCEPT SELECT name FROM users

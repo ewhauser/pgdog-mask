@@ -1,0 +1,1 @@
+ALTER TABLE audit ALTER note TYPE text USING public.user_ssn(id)

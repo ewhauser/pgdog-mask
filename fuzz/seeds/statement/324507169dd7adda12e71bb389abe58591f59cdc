@@ -1,0 +1,1 @@
+SELECT set_config('app.x', 'v', false)

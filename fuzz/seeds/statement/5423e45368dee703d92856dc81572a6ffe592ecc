@@ -1,0 +1,1 @@
+EXPLAIN SELECT ssn FROM users; SELECT ssn FROM users

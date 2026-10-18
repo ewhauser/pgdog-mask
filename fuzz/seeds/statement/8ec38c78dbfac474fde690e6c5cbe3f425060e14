@@ -1,0 +1,1 @@
+CREATE TEMP TABLE contacts AS SELECT 1 AS id

@@ -1,0 +1,1 @@
+SELECT x::interval(2), '1 day'::interval minute, 1 FROM t

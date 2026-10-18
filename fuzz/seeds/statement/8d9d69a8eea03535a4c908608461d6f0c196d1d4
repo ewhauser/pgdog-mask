@@ -1,0 +1,1 @@
+COPY (SELECT id AS id, name AS name FROM public.users) TO STDOUT

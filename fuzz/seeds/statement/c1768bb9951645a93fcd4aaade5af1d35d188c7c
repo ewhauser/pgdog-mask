@@ -1,0 +1,1 @@
+SELECT ssn FROM users; COPY users TO STDOUT

@@ -1,0 +1,1 @@
+SELECT (SELECT s.v FROM archive a JOIN (SELECT ssn AS v) s ON true LIMIT 1) FROM users u

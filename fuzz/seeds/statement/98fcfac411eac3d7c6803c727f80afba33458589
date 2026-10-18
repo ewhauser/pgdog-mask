@@ -1,0 +1,1 @@
+SELECT (SELECT l.v FROM archive a, LATERAL (SELECT ssn AS v) l LIMIT 1) FROM users u

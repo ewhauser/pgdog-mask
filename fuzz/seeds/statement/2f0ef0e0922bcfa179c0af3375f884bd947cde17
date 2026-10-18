@@ -1,0 +1,1 @@
+DECLARE c CURSOR FOR SELECT id FROM users WHERE ssn::int > 5

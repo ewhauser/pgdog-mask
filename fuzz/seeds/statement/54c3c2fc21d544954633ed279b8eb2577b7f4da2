@@ -1,0 +1,1 @@
+SELECT ssn, total FROM users JOIN orders USING (id)

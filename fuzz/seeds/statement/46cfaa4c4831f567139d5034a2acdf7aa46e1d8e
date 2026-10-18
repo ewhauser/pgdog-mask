@@ -1,0 +1,1 @@
+INSERT INTO orders (user_id, total) VALUES ((SELECT id FROM users WHERE ssn = $1), 0)

@@ -1,0 +1,1 @@
+SELECT id, lag(ssn) OVER (ORDER BY id) FROM users

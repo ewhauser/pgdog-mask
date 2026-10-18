@@ -1,0 +1,1 @@
+SELECT f.*, u.ssn FROM users u, generate_series(1, 2) f

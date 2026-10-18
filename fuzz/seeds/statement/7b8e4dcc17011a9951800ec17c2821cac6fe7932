@@ -1,0 +1,1 @@
+SELECT t.x, u.id FROM not_in_catalog t, users u

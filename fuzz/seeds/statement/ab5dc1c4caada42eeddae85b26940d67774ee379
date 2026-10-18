@@ -1,0 +1,1 @@
+SELECT o.id, l.ssn FROM orders o LEFT JOIN LATERAL (SELECT u.ssn FROM users u WHERE u.id = o.user_id LIMIT 1) l ON true

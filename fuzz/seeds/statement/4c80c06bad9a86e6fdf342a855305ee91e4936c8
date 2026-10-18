@@ -1,0 +1,1 @@
+SELECT ssn FROM users u JOIN users_2024 p USING (ssn)

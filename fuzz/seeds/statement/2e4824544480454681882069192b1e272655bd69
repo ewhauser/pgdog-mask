@@ -1,0 +1,1 @@
+SELECT j.a FROM users u, JSON_TABLE(to_jsonb(u.ssn), '$' COLUMNS (a text PATH '$')) j
