@@ -920,6 +920,12 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         // Merged columns compare, and combine, both sides' values.
         let merged = self.merged_taint(before..after, &using, natural);
         self.note(merged, false);
+        if merging {
+            let check = self.implicit_operator(&[(None, "=")]);
+            if check.needs_post_check() {
+                self.call_post_check(&check, &CallArgs::operands(merged), "=");
+            }
+        }
 
         if alias.is_none() && using_alias.is_none() {
             return;
@@ -1064,7 +1070,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     // Expressions are checked in their typed hooks, which run for top-level
     // expressions (e.g. a whole WHERE clause) as well as nested ones.
-    fn transform_a_expr<'mutref>(&mut self, mut node: nodes::A_ExprMut<'mem, 'mutref>) {
+    fn transform_a_expr<'mutref>(&mut self, node: nodes::A_ExprMut<'mem, 'mutref>) {
         if self.predicate {
             self.mark_raw_a_expr(&node);
         }
@@ -1083,18 +1089,8 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_owned();
-        // The operands are the function's arguments; a prefix operator has
-        // only the right one.
-        let prefix = matches!(node.lexpr(), Node::None);
-        self.transform_list(node.name_mut());
-        let left = self.scoped(|masker| child!(masker, node, lexpr_mut, set_lexpr));
-        let right = self.scoped(|masker| child!(masker, node, rexpr_mut, set_rexpr));
-        let mut args = CallArgs::default();
-        if !prefix {
-            args.args.push((None, left));
-        }
-        args.args.push((None, right));
-        self.call_post_check(&check, &args, &name);
+        let operands = self.scoped(|masker| transform::transform_a_expr(node, masker));
+        self.call_post_check(&check, &CallArgs::operands(operands), &name);
     }
 
     fn transform_null_test<'mutref>(&mut self, node: nodes::NullTestMut<'mem, 'mutref>) {
@@ -1165,6 +1161,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             args: names.into_iter().zip(taints).collect(),
             variadic,
             rest,
+            operands: false,
         };
         self.call_post_check(&check, &args, &name);
     }
@@ -1189,13 +1186,73 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     fn transform_sub_link<'mutref>(&mut self, node: nodes::SubLinkMut<'mem, 'mutref>) {
         let exists = node.sub_link_type == SubLinkType::EXISTS_SUBLINK;
+        // `x op ANY|ALL (query)` and `x IN (query)` apply an operator to
+        // the expression and the query's rows.
+        let compares = matches!(
+            node.sub_link_type,
+            SubLinkType::ANY_SUBLINK | SubLinkType::ALL_SUBLINK | SubLinkType::ROWCOMPARE_SUBLINK
+        );
+        let operator = compares.then(|| {
+            functions::qualified_name(node.oper_name())
+                .map(|(schema, name)| (schema.map(str::to_owned), name.to_owned()))
+                .unwrap_or((None, "=".to_owned()))
+        });
+        let check = operator
+            .as_ref()
+            .map(|(schema, name)| self.implicit_operator(&[(schema.as_deref(), name)]));
         self.expect_outputs();
-        transform::transform_sub_link(node, self);
+        let operand = self.scoped(|masker| transform::transform_sub_link(node, masker));
         let outputs = self.take_outputs().unwrap_or_else(Outputs::unknown);
         // A scalar or array subquery is computed, even when it passes a
         // column through. EXISTS only says whether there are rows.
         if !exists {
             self.note_from(outputs.bound().computed(), false, false);
+        }
+        if let (Some(check), Some((_, name))) = (check, operator)
+            && check.needs_post_check()
+        {
+            let operands = CallArgs::operands(operand.join(outputs.bound()));
+            self.call_post_check(&check, &operands, &name);
+        }
+    }
+
+    fn transform_case_expr<'mutref>(&mut self, mut node: nodes::CaseExprMut<'mem, 'mutref>) {
+        // `CASE x WHEN v` compares `x = v`.
+        let check = match node.arg() {
+            Node::None => CallCheck::TRUSTED,
+            _ => self.implicit_operator(&[(None, "=")]),
+        };
+        if !check.needs_post_check() {
+            transform::transform_case_expr(node, self);
+            return;
+        }
+        let mut operands = self.scoped(|masker| child!(masker, node, arg_mut, set_arg));
+        for when in node.args_mut() {
+            match when {
+                NodeMut::CaseWhen(mut when) => {
+                    operands = operands
+                        .join(self.scoped(|masker| child!(masker, when, expr_mut, set_expr)));
+                    child!(self, when, result_mut, set_result);
+                }
+                other => transform::transform_node(other, self),
+            }
+        }
+        child!(self, node, defresult_mut, set_defresult);
+        self.call_post_check(&check, &CallArgs::operands(operands), "=");
+    }
+
+    fn transform_sort_by<'mutref>(&mut self, node: nodes::SortByMut<'mem, 'mutref>) {
+        // `ORDER BY x USING op` compares values of `x` with `op`.
+        let operator = functions::qualified_name(node.use_op())
+            .map(|(schema, name)| (schema.map(str::to_owned), name.to_owned()));
+        let Some((schema, name)) = operator else {
+            transform::transform_sort_by(node, self);
+            return;
+        };
+        let check = self.implicit_operator(&[(schema.as_deref(), &name)]);
+        let operands = self.scoped(|masker| transform::transform_sort_by(node, masker));
+        if check.needs_post_check() {
+            self.call_post_check(&check, &CallArgs::operands(operands), &name);
         }
     }
 

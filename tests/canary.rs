@@ -1133,7 +1133,7 @@ async fn setup_proxy(client: &Client) {
                 AS $$ SELECT upper(v) $$;
              CREATE FUNCTION email_of(uid BIGINT) RETURNS TEXT LANGUAGE sql STABLE
                 AS $$ SELECT email FROM users WHERE id = uid $$;
-             CREATE FUNCTION noisy_eq(a TEXT, b TEXT) RETURNS BOOLEAN LANGUAGE sql
+             CREATE FUNCTION noisy_eq(a TEXT, b VARCHAR) RETURNS BOOLEAN LANGUAGE sql
                 AS $$ SELECT a = b FROM (SELECT pg_notify('c', a)) AS n $$;
              CREATE FUNCTION recursive_fn(x INTEGER) RETURNS INTEGER LANGUAGE sql
                 AS $$ SELECT recursive_fn(x) $$;
@@ -1149,7 +1149,26 @@ async fn setup_proxy(client: &Client) {
                 AS $$ BEGIN RETURN 'x'; END $$;
              CREATE OPERATOR === (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = same);
              CREATE OPERATOR @@@ (LEFTARG = BIGINT, RIGHTARG = BIGINT, FUNCTION = ssn_eq);
-             CREATE OPERATOR ~~~ (LEFTARG = TEXT, RIGHTARG = TEXT, FUNCTION = noisy_eq);
+             CREATE OPERATOR ~~~ (LEFTARG = TEXT, RIGHTARG = VARCHAR, FUNCTION = noisy_eq);
+             -- Operators whose functions write nothing, but whose commutator
+             -- and negator write their first operand. Their functions have a
+             -- SET option, so the planner doesn't inline them.
+             CREATE FUNCTION lt_quiet(a INTEGER, b VARCHAR) RETURNS BOOLEAN LANGUAGE sql
+                SET search_path = {PROXY_SCHEMA} AS $$ SELECT a::text < b $$;
+             CREATE FUNCTION gt_noisy(a VARCHAR, b INTEGER) RETURNS BOOLEAN LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit (note) SELECT a RETURNING a > b::text $$;
+             CREATE OPERATOR <<< (LEFTARG = INTEGER, RIGHTARG = VARCHAR, FUNCTION = lt_quiet,
+                COMMUTATOR = >>>, RESTRICT = scalarltsel);
+             CREATE OPERATOR >>> (LEFTARG = VARCHAR, RIGHTARG = INTEGER, FUNCTION = gt_noisy,
+                COMMUTATOR = <<<, RESTRICT = scalargtsel);
+             CREATE FUNCTION eq_quiet(a VARCHAR, b BIGINT) RETURNS BOOLEAN LANGUAGE sql
+                SET search_path = {PROXY_SCHEMA} AS $$ SELECT a = b::text $$;
+             CREATE FUNCTION ne_noisy(a VARCHAR, b BIGINT) RETURNS BOOLEAN LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit (note) SELECT a RETURNING a <> b::text $$;
+             CREATE OPERATOR ==== (LEFTARG = VARCHAR, RIGHTARG = BIGINT, FUNCTION = eq_quiet,
+                NEGATOR = !===);
+             CREATE OPERATOR !=== (LEFTARG = VARCHAR, RIGHTARG = BIGINT, FUNCTION = ne_noisy,
+                NEGATOR = ====);
 
              -- Tables without proxy-masked columns whose triggers, checks
              -- and defaults raise proxy-masked values in MESSAGE.
@@ -1191,7 +1210,9 @@ async fn setup_proxy(client: &Client) {
              CREATE FUNCTION bump_name(uid BIGINT) RETURNS BIGINT LANGUAGE sql
                 AS $$ UPDATE users SET name = name WHERE id = uid RETURNING id $$;
              CREATE VIEW bump_v AS SELECT bump_name(1) AS b;
-             CREATE VIEW user_names_v AS SELECT id, name FROM users;"
+             CREATE VIEW user_names_v AS SELECT id, name FROM users;
+             -- Statistics hold ssn values, which estimates pass to operators.
+             ANALYZE users;"
         ))
         .await
         .expect("setup");
@@ -2396,6 +2417,23 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     (
         "P25",
         "SELECT id FROM users WHERE 'x' ~~~ ssn",
+        Expect::Blocked,
+    ),
+    // Planning `1 <<< ssn` estimates it as `ssn >>> 1` from ssn's statistics,
+    // and NOT (ssn ==== 1) becomes ssn !=== 1: both run a function that writes.
+    (
+        "P26",
+        "BEGIN; EXPLAIN SELECT id FROM users WHERE 1 <<< ssn; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P26",
+        "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P26",
+        "BEGIN; SELECT id FROM users WHERE 1 <<< name; SELECT note FROM audit; ROLLBACK",
         Expect::Runs,
     ),
     (
@@ -2847,6 +2885,8 @@ async fn test_no_canary_leaks_proxy() {
     for sql in [
         "SELECT ssn::int FROM users",
         "BEGIN; UPDATE users SET name = name WHERE id = 1; ROLLBACK",
+        "BEGIN; EXPLAIN SELECT id FROM users WHERE 1 <<< ssn; SELECT note FROM audit; ROLLBACK",
+        "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
     ] {
         let raw = run(&conn, sql, View::Raw).await;
         let _ = conn.client.batch_execute("ROLLBACK").await;

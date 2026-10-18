@@ -388,9 +388,46 @@ pub(crate) fn functions() -> Vec<Function> {
         sql_function(
             21,
             "noisy_eq",
-            &[("a", "text"), ("b", "text")],
+            &[("a", "text"), ("b", "character varying")],
             "boolean",
             "SELECT a = b FROM (SELECT pg_notify('c', a)) AS n",
+        ),
+        // Operator functions without sinks, and the commutator, negator and
+        // namesake whose functions the planner may run in their place.
+        sql_function(
+            50,
+            "lt_quiet",
+            &[("a", "integer"), ("b", "character varying")],
+            "boolean",
+            "SELECT a::text < b",
+        ),
+        sql_function(
+            51,
+            "gt_noisy",
+            &[("a", "character varying"), ("b", "integer")],
+            "boolean",
+            "INSERT INTO public.audit (note) SELECT a RETURNING a > b::text",
+        ),
+        sql_function(
+            52,
+            "eq_quiet",
+            &[("a", "character varying"), ("b", "bigint")],
+            "boolean",
+            "SELECT a = b::text",
+        ),
+        sql_function(
+            53,
+            "ne_noisy",
+            &[("a", "character varying"), ("b", "bigint")],
+            "boolean",
+            "INSERT INTO public.audit (note) SELECT a RETURNING a <> b::text",
+        ),
+        sql_function(
+            54,
+            "cmp_quiet",
+            &[("a", "character varying"), ("b", "numeric")],
+            "boolean",
+            "SELECT a = b::text",
         ),
         sql_function(
             23,
@@ -594,13 +631,33 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
             schema: "public".into(),
             name: "~~~".into(),
             left_type: Some("text".into()),
-            right_type: Some("text".into()),
+            right_type: Some("character varying".into()),
             function_oid: 21,
             function_schema: "public".into(),
             function_name: "noisy_eq".into(),
         },
+        operator("<<<", "integer", "character varying", 50, "lt_quiet"),
+        operator(">>>", "character varying", "integer", 51, "gt_noisy"),
+        operator("====", "character varying", "bigint", 52, "eq_quiet"),
+        operator("!===", "character varying", "bigint", 53, "ne_noisy"),
+        operator("~>~", "character varying", "numeric", 54, "cmp_quiet"),
+        // Its function isn't in the catalog.
+        operator("~<~", "numeric", "character varying", 999, "cmp_c"),
     ]);
     catalog
+}
+
+/// A binary operator in `public`, implemented by a function in `public`.
+pub(crate) fn operator(name: &str, left: &str, right: &str, oid: i64, function: &str) -> Operator {
+    Operator {
+        schema: "public".into(),
+        name: name.into(),
+        left_type: Some(left.into()),
+        right_type: Some(right.into()),
+        function_oid: oid,
+        function_schema: "public".into(),
+        function_name: function.into(),
+    }
 }
 
 /// The catalog with a user-defined `public.set_config`, which unqualified

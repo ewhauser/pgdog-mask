@@ -356,6 +356,11 @@ impl Catalog {
             .find(|function| function.oid == oid)
     }
 
+    /// Every user-defined operator, in every schema.
+    pub fn all_operators(&self) -> impl Iterator<Item = &Operator> {
+        self.operators.values().flatten()
+    }
+
     /// User-defined operators an expression could resolve to.
     pub fn operators(
         &self,

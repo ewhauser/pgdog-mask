@@ -35,7 +35,7 @@ use super::{
     BodyInfo, Masker, RESOLUTION_CHANGED, Verdict, call_address, expr_address, fields, ident, rules,
 };
 use crate::analyzer::taint::Taint;
-use crate::catalog::{Function, RelationKind, parse_search_path};
+use crate::catalog::{Function, Operator, RelationKind, parse_search_path};
 
 /// What to do with a call.
 pub(in crate::analyzer) enum CallUse<'mem> {
@@ -52,6 +52,32 @@ pub(in crate::analyzer) struct CallCheck<'c> {
     /// A built-in that stores its arguments where they can be read back.
     side_effect: bool,
     kind: CallKind<'c>,
+    /// For an operator, functions the planner may run in its place.
+    substitutes: Substitutes<'c>,
+}
+
+/// Functions the planner may run in place of an operator's: a negator's,
+/// for `NOT (a op b)`, and a commutator's, with the operands swapped, e.g.
+/// to estimate `const < column` from the column's statistics. The catalog
+/// doesn't link operators, so every user-defined operator with the same
+/// operand types, or swapped ones, counts.
+#[derive(Debug, Clone, Default)]
+struct Substitutes<'c> {
+    functions: Vec<&'c Function>,
+    /// An operator whose function is neither in the catalog nor a built-in
+    /// without side effects.
+    opaque: Option<String>,
+}
+
+impl Substitutes<'_> {
+    const NONE: Self = Self {
+        functions: vec![],
+        opaque: None,
+    };
+
+    fn is_empty(&self) -> bool {
+        self.functions.is_empty() && self.opaque.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,17 +91,19 @@ enum CallKind<'c> {
 }
 
 impl CallCheck<'_> {
-    const TRUSTED: Self = Self {
+    pub(super) const TRUSTED: Self = Self {
         side_effect: false,
         kind: CallKind::Trusted,
+        substitutes: Substitutes::NONE,
     };
     const DONE: Self = Self {
         side_effect: false,
         kind: CallKind::Done,
+        substitutes: Substitutes::NONE,
     };
 
     pub(super) fn needs_post_check(&self) -> bool {
-        self.side_effect || matches!(self.kind, CallKind::Udf(_))
+        self.side_effect || matches!(self.kind, CallKind::Udf(_)) || !self.substitutes.is_empty()
     }
 }
 
@@ -160,9 +188,21 @@ pub(super) struct CallArgs {
     /// What the rest of the call carries: aggregate `ORDER BY`, `FILTER`
     /// and `OVER`.
     pub(super) rest: Taint,
+    /// An operator's operands: each may reach any parameter, as the planner
+    /// may run a commutator, with the operands swapped.
+    pub(super) operands: bool,
 }
 
 impl CallArgs {
+    /// What an operator's operands carry, together.
+    pub(super) fn operands(taint: Taint) -> Self {
+        Self {
+            args: vec![(None, taint)],
+            operands: true,
+            ..Self::default()
+        }
+    }
+
     /// What the call's inputs carry, together.
     pub(super) fn taint(&self) -> Taint {
         self.args
@@ -245,7 +285,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                     CallTarget::Udf(candidates) => CallKind::Udf(candidates.clone()),
                     CallTarget::Inline(_) => CallKind::Done,
                 };
-                (Ok(target), CallCheck { side_effect, kind })
+                let check = CallCheck {
+                    side_effect,
+                    kind,
+                    substitutes: Substitutes::NONE,
+                };
+                (Ok(target), check)
             }
             Err(()) => (Err(()), CallCheck::DONE),
         };
@@ -311,8 +356,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if check.side_effect {
             self.sink(args.taint(), &format!("{name}()"));
         }
-        let CallKind::Udf(candidates) = &check.kind else {
-            return;
+        let candidates = match &check.kind {
+            CallKind::Udf(candidates) => candidates.as_slice(),
+            CallKind::Trusted | CallKind::Done => &[],
         };
         if candidates
             .iter()
@@ -353,22 +399,34 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
         let mut reaching = Taint::Clean;
         let mut why = None;
-        for function in candidates {
+        for function in candidates.iter().chain(&check.substitutes.functions) {
             let (taint, param) = self.reaching_sinks(function, args);
             if !taint.is_clean() {
                 reaching = reaching.join(taint);
                 why.get_or_insert_with(|| {
-                    let name = function.qualified_name();
+                    let function = function.qualified_name();
+                    let can_pass = format!(
+                        "function {function}() can pass a parameter to a write or a side effect"
+                    );
                     match param {
                         Some(param) => format!(
-                            "function {name}() can pass a parameter to a write or a side effect, so its argument for {param} can't carry values of proxy-masked columns"
+                            "{can_pass}, so its argument for {param} can't carry values of proxy-masked columns"
+                        ),
+                        None if args.operands => format!(
+                            "{can_pass}, and operator {name} may call it with either operand in either parameter (the planner can use an operator's commutator or negator), so it can't be applied to values of proxy-masked columns"
                         ),
                         None => format!(
-                            "function {name}() can pass a parameter to a write or a side effect, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
+                            "{can_pass}, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
                         ),
                     }
                 });
             }
+        }
+        if let Some(operator) = &check.substitutes.opaque {
+            reaching = reaching.join(args.taint());
+            why.get_or_insert_with(|| format!(
+                "operator {operator} may be used in place of operator {name}, and its function can't be checked, so {name} can't be applied to values of proxy-masked columns"
+            ));
         }
         if let Some(why) = why {
             self.sink_with(reaching, |_| why);
@@ -388,7 +446,10 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         if !sinks.contains(&true) {
             return (Taint::Clean, None);
         }
-        let Some(positions) = parameter_positions(function, args) else {
+        let positions = (!args.operands)
+            .then(|| parameter_positions(function, args))
+            .flatten();
+        let Some(positions) = positions else {
             return (args.taint(), None);
         };
         // Aggregate and window syntax is an error for a plain function, but
@@ -791,57 +852,59 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             .unwrap_or(CallCheck::DONE)
     }
 
+    /// An operator applied by other syntax, which can't be inlined: `IN` and
+    /// `ANY` over a subquery, `CASE x WHEN`, `ORDER BY ... USING`, and the
+    /// merged columns of `JOIN ... USING`.
+    pub(super) fn implicit_operator(&mut self, names: &[(Option<&str>, &str)]) -> CallCheck<'c> {
+        let (_, target, substitutes) = match self.user_operators(names) {
+            Ok(Some(found)) => found,
+            Ok(None) => return CallCheck::TRUSTED,
+            Err(()) => return CallCheck::DONE,
+        };
+        let kind = match target {
+            CallTarget::Trusted => CallKind::Trusted,
+            CallTarget::Udf(candidates) => CallKind::Udf(candidates),
+            CallTarget::Inline(_) => {
+                self.block(format!(
+                    "operator {} reads masked columns and can't be inlined here",
+                    operator_label(names)
+                ));
+                return CallCheck::DONE;
+            }
+        };
+        CallCheck {
+            side_effect: false,
+            kind,
+            substitutes,
+        }
+    }
+
     /// What to do with an operator, and what's left to check once its operands
     /// are transformed.
     fn operator_use(&mut self, expr: &nodes::A_Expr) -> (CallUse<'mem>, CallCheck<'c>) {
-        let Some((schema, name)) = operator_name(expr) else {
-            return (CallUse::Allow, CallCheck::TRUSTED);
-        };
-        let catalog = self.ctx.catalog;
-        if self.path_changed && catalog.has_operator_named(name) {
-            self.block(RESOLUTION_CHANGED);
-            return (CallUse::Block, CallCheck::DONE);
-        }
-        let operators = catalog.operators(schema, name, &self.ctx.search_path);
-        if operators.is_empty() {
-            return (CallUse::Allow, CallCheck::TRUSTED);
-        }
-
-        let mut functions: Vec<&'c Function> = vec![];
-        for operator in &operators {
-            match catalog.function(operator.function_oid) {
-                Some(function) if !functions.iter().any(|f| f.oid == function.oid) => {
-                    functions.push(function)
-                }
-                Some(_) => (),
-                None => {
-                    self.block(format!(
-                        "operator {}.{} uses function {}.{}(), which isn't in the catalog",
-                        operator.schema,
-                        operator.name,
-                        operator.function_schema,
-                        operator.function_name
-                    ));
-                    return (CallUse::Block, CallCheck::DONE);
-                }
-            }
-        }
-
-        let function = match self.functions_target(name, &functions) {
-            Ok(CallTarget::Trusted) => return (CallUse::Allow, CallCheck::TRUSTED),
-            Ok(CallTarget::Udf(candidates)) => {
-                return (
-                    CallUse::Allow,
-                    CallCheck {
-                        side_effect: false,
-                        kind: CallKind::Udf(candidates),
-                    },
-                );
-            }
-            Ok(CallTarget::Inline(function)) => function,
+        let names = operator_names(expr);
+        let (count, target, substitutes) = match self.user_operators(&names) {
+            Ok(Some(found)) => found,
+            Ok(None) => return (CallUse::Allow, CallCheck::TRUSTED),
             Err(()) => return (CallUse::Block, CallCheck::DONE),
         };
-        if operators.len() != 1 || expr.kind != A_Expr_Kind::AEXPR_OP {
+        let function = match target {
+            CallTarget::Trusted | CallTarget::Udf(_) => {
+                let kind = match target {
+                    CallTarget::Udf(candidates) => CallKind::Udf(candidates),
+                    _ => CallKind::Trusted,
+                };
+                let check = CallCheck {
+                    side_effect: false,
+                    kind,
+                    substitutes,
+                };
+                return (CallUse::Allow, check);
+            }
+            CallTarget::Inline(function) => function,
+        };
+        let name = operator_label(&names);
+        if count != 1 || expr.kind != A_Expr_Kind::AEXPR_OP {
             self.block(format!(
                 "operator {name} reads masked columns and can't be inlined"
             ));
@@ -861,6 +924,87 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 (CallUse::Block, CallCheck::DONE)
             }
         }
+    }
+
+    /// User-defined operators with these names: how many, what their
+    /// functions resolve to, and the functions the planner may run in their
+    /// place. `Ok(None)` if there are none: the built-in applies.
+    fn user_operators(
+        &mut self,
+        names: &[(Option<&str>, &str)],
+    ) -> Result<Option<(usize, CallTarget<'c>, Substitutes<'c>)>, ()> {
+        let catalog = self.ctx.catalog;
+        let mut operators = vec![];
+        for (schema, name) in names {
+            if self.path_changed && catalog.has_operator_named(name) {
+                self.block(RESOLUTION_CHANGED);
+                return Err(());
+            }
+            operators.extend(catalog.operators(*schema, name, &self.ctx.search_path));
+        }
+        if operators.is_empty() {
+            return Ok(None);
+        }
+
+        let mut functions: Vec<&'c Function> = vec![];
+        for operator in &operators {
+            match catalog.function(operator.function_oid) {
+                Some(function) if !functions.iter().any(|f| f.oid == function.oid) => {
+                    functions.push(function)
+                }
+                Some(_) => (),
+                None => {
+                    self.block(format!(
+                        "operator {}.{} uses function {}.{}(), which isn't in the catalog",
+                        operator.schema,
+                        operator.name,
+                        operator.function_schema,
+                        operator.function_name
+                    ));
+                    return Err(());
+                }
+            }
+        }
+        let target = self.functions_target(&operator_label(names), &functions)?;
+        let substitutes = self.substitutes(&operators, &functions);
+        Ok(Some((operators.len(), target, substitutes)))
+    }
+
+    /// Functions of user-defined operators the planner may run in place of
+    /// these, other than theirs (`functions`), in a stable order.
+    fn substitutes(&self, operators: &[&Operator], functions: &[&Function]) -> Substitutes<'c> {
+        let catalog = self.ctx.catalog;
+        let mut others: Vec<&Operator> = catalog.all_operators().collect();
+        others.sort_by_key(|other| (&other.schema, &other.name, other.function_oid));
+        let mut substitutes = Substitutes::default();
+        for other in others {
+            let related = operators.iter().any(|operator| {
+                let types = (&operator.left_type, &operator.right_type);
+                types == (&other.left_type, &other.right_type)
+                    || types == (&other.right_type, &other.left_type)
+            });
+            if !related {
+                continue;
+            }
+            match catalog.function(other.function_oid) {
+                Some(function)
+                    if functions
+                        .iter()
+                        .chain(&substitutes.functions)
+                        .any(|f| f.oid == function.oid)
+                        || self.function_allowlisted(function) => {}
+                Some(function) => substitutes.functions.push(function),
+                None if other.function_schema == "pg_catalog"
+                    && !rules::side_effect(&other.function_name)
+                    && rules::denied_function(&other.function_name).is_none() => {}
+                None => {
+                    substitutes
+                        .opaque
+                        .get_or_insert_with(|| format!("{}.{}", other.schema, other.name));
+                }
+            }
+        }
+        substitutes
     }
 
     /// Is this an operator defined outside `pg_catalog`?
@@ -1306,6 +1450,39 @@ fn is_body_placeholder(select: &nodes::SelectStmt) -> bool {
     ))
 }
 
+/// The operators an operator expression applies: its own, or for
+/// `BETWEEN`, the comparisons it stands for.
+fn operator_names(expr: &nodes::A_Expr) -> Vec<(Option<&str>, &str)> {
+    use A_Expr_Kind::*;
+    match expr.kind {
+        AEXPR_BETWEEN | AEXPR_BETWEEN_SYM => vec![(None, ">="), (None, "<=")],
+        AEXPR_NOT_BETWEEN | AEXPR_NOT_BETWEEN_SYM => vec![(None, "<"), (None, ">")],
+        _ => qualified_name(expr.name()).into_iter().collect(),
+    }
+}
+
+/// A possibly qualified operator name, e.g. from `OPERATOR(schema.op)`.
+pub(super) fn qualified_name(list: &pg_raw_parse::list::NodeList) -> Option<(Option<&str>, &str)> {
+    let names: Vec<&str> = list.iter().filter_map(|n| n.as_str()).collect();
+    match names.as_slice() {
+        [name] => Some((None, *name)),
+        [.., schema, name] => Some((Some(*schema), *name)),
+        [] => None,
+    }
+}
+
+/// Operator names for messages.
+fn operator_label(names: &[(Option<&str>, &str)]) -> String {
+    names
+        .iter()
+        .map(|(schema, name)| match schema {
+            Some(schema) => format!("{schema}.{name}"),
+            None => (*name).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 /// Operator name of an operator expression.
 fn operator_name(expr: &nodes::A_Expr) -> Option<(Option<&str>, &str)> {
     if !matches!(
@@ -1314,12 +1491,7 @@ fn operator_name(expr: &nodes::A_Expr) -> Option<(Option<&str>, &str)> {
     ) {
         return None;
     }
-    let names: Vec<&str> = expr.name().iter().filter_map(|n| n.as_str()).collect();
-    match names.as_slice() {
-        [name] => Some((None, *name)),
-        [.., schema, name] => Some((Some(*schema), *name)),
-        [] => None,
-    }
+    qualified_name(expr.name())
 }
 
 fn column_ref<'mem>(

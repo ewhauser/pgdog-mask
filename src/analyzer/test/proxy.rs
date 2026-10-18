@@ -2125,11 +2125,17 @@ fn param_sinks() -> Vec<Case> {
             "SELECT touch_if(ssn) FROM users",
             Same(vec![n(0)], true),
         ),
-        // Operators: noisy_eq's right operand only reaches a condition.
+        // Operators: the planner may swap the operands for a commutator's
+        // call, so either one may reach either parameter.
         case(
             "P25",
             "SELECT id FROM users WHERE 'x' ~~~ ssn",
-            Same(vec![], true),
+            Block("operator ~~~ may call it with either operand in either parameter"),
+        ),
+        case(
+            "P25",
+            "SELECT noisy_eq('x', ssn) FROM users",
+            Same(vec![n(0)], true),
         ),
         // The check applies when only planning, too.
         case(
@@ -2149,6 +2155,148 @@ fn param_sinks() -> Vec<Case> {
             Block("its argument for w1"),
         ),
     ]
+}
+
+/// A catalog where `=`, `<>`, `<`, `>`, `>=`, `<=` and `~~` on a varchar
+/// and text have user-defined functions that write their arguments.
+fn catalog_with_sink_operators() -> Catalog {
+    let writes = |oid, name: &str, args: [(&str, &str); 2]| {
+        let mut function = sql_function(
+            oid,
+            name,
+            &args,
+            "boolean",
+            "INSERT INTO public.audit (note) SELECT a::text RETURNING true",
+        );
+        function.volatility = "volatile".into();
+        function
+    };
+    let functions = vec![
+        writes(901, "stash_eq", [("a", "character varying"), ("b", "text")]),
+        writes(
+            902,
+            "stash_eq_r",
+            [("a", "text"), ("b", "character varying")],
+        ),
+    ];
+    let mut catalog = catalog_with(vec![], functions);
+    catalog.add_operators(
+        ["=", "<>", "<", ">", ">=", "<=", "~~"]
+            .into_iter()
+            .flat_map(|name| {
+                [
+                    operator(name, "character varying", "text", 901, "stash_eq"),
+                    operator(name, "text", "character varying", 902, "stash_eq_r"),
+                ]
+            })
+            .collect(),
+    );
+    catalog
+}
+
+/// User-defined operators: applied by any syntax, and with the functions
+/// the planner may run in their place.
+fn operators() -> Vec<Case> {
+    use Expect::*;
+    let writes = "function public.stash_eq";
+    let mut cases = vec![
+        // A commutator: `1 <<< ssn` is estimated as `ssn >>> 1`, calling
+        // gt_noisy on values from ssn's statistics.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE 1 <<< ssn",
+            Block("function public.gt_noisy() can pass a parameter"),
+        ),
+        case(
+            "P26",
+            "EXPLAIN SELECT id FROM users WHERE 1 <<< ssn",
+            Block("function public.gt_noisy() can pass a parameter"),
+        ),
+        // A negator: `NOT (ssn ==== 1)` may become `ssn !=== 1`.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE NOT (ssn ==== 1)",
+            Block("function public.ne_noisy() can pass a parameter"),
+        ),
+        // An operator whose function can't be checked.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE ssn ~>~ 1",
+            Block("operator public.~<~ may be used in place of operator ~>~"),
+        ),
+        // Without values of proxy-masked columns, nothing reaches them.
+        case("P26", "SELECT id FROM users WHERE 1 <<< name", allow()),
+        case(
+            "P26",
+            "SELECT id FROM users WHERE ssn === 'x'",
+            Same(vec![], true),
+        ),
+    ];
+    for sql in [
+        "SELECT id FROM users WHERE ssn = 'x'",
+        "SELECT id FROM users WHERE 'x' = ssn",
+        "SELECT id FROM users WHERE ssn IN ('x', 'y')",
+        "SELECT id FROM users WHERE ssn NOT IN ('x', 'y')",
+        "SELECT id FROM users WHERE ssn LIKE 'x%'",
+        "SELECT id FROM users WHERE ssn BETWEEN 'a' AND 'z'",
+        "SELECT id FROM users WHERE ssn NOT BETWEEN 'a' AND 'z'",
+        "SELECT id FROM users WHERE ssn BETWEEN SYMMETRIC 'a' AND 'z'",
+        "SELECT NULLIF(ssn, 'x') FROM users",
+        "SELECT id FROM users WHERE ssn IS DISTINCT FROM 'x'",
+        "SELECT id FROM users WHERE ssn IS NOT DISTINCT FROM 'x'",
+        "SELECT CASE ssn WHEN 'x' THEN 1 ELSE 0 END FROM users",
+        "SELECT id FROM users WHERE ssn = ANY (SELECT 'x')",
+        "SELECT id FROM users WHERE ssn IN (SELECT 'x')",
+        "SELECT id FROM users WHERE 'x' IN (SELECT ssn FROM users)",
+        "SELECT id FROM users WHERE ssn < ALL (SELECT 'x')",
+        "SELECT id FROM users WHERE (ssn, name) = ('x', 'y')",
+        "SELECT id FROM users WHERE (ssn, name) IN (('x', 'y'))",
+        "SELECT id FROM users WHERE (ssn, name) = (SELECT 'x', 'y')",
+        "SELECT id FROM users ORDER BY ssn USING <",
+        "SELECT id FROM users WHERE ssn OPERATOR(public.=) 'x'",
+        "SELECT u.id FROM users u JOIN archive a USING (ssn)",
+        "SELECT id FROM users NATURAL JOIN archive",
+        "SELECT CASE (SELECT ssn FROM users LIMIT 1) WHEN 'x' THEN 1 END",
+    ] {
+        cases.push(case("P26", sql, Block(writes)).catalog(catalog_with_sink_operators));
+    }
+    cases.extend([
+        // Clean operands reach nothing; the functions write, so errors are
+        // redacted.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE name IN ('x', 'y')",
+            Same(vec![], true),
+        )
+        .catalog(catalog_with_sink_operators),
+        case(
+            "P26",
+            "SELECT CASE id WHEN 1 THEN ssn END FROM users",
+            Same(vec![n(0)], true),
+        )
+        .catalog(catalog_with_sink_operators),
+        // SQL masks: an operator reading masked columns can't be inlined
+        // where the syntax applies it.
+        case(
+            "P26",
+            "SELECT id FROM orders WHERE id @@@ ANY (SELECT user_id FROM orders)",
+            Block("operator @@@ reads masked columns and can't be inlined here"),
+        )
+        .user("analyst"),
+        case(
+            "P26",
+            "SELECT id FROM orders ORDER BY id USING @@@",
+            Block("operator @@@ reads masked columns and can't be inlined here"),
+        )
+        .user("analyst"),
+        case(
+            "P26",
+            "SELECT id FROM orders WHERE id @@@ user_id",
+            Rewritten(vec!["__pgdog_args"], vec![], false),
+        )
+        .user("analyst"),
+    ]);
+    cases
 }
 
 fn views() -> Vec<Case> {
@@ -2858,6 +3006,11 @@ fn test_param_sinks_memoized() {
 }
 
 #[test]
+fn test_proxy_operators() {
+    check(operators());
+}
+
+#[test]
 fn test_proxy_views() {
     check(views());
 }
@@ -2965,6 +3118,7 @@ fn corpus() -> Vec<Case> {
         side_effects(),
         functions(),
         param_sinks(),
+        operators(),
         views(),
         explain(),
         multi_statement(),
