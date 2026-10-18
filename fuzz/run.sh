@@ -33,6 +33,12 @@ if command -v rustup >/dev/null; then
     export PATH RUSTUP_TOOLCHAIN=nightly
 fi
 
+# cargo-fuzz defaults --target to the triple it was itself built for. Its
+# Linux release binary (what cargo-binstall installs) is musl, and the nightly
+# toolchain has no musl std, nor does ASan work with musl's static libc.
+# Build for the toolchain's own host instead.
+HOST="$(rustc -vV | sed -n 's/^host: //p')"
+
 run() {
     local target="$1"
     mkdir -p "fuzz/corpus/$target" "fuzz/artifacts/$target"
@@ -40,7 +46,7 @@ run() {
     [[ -d "fuzz/seeds/$target" ]] && seeds=("fuzz/seeds/$target")
     read -ra extra <<<"$(flags "$target")"
     # Optimized, with debug assertions and overflow checks (cargo-fuzz's default).
-    cargo fuzz run "$target" "fuzz/corpus/$target" ${seeds[@]+"${seeds[@]}"} -- \
+    cargo fuzz run --target "$HOST" "$target" "fuzz/corpus/$target" ${seeds[@]+"${seeds[@]}"} -- \
         -max_total_time="$SECONDS_PER_TARGET" \
         -timeout=10 \
         -rss_limit_mb="${FUZZ_RSS_LIMIT_MB:-4096}" \
@@ -52,7 +58,7 @@ cmin() {
     local target="$1" extra
     [[ -d "fuzz/corpus/$target" ]] || return 0
     read -ra extra <<<"$(flags "$target")"
-    cargo fuzz cmin "$target" "fuzz/corpus/$target" -- \
+    cargo fuzz cmin --target "$HOST" "$target" "fuzz/corpus/$target" -- \
         -rss_limit_mb="${FUZZ_RSS_LIMIT_MB:-4096}" \
         "${extra[@]}"
 }
