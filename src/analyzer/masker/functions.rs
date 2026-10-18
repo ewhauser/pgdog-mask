@@ -1036,7 +1036,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 self.block(RESOLUTION_CHANGED);
                 return Err(());
             }
-            operators.extend(catalog.operators(*schema, name, &self.ctx.search_path));
+            let found = catalog.operators(*schema, name, &self.ctx.search_path);
+            // Postgres may resolve an unqualified operator with another
+            // search_path than the session's, which PgDog doesn't always
+            // follow: once one is on the session's, namesakes in other
+            // schemas count too, as for functions.
+            if schema.is_none() && !found.is_empty() {
+                operators.extend(catalog.all_operators().filter(|other| other.name == *name));
+            } else {
+                operators.extend(found);
+            }
         }
         if operators.is_empty() {
             return Ok(None);

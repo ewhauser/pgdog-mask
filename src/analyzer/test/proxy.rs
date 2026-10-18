@@ -2194,6 +2194,25 @@ fn catalog_with_sink_operators() -> Catalog {
     catalog
 }
 
+/// The test catalog with an `===` in another schema, whose function
+/// notifies its first argument.
+fn catalog_with_namesake_operator() -> Catalog {
+    let mut function = sql_function(
+        903,
+        "other_same",
+        &[("a", "text"), ("b", "character varying")],
+        "boolean",
+        "SELECT a = b FROM (SELECT pg_notify('c', a)) AS n",
+    );
+    function.schema = "other".into();
+    let mut catalog = catalog_with(vec![], vec![function]);
+    let mut namesake = operator("===", "text", "character varying", 903, "other_same");
+    namesake.schema = "other".into();
+    namesake.function_schema = "other".into();
+    catalog.add_operators(vec![namesake]);
+    catalog
+}
+
 /// User-defined operators: applied by any syntax, and with the functions
 /// the planner may run in their place.
 fn operators() -> Vec<Case> {
@@ -2226,6 +2245,20 @@ fn operators() -> Vec<Case> {
                 "the function of operator public.~<~ may be run in place of operator ~>~ and can't be checked",
             ),
         ),
+        // Postgres may resolve `===` with a search_path PgDog didn't follow:
+        // a namesake in another schema counts.
+        case(
+            "P26",
+            "SELECT id FROM users WHERE ssn === 'x'",
+            Block("function other.other_same() can pass a parameter"),
+        )
+        .catalog(catalog_with_namesake_operator),
+        case(
+            "P26",
+            "SELECT id FROM users WHERE ssn OPERATOR(public.===) 'x'",
+            Same(vec![], true),
+        )
+        .catalog(catalog_with_namesake_operator),
         // Without values of proxy-masked columns, nothing reaches them; but
         // the commutator and negator write, so errors are redacted.
         case(
