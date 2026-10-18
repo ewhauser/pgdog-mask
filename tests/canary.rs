@@ -25,7 +25,7 @@ use pgdog_mask::config::Config;
 use pgdog_mask::profile::{Assignments, Policies, ProxyInstance};
 use pgdog_mask::proxy::Datum;
 use tokio_postgres::error::{DbError, ErrorPosition};
-use tokio_postgres::{AsyncMessage, Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::{AsyncMessage, Client, NoTls, Notification, SimpleQueryMessage};
 
 const SCHEMA: &str = "masking_canary";
 
@@ -82,10 +82,11 @@ column = "salary"
 policy = "salary"
 "#;
 
-/// A connection, and the notices it receives.
+/// A connection, and the notices and notifications it receives.
 struct Connection {
     client: Client,
     notices: Arc<Mutex<Vec<DbError>>>,
+    notifications: Arc<Mutex<Vec<Notification>>>,
 }
 
 async fn connect() -> Connection {
@@ -95,16 +96,25 @@ async fn connect() -> Connection {
         .await
         .expect("connect to Postgres (set PGDOG_MASK_TEST_URL)");
     let notices = Arc::new(Mutex::new(vec![]));
-    let sink = notices.clone();
+    let notifications = Arc::new(Mutex::new(vec![]));
+    let (notice_sink, notification_sink) = (notices.clone(), notifications.clone());
     tokio::spawn(async move {
         let mut messages = stream::poll_fn(move |cx| connection.poll_message(cx));
         while let Some(Ok(message)) = messages.next().await {
-            if let AsyncMessage::Notice(notice) = message {
-                sink.lock().unwrap().push(notice);
+            match message {
+                AsyncMessage::Notice(notice) => notice_sink.lock().unwrap().push(notice),
+                AsyncMessage::Notification(notification) => {
+                    notification_sink.lock().unwrap().push(notification)
+                }
+                _ => (),
             }
         }
     });
-    Connection { client, notices }
+    Connection {
+        client,
+        notices,
+        notifications,
+    }
 }
 
 async fn setup(client: &Client) {
@@ -146,6 +156,9 @@ async fn setup(client: &Client) {
              CREATE VIEW barrier WITH (security_barrier) AS
                 SELECT id, ssn, upper(ssn) AS loud FROM users;
              CREATE MATERIALIZED VIEW ssn_mv AS SELECT id, ssn, salary FROM users;
+             -- Notifications on this schema's channel reach this connection.
+             -- Channels are per database: the proxy canaries use others.
+             LISTEN {SCHEMA};
 
              CREATE FUNCTION last4(v TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT
                 AS $$ SELECT right(v, 4) $$;
@@ -263,22 +276,33 @@ fn render(error: &DbError, view: View<'_>) -> String {
     String::from_utf8_lossy(&body).replace('\0', " | ")
 }
 
-/// Everything a statement sends back, as text: rows, COPY data, the error and notices.
+/// Everything a statement sends back, as text: rows, COPY data, the error,
+/// notices, and notifications on channels the connection listens to, which
+/// PgDog passes on as they are. Postgres sends a session the notifications
+/// a statement committed before it says it's ready for the next one.
 async fn run(conn: &Connection, sql: &str, view: View<'_>) -> Result<String, String> {
     conn.notices.lock().unwrap().clear();
+    conn.notifications.lock().unwrap().clear();
     let client = &conn.client;
     let result = if sql.trim_start().to_ascii_uppercase().starts_with("COPY") {
         copy_out(client, sql).await
     } else {
         query(client, sql, view).await
     };
-    let notices: String = conn
+    let mut notices: String = conn
         .notices
         .lock()
         .unwrap()
         .iter()
         .map(|notice| format!("NOTICE {}\n", render(notice, view)))
         .collect();
+    for notification in conn.notifications.lock().unwrap().iter() {
+        notices.push_str(&format!(
+            "NOTIFY {} {}\n",
+            notification.channel(),
+            notification.payload()
+        ));
+    }
     let error = |err: Failure| match err {
         Failure::Postgres(err) => match err.as_db_error() {
             Some(db) => render(db, view),
@@ -870,6 +894,14 @@ async fn test_no_canary_leaks() {
     .await
     .unwrap();
     assert!(leaked(&out).is_some(), "{out}");
+    // Control: so do notifications.
+    let notify = format!("SELECT pg_notify('{SCHEMA}', ssn) FROM users");
+    let out = run(&conn, &notify, View::Raw).await.unwrap();
+    let notified: String = out
+        .lines()
+        .filter(|line| line.starts_with(&format!("NOTIFY {SCHEMA} ")))
+        .collect();
+    assert!(leaked(&notified).is_some(), "{out}");
 
     let profile = policies.profile("anonymous", "pgdog");
     let ctx = Context {
@@ -1104,6 +1136,10 @@ async fn setup_proxy(client: &Client) {
              CREATE MATERIALIZED VIEW ssn_counts AS SELECT ssn, count(*) AS n FROM users GROUP BY ssn;
              CREATE MATERIALIZED VIEW ssn_flags AS
                 SELECT id, ssn LIKE 'CANARY%' AS starts_9 FROM users;
+             -- Notifications on the channels the corpus notifies reach this
+             -- connection.
+             LISTEN c;
+             LISTEN ch;
 
              CREATE FUNCTION last4(v TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT
                 AS $$ SELECT right(v, 4) $$;
@@ -3140,6 +3176,15 @@ async fn test_no_canary_leaks_proxy() {
             Ok(out) | Err(out) => out,
         };
         assert!(leaked(text).is_some(), "{sql}: {text}");
+    }
+    // Control: notifications carry the canaries too.
+    for sql in ["SELECT pg_notify('c', ssn) FROM users"] {
+        let out = run(&conn, sql, View::Raw).await.unwrap();
+        let notified: String = out
+            .lines()
+            .filter(|line| line.starts_with("NOTIFY c "))
+            .collect();
+        assert!(leaked(&notified).is_some(), "{sql}: {out}");
     }
 
     let profile = policies.profile("anonymous", "pgdog");
