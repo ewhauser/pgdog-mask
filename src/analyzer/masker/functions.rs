@@ -428,6 +428,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.note(Taint::Computed, false);
             self.state.writes = true;
         }
+        // Converting arguments or results to a type that isn't built in
+        // may run a cast function or domain check, which may write.
+        if candidates.iter().any(|function| {
+            function.argument_types.iter().any(|t| is_user_type(t))
+                || self.user_result(function).is_some()
+        }) {
+            self.state.writes = true;
+        }
         if let Some(function) = candidates
             .iter()
             .find(|function| self.folds_proxies(function))

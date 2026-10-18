@@ -2348,7 +2348,13 @@ fn user_types() -> Vec<Case> {
             "SELECT x::checked_ssn FROM (SELECT ssn AS x FROM users) s",
             Block("a cast to checked_ssn"),
         ),
-        case("P27", "SELECT name::checked_ssn FROM users", allow()),
+        // The check or cast function runs on other values too, and may
+        // write: errors are redacted.
+        case(
+            "P27",
+            "SELECT name::checked_ssn FROM users",
+            Same(vec![], true),
+        ),
         // Built-in types, and ROW(...) to a table's row type, as masks build.
         case(
             "P27",
@@ -2375,7 +2381,7 @@ fn user_types() -> Vec<Case> {
                 "function public.takes_d() takes x as public.checked_ssn, which isn't a built-in type",
             ),
         ),
-        case("P27", "SELECT takes_d(name) FROM users", allow()),
+        case("P27", "SELECT takes_d(name) FROM users", Same(vec![], true)),
         case(
             "P27",
             "SELECT returns_d(ssn) FROM users",
@@ -2383,7 +2389,11 @@ fn user_types() -> Vec<Case> {
                 "function public.returns_d() returns public.checked_ssn, which isn't a built-in type",
             ),
         ),
-        case("P27", "SELECT returns_d(name) FROM users", allow()),
+        case(
+            "P27",
+            "SELECT returns_d(name) FROM users",
+            Same(vec![], true),
+        ),
         case(
             "P27",
             "SELECT ssn_d(1)",
@@ -2404,7 +2414,7 @@ fn user_types() -> Vec<Case> {
                 "function public.cast_d() can pass a parameter to a write or a side effect, so its argument for v",
             ),
         ),
-        case("P27", "SELECT cast_d(name) FROM users", allow()),
+        case("P27", "SELECT cast_d(name) FROM users", Same(vec![], true)),
         // Elsewhere in a statement that reads proxy-masked columns.
         case(
             "P27",
@@ -2419,7 +2429,7 @@ fn user_types() -> Vec<Case> {
         case(
             "P27",
             "SELECT name, JSON_VALUE('{\"a\": 1}', '$.a' RETURNING checked_ssn) FROM users",
-            allow(),
+            Same(vec![], true),
         ),
     ]
 }
@@ -2881,11 +2891,12 @@ fn exempt_user() -> Vec<Case> {
 fn parameters_literals() -> Vec<Case> {
     use Expect::*;
     vec![
-        // A type modifier names an identifier; it reads no column.
+        // A type modifier names an identifier; it reads no column. The
+        // type isn't built in, so converting 'x' to it may run user code.
         case(
             "V0",
             "SELECT id FROM users WHERE mytype(ssn) 'x' = 'x'",
-            Same(vec![], false),
+            Same(vec![], true),
         ),
         case(
             "V1",

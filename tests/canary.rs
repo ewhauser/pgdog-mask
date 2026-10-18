@@ -1234,6 +1234,12 @@ async fn setup_proxy(client: &Client) {
                 NEGATOR = !#=);
              CREATE OPERATOR !#= (LEFTARG = BIGINT, RIGHTARG = BIGINT, FUNCTION = ne_log,
                 NEGATOR = =#=);
+             -- A cast whose function writes audit_log, whose trigger raises an ssn.
+             CREATE TYPE logged AS (v BIGINT);
+             CREATE FUNCTION to_logged(v BIGINT) RETURNS logged LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit_log VALUES (v, v)
+                   RETURNING ROW(v)::{PROXY_SCHEMA}.logged $$;
+             CREATE CAST (BIGINT AS logged) WITH FUNCTION to_logged(BIGINT);
              -- Statistics hold ssn values, which estimates pass to operators.
              ANALYZE users;"
         ))
@@ -2627,6 +2633,12 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         "BEGIN; SELECT name::checked_ssn, takes_d(name) FROM users; SELECT note FROM audit; ROLLBACK",
         Expect::Runs,
     ),
+    // The cast function's write runs audit_log's trigger, which raises an ssn.
+    (
+        "P27",
+        "SELECT (id::logged).v FROM orders WHERE id = 2",
+        Expect::Fails("P0001"),
+    ),
     (
         "P25",
         "SELECT stash_if(ssn, 'x') FROM users",
@@ -3079,6 +3091,7 @@ async fn test_no_canary_leaks_proxy() {
         "BEGIN; EXPLAIN SELECT id FROM users WHERE 1 <<< ssn; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
         "SELECT id FROM orders WHERE NOT (id =#= 2)",
+        "SELECT (id::logged).v FROM orders WHERE id = 2",
         "BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK",

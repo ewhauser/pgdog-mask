@@ -998,10 +998,12 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
     // Type modifiers are constants or identifiers, never column references:
     // in `mytype(ssn) 'x'`, `ssn` is a name Postgres passes to the type.
     // Values converted to a type that isn't built in outside a cast, e.g.
-    // `RETURNING`, count against the whole statement.
+    // `RETURNING`, count against the whole statement. The conversion may
+    // run user code, which may write.
     fn transform_type_name<'mutref>(&mut self, node: nodes::TypeNameMut<'mem, 'mutref>) {
         if let Some(data_type) = user_type_name(&node) {
             self.state.user_type.get_or_insert(data_type);
+            self.state.writes = true;
         }
     }
 
@@ -1015,6 +1017,8 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             .filter(|type_name| !(row && self.is_row_type(type_name)))
             .and_then(user_type_name);
         let taint = self.scoped(|masker| child!(masker, node, arg_mut, set_arg));
+        // The cast function or domain check may write, whatever the value.
+        self.state.writes |= user_type.is_some();
         if let Some(data_type) = user_type
             && self.executing
         {
