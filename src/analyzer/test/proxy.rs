@@ -3229,6 +3229,15 @@ fn test_proxy_columns_not_listed_as_rewritten() {
             "SELECT s.*, upper(u.ssn) FROM (SELECT * FROM orders) s, users u",
             vec![],
         ),
+        // An inlined view, and a join, with columns of both kinds.
+        (
+            "SELECT ssn, email FROM user_contacts WHERE id = $1",
+            vec!["public.users.email"],
+        ),
+        (
+            "SELECT u.ssn, u.email, p.mrn FROM users u JOIN patients p ON p.user_id = u.id",
+            vec!["public.users.email"],
+        ),
     ] {
         let Outcome::Rewritten { masked, .. } = analyze(sql, &ctx) else {
             panic!("{sql}: a rewrite");
