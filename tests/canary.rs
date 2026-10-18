@@ -1211,6 +1211,20 @@ async fn setup_proxy(client: &Client) {
                 AS $$ UPDATE users SET name = name WHERE id = uid RETURNING id $$;
              CREATE VIEW bump_v AS SELECT bump_name(1) AS b;
              CREATE VIEW user_names_v AS SELECT id, name FROM users;
+             -- A domain whose check, and a cast whose function, write the value;
+             -- functions converting arguments and results to the domain.
+             CREATE FUNCTION log_it(v VARCHAR) RETURNS BOOLEAN LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit (note) SELECT 'domain:' || v RETURNING true $$;
+             CREATE DOMAIN checked_ssn AS VARCHAR CHECK (log_it(VALUE));
+             CREATE TYPE boxed AS (v TEXT);
+             CREATE FUNCTION to_boxed(v VARCHAR) RETURNS boxed LANGUAGE sql
+                AS $$ INSERT INTO {PROXY_SCHEMA}.audit (note) SELECT 'cast:' || v
+                   RETURNING ROW(v)::{PROXY_SCHEMA}.boxed $$;
+             CREATE CAST (VARCHAR AS boxed) WITH FUNCTION to_boxed(VARCHAR);
+             CREATE FUNCTION takes_d(x checked_ssn) RETURNS INT LANGUAGE sql
+                SET search_path = {PROXY_SCHEMA} AS $$ SELECT 1 $$;
+             CREATE FUNCTION returns_d(x VARCHAR) RETURNS checked_ssn LANGUAGE sql
+                SET search_path = {PROXY_SCHEMA} AS $$ SELECT x $$;
              -- Statistics hold ssn values, which estimates pass to operators.
              ANALYZE users;"
         ))
@@ -2436,6 +2450,33 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
         "BEGIN; SELECT id FROM users WHERE 1 <<< name; SELECT note FROM audit; ROLLBACK",
         Expect::Runs,
     ),
+    // Conversions to a domain run its check, and casts to a type their
+    // function.
+    (
+        "P27",
+        "BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P27",
+        "BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P27",
+        "BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P27",
+        "BEGIN; SELECT length(returns_d(ssn)) FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Blocked,
+    ),
+    (
+        "P27",
+        "BEGIN; SELECT name::checked_ssn, takes_d(name) FROM users; SELECT note FROM audit; ROLLBACK",
+        Expect::Runs,
+    ),
     (
         "P25",
         "SELECT stash_if(ssn, 'x') FROM users",
@@ -2887,6 +2928,10 @@ async fn test_no_canary_leaks_proxy() {
         "BEGIN; UPDATE users SET name = name WHERE id = 1; ROLLBACK",
         "BEGIN; EXPLAIN SELECT id FROM users WHERE 1 <<< ssn; SELECT note FROM audit; ROLLBACK",
         "BEGIN; SELECT id FROM users WHERE NOT (ssn ==== 1); SELECT note FROM audit; ROLLBACK",
+        "BEGIN; SELECT length(ssn::checked_ssn) FROM users; SELECT note FROM audit; ROLLBACK",
+        "BEGIN; SELECT (ssn::boxed).v FROM users; SELECT note FROM audit; ROLLBACK",
+        "BEGIN; SELECT takes_d(ssn) FROM users; SELECT note FROM audit; ROLLBACK",
+        "BEGIN; SELECT length(returns_d(ssn)) FROM users; SELECT note FROM audit; ROLLBACK",
     ] {
         let raw = run(&conn, sql, View::Raw).await;
         let _ = conn.client.batch_execute("ROLLBACK").await;

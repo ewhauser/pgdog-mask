@@ -441,6 +441,17 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.blocked.get_or_insert_with(|| reason.into());
     }
 
+    /// Does a type name a relation's row type?
+    fn is_row_type(&self, type_name: &nodes::TypeName) -> bool {
+        let names: Vec<&str> = type_name.names().iter().filter_map(|n| n.sval()).collect();
+        let catalog = self.ctx.catalog;
+        match names.as_slice() {
+            [schema, name] => catalog.get(schema, name).is_some(),
+            [name] => !catalog.relations_named(name).is_empty(),
+            _ => false,
+        }
+    }
+
     /// Mask a top-level statement. `finish_statement` ends it.
     pub(super) fn statement(&mut self, stmt: nodes::RawStmtMut<'mem, '_>) {
         let node = stmt.stmt();
@@ -748,6 +759,12 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     }
 }
 
+/// A type's name, if it isn't a built-in type.
+fn user_type_name(type_name: &nodes::TypeName) -> Option<String> {
+    let names: Vec<&str> = type_name.names().iter().filter_map(|n| n.sval()).collect();
+    (!rules::builtin_type(&names)).then(|| names.join("."))
+}
+
 /// The relations of a list of relation names.
 fn range_vars(list: &pg_raw_parse::list::NodeList) -> Vec<&nodes::RangeVar> {
     list.iter()
@@ -980,7 +997,34 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     // Type modifiers are constants or identifiers, never column references:
     // in `mytype(ssn) 'x'`, `ssn` is a name Postgres passes to the type.
-    fn transform_type_name<'mutref>(&mut self, _node: nodes::TypeNameMut<'mem, 'mutref>) {}
+    // Values converted to a type that isn't built in outside a cast, e.g.
+    // `RETURNING`, count against the whole statement.
+    fn transform_type_name<'mutref>(&mut self, node: nodes::TypeNameMut<'mem, 'mutref>) {
+        if let Some(data_type) = user_type_name(&node) {
+            self.state.user_type.get_or_insert(data_type);
+        }
+    }
+
+    // A cast to a type that isn't built in can run a user-defined cast
+    // function or domain check on the value. `ROW(...)` cast to a table's
+    // row type is converted field by field.
+    fn transform_type_cast<'mutref>(&mut self, mut node: nodes::TypeCastMut<'mem, 'mutref>) {
+        let row = matches!(node.arg(), Node::RowExpr(_));
+        let user_type = node
+            .type_name()
+            .filter(|type_name| !(row && self.is_row_type(type_name)))
+            .and_then(user_type_name);
+        let taint = self.scoped(|masker| child!(masker, node, arg_mut, set_arg));
+        if let Some(data_type) = user_type
+            && self.executing
+        {
+            self.sink_with(taint, |_| {
+                format!(
+                    "a cast to {data_type}, which isn't a built-in type, can run a user-defined cast function or domain check on values of proxy-masked columns"
+                )
+            });
+        }
+    }
 
     fn transform_param_ref<'mutref>(&mut self, node: nodes::ParamRefMut<'mem, 'mutref>) {
         // A parameter of the function body being analyzed for where its

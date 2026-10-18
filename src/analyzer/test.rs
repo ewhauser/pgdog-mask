@@ -429,6 +429,42 @@ pub(crate) fn functions() -> Vec<Function> {
             "boolean",
             "SELECT a = b::text",
         ),
+        // `public.checked_ssn` is a domain, whose check may run any function.
+        sql_function(
+            55,
+            "takes_d",
+            &[("x", "public.checked_ssn")],
+            "integer",
+            "SELECT 1",
+        ),
+        sql_function(
+            56,
+            "returns_d",
+            &[("x", "character varying")],
+            "public.checked_ssn",
+            "SELECT x",
+        ),
+        sql_function(
+            57,
+            "ssn_d",
+            &[("uid", "bigint")],
+            "public.checked_ssn",
+            "SELECT ssn FROM public.users WHERE id = uid",
+        ),
+        sql_function(
+            58,
+            "eq_d",
+            &[("a", "public.checked_ssn"), ("b", "text")],
+            "boolean",
+            "SELECT a::text = b",
+        ),
+        sql_function(
+            59,
+            "cast_d",
+            &[("v", "text")],
+            "boolean",
+            "SELECT v::public.checked_ssn IS NOT NULL",
+        ),
         sql_function(
             23,
             "notify_p",
@@ -643,6 +679,7 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
         operator("~>~", "character varying", "numeric", 54, "cmp_quiet"),
         // Its function isn't in the catalog.
         operator("~<~", "numeric", "character varying", 999, "cmp_c"),
+        operator("##", "public.checked_ssn", "text", 58, "eq_d"),
     ]);
     catalog
 }

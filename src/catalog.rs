@@ -380,6 +380,13 @@ impl Catalog {
     }
 }
 
+/// Is a type, as the catalog names it, user-defined? Its names come from
+/// `format_type` with an empty `search_path`, which qualifies every type
+/// outside `pg_catalog`.
+pub fn is_user_type(data_type: &str) -> bool {
+    data_type.contains('.')
+}
+
 /// Parse a `search_path` setting, e.g. `"$user", public`.
 pub fn parse_search_path(value: &str, user: &str) -> Vec<String> {
     value

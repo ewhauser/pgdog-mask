@@ -2299,6 +2299,112 @@ fn operators() -> Vec<Case> {
     cases
 }
 
+/// Values converted to a type that isn't built in: a domain's check, or a
+/// user-defined cast function, runs on them.
+fn user_types() -> Vec<Case> {
+    use Expect::*;
+    vec![
+        case(
+            "P27",
+            "SELECT ssn::checked_ssn FROM users",
+            Block("a cast to checked_ssn, which isn't a built-in type"),
+        ),
+        case(
+            "P27",
+            "SELECT CAST(ssn AS public.checked_ssn) FROM users",
+            Block("a cast to public.checked_ssn"),
+        ),
+        case(
+            "P27",
+            "SELECT length(upper(ssn)::checked_ssn) FROM users",
+            Block("a cast to checked_ssn"),
+        ),
+        case(
+            "P27",
+            "SELECT id FROM users WHERE ssn::checked_ssn IS NOT NULL",
+            Block("a cast to checked_ssn"),
+        ),
+        case(
+            "P27",
+            "SELECT x::checked_ssn FROM (SELECT ssn AS x FROM users) s",
+            Block("a cast to checked_ssn"),
+        ),
+        case("P27", "SELECT name::checked_ssn FROM users", allow()),
+        // Built-in types, and ROW(...) to a table's row type, as masks build.
+        case(
+            "P27",
+            "SELECT ssn::text, ssn::int, ssn::character varying(4), ssn::jsonb FROM users",
+            Same(vec![n(0), n(1), n(2), n(3)], true),
+        ),
+        case(
+            "P27",
+            "SELECT ROW(u.id, u.name, u.ssn, u.email, u.opted_in, u.salary)::users FROM users u",
+            Rewritten(vec!["ROW(u.id, u.name, u.ssn, ("], vec![n(0)], true),
+        ),
+        // Only planned.
+        case(
+            "P27",
+            "EXPLAIN SELECT ssn::checked_ssn FROM users",
+            Same(vec![], true),
+        ),
+        // Arguments are converted to their parameters' types, and results to
+        // the function's.
+        case(
+            "P27",
+            "SELECT takes_d(ssn) FROM users",
+            Block(
+                "function public.takes_d() takes x as public.checked_ssn, which isn't a built-in type",
+            ),
+        ),
+        case("P27", "SELECT takes_d(name) FROM users", allow()),
+        case(
+            "P27",
+            "SELECT returns_d(ssn) FROM users",
+            Block(
+                "function public.returns_d() returns public.checked_ssn, which isn't a built-in type",
+            ),
+        ),
+        case("P27", "SELECT returns_d(name) FROM users", allow()),
+        case(
+            "P27",
+            "SELECT ssn_d(1)",
+            Block("function public.ssn_d() returns public.checked_ssn"),
+        ),
+        case(
+            "P27",
+            "SELECT id FROM users WHERE ssn ## 'x'",
+            Block(
+                "function public.eq_d() takes public.checked_ssn, which isn't a built-in type, and operator ## may call it",
+            ),
+        ),
+        // A body converting its parameter.
+        case(
+            "P27",
+            "SELECT cast_d(ssn) FROM users",
+            Block(
+                "function public.cast_d() can pass a parameter to a write or a side effect, so its argument for v",
+            ),
+        ),
+        case("P27", "SELECT cast_d(name) FROM users", allow()),
+        // Elsewhere in a statement that reads proxy-masked columns.
+        case(
+            "P27",
+            "SELECT ssn, JSON_VALUE('{\"a\": 1}', '$.a' RETURNING checked_ssn) FROM users",
+            Block("checked_ssn isn't a built-in type: converting values to it"),
+        ),
+        case(
+            "P27",
+            "SELECT JSON_VALUE(to_json(ssn), '$' RETURNING public.checked_ssn) FROM users",
+            Block("public.checked_ssn isn't a built-in type"),
+        ),
+        case(
+            "P27",
+            "SELECT name, JSON_VALUE('{\"a\": 1}', '$.a' RETURNING checked_ssn) FROM users",
+            allow(),
+        ),
+    ]
+}
+
 fn views() -> Vec<Case> {
     use Expect::*;
     let tables = PROXY_CONFIG.replacen("[general]", "[general]\ninline_views = false", 1);
@@ -3011,6 +3117,11 @@ fn test_proxy_operators() {
 }
 
 #[test]
+fn test_proxy_user_types() {
+    check(user_types());
+}
+
+#[test]
 fn test_proxy_views() {
     check(views());
 }
@@ -3119,6 +3230,7 @@ fn corpus() -> Vec<Case> {
         functions(),
         param_sinks(),
         operators(),
+        user_types(),
         views(),
         explain(),
         multi_statement(),

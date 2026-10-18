@@ -35,7 +35,7 @@ use super::{
     BodyInfo, Masker, RESOLUTION_CHANGED, Verdict, call_address, expr_address, fields, ident, rules,
 };
 use crate::analyzer::taint::Taint;
-use crate::catalog::{Function, Operator, RelationKind, parse_search_path};
+use crate::catalog::{Function, Operator, RelationKind, is_user_type, parse_search_path};
 
 /// What to do with a call.
 pub(in crate::analyzer) enum CallUse<'mem> {
@@ -209,6 +209,47 @@ impl CallArgs {
             .iter()
             .map(|(_, taint)| *taint)
             .fold(self.rest, Taint::join)
+    }
+}
+
+/// Why arguments of a call to a user-defined function can't carry values
+/// of proxy-masked columns.
+enum Reach {
+    /// They're passed to this parameter, which can reach a sink.
+    Sink(String),
+    /// They're passed to this parameter, of this type that isn't built in.
+    Type(String, String),
+    /// An operator's operands, which may reach any parameter: one that can
+    /// reach a sink, or (if `Some`) one of this type that isn't built in.
+    Operands(Option<String>),
+    /// They can't be matched to parameters.
+    Unmatched,
+}
+
+impl Reach {
+    fn message(&self, function: &Function, name: &str) -> String {
+        let function = function.qualified_name();
+        let can_pass =
+            format!("function {function}() can pass a parameter to a write or a side effect");
+        let converting =
+            "converting a value to it can run a user-defined cast function or domain check";
+        match self {
+            Reach::Sink(param) => format!(
+                "{can_pass}, so its argument for {param} can't carry values of proxy-masked columns"
+            ),
+            Reach::Type(param, data_type) => format!(
+                "function {function}() takes {param} as {data_type}, which isn't a built-in type: {converting}, so its argument for {param} can't carry values of proxy-masked columns"
+            ),
+            Reach::Operands(None) => format!(
+                "{can_pass}, and operator {name} may call it with either operand in either parameter (the planner can use an operator's commutator or negator), so it can't be applied to values of proxy-masked columns"
+            ),
+            Reach::Operands(Some(data_type)) => format!(
+                "function {function}() takes {data_type}, which isn't a built-in type, and operator {name} may call it with either operand: {converting}, so {name} can't be applied to values of proxy-masked columns"
+            ),
+            Reach::Unmatched => format!(
+                "{can_pass}, or takes a type that isn't built in, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
+            ),
+        }
     }
 }
 
@@ -391,6 +432,19 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 ));
             }
         }
+        // A result is converted to the function's type, which can run a
+        // domain check on what it computed.
+        if let Some((function, data_type)) = candidates.iter().find_map(|function| {
+            let reads = self.body_info(function, |info| info.reads_proxies);
+            let data_type = self.user_result(function)?;
+            (reads || !args.taint().is_clean()).then_some((function, data_type))
+        }) {
+            let function = function.qualified_name();
+            let why = format!(
+                "function {function}() returns {data_type}, which isn't a built-in type: converting its result can run a user-defined domain check on values of proxy-masked columns"
+            );
+            self.sink_with(args.taint().join(Taint::Computed), |_| why);
+        }
         // Planning alone can call an operator's function on values from
         // pg_statistic (RESTRICT = eqsel), so this applies under plain
         // EXPLAIN too.
@@ -400,26 +454,9 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let mut reaching = Taint::Clean;
         let mut why = None;
         for function in candidates.iter().chain(&check.substitutes.functions) {
-            let (taint, param) = self.reaching_sinks(function, args);
-            if !taint.is_clean() {
+            if let Some((taint, reach)) = self.reaching(function, args) {
                 reaching = reaching.join(taint);
-                why.get_or_insert_with(|| {
-                    let function = function.qualified_name();
-                    let can_pass = format!(
-                        "function {function}() can pass a parameter to a write or a side effect"
-                    );
-                    match param {
-                        Some(param) => format!(
-                            "{can_pass}, so its argument for {param} can't carry values of proxy-masked columns"
-                        ),
-                        None if args.operands => format!(
-                            "{can_pass}, and operator {name} may call it with either operand in either parameter (the planner can use an operator's commutator or negator), so it can't be applied to values of proxy-masked columns"
-                        ),
-                        None => format!(
-                            "{can_pass}, and the call's arguments can't be matched to its parameters, so it can't be called with values of proxy-masked columns"
-                        ),
-                    }
-                });
+                why.get_or_insert_with(|| reach.message(function, name));
             }
         }
         if let Some(operator) = &check.substitutes.opaque {
@@ -433,40 +470,78 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         }
     }
 
-    /// What the arguments passed to parameters of a user-defined SQL
-    /// function that can reach a sink carry, and the first such parameter
-    /// given a non-Clean argument. When the arguments can't be matched to
-    /// the parameters, every argument may reach one.
-    fn reaching_sinks(
-        &mut self,
-        function: &'c Function,
-        args: &CallArgs,
-    ) -> (Taint, Option<String>) {
+    /// What the arguments a user-defined SQL function can't take values of
+    /// proxy-masked columns in carry, and why, if any does: those passed to
+    /// a parameter that can reach a sink in its body, or of a type that
+    /// isn't built in. When the arguments can't be matched to the
+    /// parameters, every argument counts.
+    fn reaching(&mut self, function: &'c Function, args: &CallArgs) -> Option<(Taint, Reach)> {
         let sinks = self.param_sinks(function);
-        if !sinks.contains(&true) {
-            return (Taint::Clean, None);
+        // Converting an argument to a type that isn't built in can run a
+        // user-defined cast function or domain check.
+        let user_type = |position: usize| {
+            function
+                .argument_types
+                .get(position)
+                .filter(|data_type| is_user_type(data_type))
+        };
+        let sink = |position: usize| sinks.get(position) != Some(&false);
+        let count = function.argument_types.len();
+        if !(0..count).any(|position| sink(position) || user_type(position).is_some()) {
+            return None;
         }
-        let positions = (!args.operands)
-            .then(|| parameter_positions(function, args))
-            .flatten();
-        let Some(positions) = positions else {
-            return (args.taint(), None);
+        if args.operands {
+            let data_type = match sinks.contains(&true) {
+                true => None,
+                false => (0..count).find_map(user_type).cloned(),
+            };
+            return Some((args.taint(), Reach::Operands(data_type)));
+        }
+        let Some(positions) = parameter_positions(function, args) else {
+            return Some((args.taint(), Reach::Unmatched));
         };
         // Aggregate and window syntax is an error for a plain function, but
         // fail closed.
         let mut taint = args.rest;
-        let mut param = None;
+        let mut reach = None;
         for ((_, arg), position) in args.args.iter().zip(positions) {
-            if arg.is_clean() || sinks.get(position) == Some(&false) {
+            if arg.is_clean() || !(sink(position) || user_type(position).is_some()) {
                 continue;
             }
             taint = taint.join(*arg);
-            param.get_or_insert_with(|| match function.argument_names.get(position) {
-                Some(name) if !name.is_empty() => name.clone(),
-                _ => format!("${}", position + 1),
+            reach.get_or_insert_with(|| {
+                let param = match function.argument_names.get(position) {
+                    Some(name) if !name.is_empty() => name.clone(),
+                    _ => format!("${}", position + 1),
+                };
+                match user_type(position) {
+                    Some(data_type) if !sink(position) => Reach::Type(param, data_type.clone()),
+                    _ => Reach::Sink(param),
+                }
             });
         }
-        (taint, param)
+        match reach {
+            Some(reach) => Some((taint, reach)),
+            None if !taint.is_clean() => Some((taint, Reach::Unmatched)),
+            None => None,
+        }
+    }
+
+    /// A type that isn't built in that a function's result is converted to,
+    /// other than a relation's row type, which has no checks.
+    fn user_result<'f>(&self, function: &'f Function) -> Option<&'f str> {
+        std::iter::once(&function.return_type)
+            .chain(&function.output_types)
+            .find(|data_type| {
+                is_user_type(data_type)
+                    && !data_type.split_once('.').is_some_and(|(schema, name)| {
+                        self.ctx
+                            .catalog
+                            .get(schema.trim_matches('"'), name.trim_matches('"'))
+                            .is_some()
+                    })
+            })
+            .map(String::as_str)
     }
 
     /// Something about a user-defined function's body, once analyzed.

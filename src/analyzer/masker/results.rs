@@ -51,6 +51,9 @@ pub(super) struct StatementState {
     pub portal: Option<(&'static str, Option<String>)>,
     /// Proxy-masked columns read, for sink messages.
     pub proxy_labels: BTreeSet<String>,
+    /// A type that isn't built in that values are converted to outside a
+    /// cast, e.g. by `RETURNING` of a JSON function.
+    pub user_type: Option<String>,
 }
 
 impl StatementState {
@@ -539,6 +542,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
 
         if state.stores_expressions && (state.reads_proxies || !computes.is_clean()) {
             self.block("DDL expressions would store values computed from proxy-masked columns");
+        }
+        if let Some(data_type) = &state.user_type
+            && (state.reads_proxies || !computes.is_clean())
+        {
+            self.block(format!(
+                "{data_type} isn't a built-in type: converting values to it can run a user-defined cast function or domain check, so statements that read proxy-masked columns can only use it in casts of other values"
+            ));
         }
         if relevant && let Some(reason) = state.deferred {
             self.block(reason);
