@@ -36,6 +36,8 @@ jobs:
       - name: Nightly toolchain
         run: rustup toolchain install nightly --profile minimal
 
+      # Installs cargo-fuzz's musl release binary, which defaults to a musl
+      # target; fuzz/run.sh passes the nightly host's --target instead.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
