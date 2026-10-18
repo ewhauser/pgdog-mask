@@ -182,6 +182,9 @@ struct Memo {
     functions: HashMap<i64, BodyInfo>,
     /// Whether a parameter of a SQL function can reach a sink in its body.
     param_sinks: HashMap<i64, bool>,
+    /// For a relation an unqualified name resolves to, by schema and name, a
+    /// namesake in another schema that reads differently, if there's one.
+    namesakes: HashMap<(String, String), Option<String>>,
     /// Views and functions being analyzed, to stop recursion.
     active: Vec<String>,
     /// Bodies parsed to find where their parameters go.
@@ -496,11 +499,29 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let resolved = catalog
             .resolve(None, name, &self.ctx.search_path)
             .or(named.first())?;
-        if let Some(other) = named.iter().find(|other| !self.reads_like(resolved, other)) {
+        if named.len() < 2 {
+            return Some(resolved);
+        }
+        let key = (resolved.schema.clone(), resolved.name.clone());
+        let memoized = self.memo.borrow().namesakes.get(&key).cloned();
+        let different = match memoized {
+            Some(different) => different,
+            None => {
+                let different = named
+                    .iter()
+                    .find(|other| !self.reads_like(resolved, other))
+                    .map(Relation::qualified_name);
+                self.memo
+                    .borrow_mut()
+                    .namesakes
+                    .insert(key, different.clone());
+                different
+            }
+        };
+        if let Some(other) = different {
             self.block(format!(
-                "\"{name}\" may refer to {} or to {}, which read differently for masked users; qualify it with its schema",
+                "\"{name}\" may refer to {} or to {other}, which read differently for masked users; qualify it with its schema",
                 resolved.qualified_name(),
-                other.qualified_name()
             ));
         }
         Some(resolved)
