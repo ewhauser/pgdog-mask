@@ -1,0 +1,1 @@
+ SELECT users.id, public.email_of(users.id) AS e FROM public.users;

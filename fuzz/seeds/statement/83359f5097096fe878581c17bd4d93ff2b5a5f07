@@ -1,0 +1,1 @@
+ SELECT ssns.id, ssns.ssn AS v FROM public.ssns() ssns(id, ssn);

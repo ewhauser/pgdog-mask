@@ -1,0 +1,1 @@
+ SELECT users.id, public.user_ssn(users.id) AS s FROM public.users;

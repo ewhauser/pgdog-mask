@@ -1,0 +1,1 @@
+ SELECT users.id, query_to_xml('SELECT ssn FROM public.users'::text, true, false, ''::text) AS x FROM public.users;

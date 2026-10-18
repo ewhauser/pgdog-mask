@@ -1,0 +1,1 @@
+SELECT id FROM fn_sb WHERE s LIKE 'CANARY%'

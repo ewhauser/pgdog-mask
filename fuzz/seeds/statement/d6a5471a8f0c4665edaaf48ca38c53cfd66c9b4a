@@ -1,0 +1,1 @@
+ SELECT fn_sb.id, fn_sb.s FROM public.fn_sb;
