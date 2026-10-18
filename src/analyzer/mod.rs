@@ -53,8 +53,9 @@ pub struct ResultColumn {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Results {
     pub columns: Vec<ResultColumn>,
-    /// Errors and notices may quote values of proxy-masked columns: PgDog
-    /// replaces their message, and keeps their severity, SQLSTATE, position
+    /// Errors and notices may quote real values of masked columns, such as
+    /// those of proxy-masked columns, or of any masked column a table-like
+    /// view's definition reads: PgDog replaces their message, and keeps their severity, SQLSTATE, position
     /// and the fields naming where they come from (file, line, routine,
     /// schema, table, column, data type and constraint).
     pub redact_errors: bool,

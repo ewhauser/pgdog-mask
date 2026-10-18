@@ -27,11 +27,16 @@ pub(super) struct StatementState {
     pub reads_proxies: bool,
     /// Names a relation with proxy-masked columns.
     pub touches_proxies: bool,
-    /// Writes, maintains, alters or commits, or runs a function or view body
-    /// that does: triggers, constraints, defaults, rules, policies and index
-    /// expressions run on real values, of any relation, and may quote them
-    /// in messages.
+    /// Writes, maintains, alters or commits: triggers, constraints,
+    /// defaults, rules, policies and index expressions run on real values,
+    /// of any relation, and may quote them in messages.
     pub writes: bool,
+    /// Reads a view or calls a function whose body's errors need redaction
+    /// for this user (`BodyInfo::redacts`): it writes, or computes on values
+    /// of masked columns that aren't rewritten. A table-like view's
+    /// definition runs on real values, so this counts for users with only
+    /// SQL masks too.
+    pub body_redacts: bool,
     /// Join of every non-Clean taint used other than as a whole output column.
     pub computes: Taint,
     /// A sink that received `Unknown`: blocks if the statement turns out to be
@@ -576,9 +581,16 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.result_masks(result, outputs.unwrap_or_else(Outputs::unknown), relevant);
         }
 
-        self.results.redact_errors |= !computes.is_clean()
-            || (state.writes && self.ctx.profile.proxies)
-            || (state.runs_earlier && self.ctx.profile.proxies);
+        // Writes and earlier statements run on real values: statements of
+        // users with proxy masks do, and so does what a table-like view's
+        // definition uses, whatever the user's masks. Exempt users see them
+        // anyway.
+        let real_values = self.ctx.profile.proxies || self.real_values;
+        self.results.redact_errors |= !self.ctx.profile.exempt
+            && (!computes.is_clean()
+                || state.body_redacts
+                || (state.writes && real_values)
+                || (state.runs_earlier && real_values));
         self.reads_proxies |= state.reads_proxies;
         // Only the statements after it resolve names differently.
         self.path_changed |= state.changes_resolution;

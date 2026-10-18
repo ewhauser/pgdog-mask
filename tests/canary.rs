@@ -162,6 +162,15 @@ async fn setup(client: &Client) {
              -- Reading any of its columns notifies listeners of every ssn.
              CREATE VIEW notify_sb WITH (security_barrier) AS
                 SELECT id, pg_notify('{SCHEMA}', ssn)::text AS n FROM users;
+             -- Reading it fails with an ssn in the message: the definition
+             -- casts real values, also when read through a view or a
+             -- function. Inlined, it casts the mask.
+             CREATE VIEW err_sb WITH (security_barrier) AS
+                SELECT id FROM users WHERE ssn::int > 0;
+             CREATE VIEW err_over_sb AS SELECT id FROM err_sb;
+             CREATE VIEW err_inline AS SELECT id FROM users WHERE ssn::int > 0;
+             CREATE FUNCTION count_err_sb() RETURNS BIGINT LANGUAGE sql STABLE
+                AS $$ SELECT count(*) FROM err_sb $$;
 
              CREATE FUNCTION last4(v TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT
                 AS $$ SELECT right(v, 4) $$;
@@ -701,6 +710,16 @@ const CORPUS: &[(&str, Expect)] = &[
     ("SELECT loud FROM loud_sb", Expect::Blocked),
     ("SELECT s FROM fn_sb_v", Expect::Blocked),
     ("SELECT s FROM fn_v", Expect::Blocked),
+    // Its definition runs on real values, which its errors quote.
+    ("SELECT id FROM err_sb", Expect::Fails("22P02")),
+    ("SELECT id FROM err_over_sb", Expect::Fails("22P02")),
+    ("SELECT count_err_sb()", Expect::Fails("22P02")),
+    (
+        "BEGIN; UPDATE err_sb SET id = id WHERE id = 1; ROLLBACK",
+        Expect::Fails("22P02"),
+    ),
+    // Inlined, its errors quote the mask.
+    ("SELECT id FROM err_inline", Expect::NoLeak),
     // Writes through views over masked columns are blocked.
     (
         "BEGIN; UPDATE user_ssns SET email = email; ROLLBACK",
@@ -963,6 +982,12 @@ async fn test_no_canary_leaks() {
     for sql in FN_VIEW_COLUMNS {
         let out = run(&conn, sql, View::Raw).await.unwrap();
         assert!(leaked(&out).is_some(), "{sql}: {out}");
+    }
+    // Control: without DETAIL, errors still quote the real values a view's
+    // definition casts when no masked column is read.
+    for sql in ["SELECT id FROM err_sb", "SELECT count_err_sb()"] {
+        let err = run(&conn, sql, View::masked()).await.unwrap_err();
+        assert!(leaked(&err).is_some(), "{sql}: {err}");
     }
 
     let profile = policies.profile("anonymous", "pgdog");

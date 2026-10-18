@@ -352,6 +352,14 @@ pub(crate) fn functions() -> Vec<Function> {
             "bigint",
             "SELECT count(*) FROM public.users",
         ),
+        // Reads a view whose definition casts real values.
+        sql_function(
+            63,
+            "count_err_sb",
+            &[],
+            "bigint",
+            "SELECT count(*) FROM public.err_sb",
+        ),
         atomic,
         sql_function(
             9,
@@ -688,6 +696,24 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
             " SELECT users.id, public.upper_safe(users.name) AS u FROM public.users;",
         ),
     ];
+    // Conditions whose errors quote the values they cast: real ones queried
+    // like a table, also through a view that reads it, and masks inlined.
+    // And one that only passes a masked column through.
+    let casts_ssn = " SELECT users.id FROM public.users WHERE ((users.ssn)::integer > 0);";
+    let error_views = vec![
+        barrier_view("err_sb", &["id"], casts_ssn),
+        view(
+            "err_over_sb",
+            &["id"],
+            " SELECT err_sb.id FROM public.err_sb;",
+        ),
+        view("err_inline", &["id"], casts_ssn),
+        barrier_view(
+            "ids_sb",
+            &["id", "ssn"],
+            " SELECT users.id, users.ssn FROM public.users WHERE (users.id > 0);",
+        ),
+    ];
 
     let mut catalog = Catalog::new(
         vec!["$user".into(), "public".into()],
@@ -775,6 +801,7 @@ fn catalog_with(relations: Vec<Relation>, extra_functions: Vec<Function>) -> Cat
         .into_iter()
         .chain(sink_views)
         .chain(function_views)
+        .chain(error_views)
         .chain(relations)
         .collect(),
     );
@@ -1371,6 +1398,56 @@ fn test_views_as_tables() {
     };
     assert!(sql.ends_with("FROM user_ssns"), "{sql}");
     assert!(sql.contains("'XXX-XX-'"), "{sql}");
+}
+
+/// Whether the errors of a statement that runs are redacted.
+fn redacts(config: &str, user: &str, sql: &str) -> bool {
+    match analyze_with(config, user, sql) {
+        Outcome::Unchanged { results, .. } | Outcome::Rewritten { results, .. } => {
+            results.redact_errors
+        }
+        Outcome::Blocked { reason } => panic!("{sql:?} blocked: {reason}"),
+    }
+}
+
+#[test]
+fn test_table_like_view_errors_redacted() {
+    // Queried like a table, a view's definition runs on real values, whatever
+    // the user's masks, and its errors can quote them. On Postgres 16,
+    // `SELECT id FROM err_sb` failed with `invalid input syntax for type
+    // integer: "123-45-6789"`, which the DETAIL scrub doesn't remove.
+    for sql in [
+        "SELECT id FROM err_sb",
+        "SELECT o.id FROM orders o JOIN err_sb e ON e.id = o.user_id",
+        "SELECT id FROM orders WHERE user_id IN (SELECT id FROM err_sb)",
+        // Writes through it run its condition.
+        "UPDATE err_sb SET id = id WHERE id = 1",
+        // Through a view, or a function, that reads it.
+        "SELECT id FROM err_over_sb",
+        "SELECT count_err_sb()",
+        // Its row filter can't be analyzed: it may read masked columns by
+        // itself.
+        "SELECT id FROM filtered_sb",
+    ] {
+        assert!(redacts(CONFIG, "anonymous", sql), "{sql}");
+    }
+    assert!(!redacts(CONFIG, "admin", "SELECT id FROM err_sb"));
+    // Passing masked columns through and filtering on others computes nothing
+    // on them.
+    assert!(!redacts(CONFIG, "anonymous", "SELECT id, ssn FROM ids_sb"));
+
+    // Inlined, the definition casts the mask, so its errors quote the mask.
+    let sql = rewritten("anonymous", "SELECT id FROM err_inline");
+    assert!(sql.contains("'XXX-XX-'"), "{sql}");
+    assert!(!redacts(CONFIG, "anonymous", "SELECT id FROM err_inline"));
+
+    // With inline_views off, it runs on real values too, and so does a write
+    // in a function a view calls: its triggers run on them.
+    let config = CONFIG.replacen("[general]", "[general]\ninline_views = false", 1);
+    for sql in ["SELECT id FROM err_inline", "SELECT b FROM bump_v"] {
+        assert!(redacts(&config, "anonymous", sql), "{sql}");
+    }
+    assert!(!redacts(CONFIG, "anonymous", "SELECT b FROM bump_v"));
 }
 
 #[test]

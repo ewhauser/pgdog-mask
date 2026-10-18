@@ -2631,7 +2631,7 @@ fn views() -> Vec<Case> {
         case("Q17", "SELECT id FROM notify_mv", allow()),
         // Functions that can't be analyzed can run there, e.g. to filter
         // rows, but can't be passed values of masked columns. They may
-        // write.
+        // write, or read masked columns by themselves, for SQL masks too.
         case(
             "Q18",
             "SELECT ssn FROM filtered_sb",
@@ -2640,7 +2640,7 @@ fn views() -> Vec<Case> {
         case(
             "Q18",
             "SELECT id, ssn FROM filtered_sb",
-            Rewritten(vec!["FROM filtered_sb"], vec![], false),
+            Rewritten(vec!["FROM filtered_sb"], vec![], true),
         )
         .user("analyst"),
         case(
@@ -2656,7 +2656,7 @@ fn views() -> Vec<Case> {
             Block("function public.can_see_ssn() is written in plpgsql"),
         )
         .user("analyst")
-        .config(tables),
+        .config(tables.clone()),
         // Lineage follows column references only. A column its definition
         // fills with masked values some other way, e.g. through a function's
         // body, is computed from the masked columns whose values reach it:
@@ -2670,7 +2670,8 @@ fn views() -> Vec<Case> {
         .user("analyst"),
         case("Q19", "SELECT s FROM fn_sb", allow()).user("admin"),
         case("Q19", "SELECT id FROM fn_sb", Same(vec![], true)),
-        case("Q19", "SELECT id FROM fn_sb", allow()).user("analyst"),
+        // Its definition computes on ssn, through the function.
+        case("Q19", "SELECT id FROM fn_sb", Same(vec![], true)).user("analyst"),
         case(
             "Q19",
             "SELECT * FROM fn_sb",
@@ -2757,6 +2758,49 @@ fn views() -> Vec<Case> {
                 "[general]\nview_allowlist = [\"public.fn_sb\"]",
                 1,
             )),
+        // Errors of a definition that runs on real values can quote them,
+        // with SQL masks too: `invalid input syntax for type integer`.
+        case("Q20", "SELECT id FROM err_sb", Same(vec![], true)),
+        case("Q20", "SELECT id FROM err_sb", Same(vec![], true)).user("analyst"),
+        case("Q20", "SELECT id FROM err_sb", allow()).user("admin"),
+        // Through a view or a function that reads it, and through writes.
+        case("Q20", "SELECT id FROM err_over_sb", Same(vec![], true)).user("analyst"),
+        case("Q20", "SELECT count_err_sb()", Same(vec![], true)).user("analyst"),
+        case(
+            "Q20",
+            "UPDATE err_sb SET id = id WHERE id = $1",
+            Same(vec![], true),
+        )
+        .user("analyst"),
+        // Inlined, SQL-masked columns are rewritten, so errors quote masks.
+        case(
+            "Q20",
+            "SELECT id FROM err_inline",
+            Rewritten(vec!["FROM (SELECT users.id"], vec![], true),
+        ),
+        case(
+            "Q20",
+            "SELECT id FROM err_inline",
+            Rewritten(vec!["FROM (SELECT users.id"], vec![], false),
+        )
+        .user("analyst"),
+        case("Q20", "SELECT id FROM err_inline", Same(vec![], true))
+            .user("analyst")
+            .config(tables.clone()),
+        // A write in a function its definition calls runs triggers on real
+        // values.
+        case("Q20", "SELECT b FROM bump_v", Same(vec![], true))
+            .user("analyst")
+            .config(tables),
+        case("Q20", "SELECT b FROM bump_v", allow()).user("analyst"),
+        // Passing masked columns through computes nothing on them.
+        case(
+            "Q20",
+            "SELECT id, ssn FROM ids_sb",
+            Rewritten(vec!["FROM ids_sb"], vec![], false),
+        )
+        .user("analyst"),
+        case("Q20", "SELECT id, ssn FROM ids_sb", Same(vec![pt(1)], false)),
     ]
 }
 

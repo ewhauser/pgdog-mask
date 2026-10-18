@@ -440,12 +440,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.note(Taint::Computed, false);
             self.state.reads_proxies = true;
         }
-        // Its triggers and constraints run on real values.
+        // Its triggers and constraints, and the definitions of table-like
+        // views it reads, run on real values.
         if candidates
             .iter()
             .any(|function| self.body_info(function, |info| info.redacts))
         {
-            self.state.writes = true;
+            self.state.body_redacts = true;
         }
         // One that can't be analyzed may read or write anything.
         if check.substitutes.opaque.is_some() {

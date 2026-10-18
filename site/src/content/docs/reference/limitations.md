@@ -44,6 +44,8 @@ The plugin blocks what it can't prove safe. All of these fail with SQLSTATE `425
 - Queries embedded in an expression the plugin doesn't follow: `a subquery is used in a way the plugin can't analyze`. Subqueries, `ARRAY(…)`, `EXISTS`, `IN` and `JSON_ARRAY(query)` are followed.
 - SQL-masked columns used directly as a boolean condition, such as `WHERE is_vip` on a masked column.
 
+Statements that read, or write through, a table-like view whose definition computes with masked columns, writes, or calls a function the plugin can't analyze aren't blocked, but their errors lose their message, for every masked user, including users with only SQL masks: the definition's errors can quote real values. The SQLSTATE, position and object names are kept. See [Views queried like tables](../../configure/errors/#views-queried-like-tables).
+
 ## With proxy masks
 
 These apply to users with [proxy masks](../../configure/proxy-masks/), on top of the rules above.
@@ -83,7 +85,7 @@ Not supported:
 - **Inference through proxy-masked columns**, whose conditions and ordering use real values by design. See [Proxy masks](../../configure/proxy-masks/#security-model).
 - **Timing side channels.**
 - **Copies made by exempt users** into tables masked users can read.
-- **Functions the plugin can't analyze** (PL/pgSQL, C, extensions) **called by a table-like view's definition**, which may read masked columns on their own and send them anywhere but the view's columns. They can't be passed values of masked columns there, and a column holding their result is masked as computed from every masked column, but what else they do by themselves isn't checked. See [Views and functions](../../configure/views-functions/#what-a-table-like-views-definition-does).
+- **Functions the plugin can't analyze** (PL/pgSQL, C, extensions) **called by a table-like view's definition**, which may read masked columns on their own and send them anywhere but the view's columns. They can't be passed values of masked columns there, a column holding their result is masked as computed from every masked column, and the errors of statements reading such a view are redacted, but what else they do by themselves isn't checked. See [Views and functions](../../configure/views-functions/#what-a-table-like-views-definition-does).
 - **Sharding keys.** Masking a column PgDog shards by breaks routing for masked users; the plugin doesn't check this. See [Choose masked columns](../../configure/columns/#dont-mask-sharding-keys).
 
 See the [security model](../security/) for the assumptions masking relies on.

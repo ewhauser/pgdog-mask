@@ -153,8 +153,10 @@ struct BodyInfo {
     /// Calls an IMMUTABLE function that reads proxy-masked columns, which
     /// the planner may run in advance.
     folds_proxies: bool,
-    /// Its errors need redaction: it writes, or computes on values of
-    /// proxy-masked columns.
+    /// Its errors need redaction for this user: it computes on values of
+    /// masked columns that aren't rewritten (proxy-masked ones, or any in
+    /// what runs on real values), or writes, for users with proxy masks or
+    /// where it runs on real values.
     redacts: bool,
 }
 

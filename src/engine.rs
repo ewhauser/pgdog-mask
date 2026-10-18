@@ -1295,13 +1295,20 @@ policy = "ssn"
     }
 
     /// X1: a statement that only computes on proxy-masked columns is sent as
-    /// is, with its errors redacted.
+    /// is, with its errors redacted. So is one reading a view queried like a
+    /// table whose definition computes on masked columns, whatever the user's
+    /// masks: PgDog redacts without result masks too.
     #[test]
     fn test_redaction_only_rewrite() {
         let engine = engine_with(PROXY_CONFIG, proxy_registry(), catalog());
         let sql = "SELECT id FROM users WHERE ssn = $1";
         assert_eq!(
             engine.statement(&session("engineer"), sql),
+            Verdict::rewrite_masked(sql, vec![]).redact_errors(true)
+        );
+        let sql = "SELECT id FROM err_sb";
+        assert_eq!(
+            engine.statement(&session("analyst"), sql),
             Verdict::rewrite_masked(sql, vec![]).redact_errors(true)
         );
     }

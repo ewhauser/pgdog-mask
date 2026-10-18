@@ -89,10 +89,11 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             self.view_info(relation, table_like)
         };
         self.touched |= info.touched;
-        // Inlined or not, the definition runs on real values: a view calling
-        // a function that writes, or computing on values of masked columns
-        // that aren't rewritten, may quote them in messages.
-        self.state.writes |= info.redacts;
+        // A view calling a function that writes, or computing on values of
+        // masked columns that aren't rewritten, may quote them in messages.
+        // Inlined, only proxy-masked ones aren't; queried like a table, no
+        // masked column is, whatever the user's masks.
+        self.state.body_redacts |= info.redacts;
         info.verdict
     }
 
