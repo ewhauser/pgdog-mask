@@ -55,6 +55,7 @@ Raw search deliberately allows confirming a guess, so treat it as a privilege:
 
 - **Range and pattern operators make extraction fast.** With `<`/`>` or `LIKE`, a value can be recovered by binary search or prefix probing in a few dozen queries. Only add them when you need them.
 - **Low-entropy columns can be brute-forced** even with equality alone, for example dates of birth or ZIP codes.
+- **Both are flagged.** The plugin logs a warning when it loads rules that allow range or pattern operators, or that apply to a policy whose `data_type` is `date` or `boolean`. [`pgdog-mask validate`](../../operate/validate/) also warns about raw searches on `date`, `boolean` and enum columns, whatever the policy's `data_type`.
 - **Raw searches are logged when they're analyzed**, at `info`, with the user and the columns searched. Parameter values are never logged:
 
   ```text

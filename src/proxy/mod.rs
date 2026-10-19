@@ -203,6 +203,11 @@ impl Registry {
         );
     }
 
+    /// Is a mask registered under this name?
+    pub fn contains(&self, name: &str) -> bool {
+        self.factories.contains_key(name)
+    }
+
     /// Build a mask for a column of `data_type`.
     pub fn create(
         &self,
@@ -339,7 +344,10 @@ mod test {
     #[test]
     fn test_registry() {
         let mut registry = Registry::default();
+        assert!(registry.contains("hmac_sha256"));
+        assert!(!registry.contains("test.reverse"));
         registry.register("test.reverse", |_: &Options| Ok(Reverse));
+        assert!(registry.contains("test.reverse"));
 
         let mask = registry
             .create("test.reverse", &Options::default(), "text")

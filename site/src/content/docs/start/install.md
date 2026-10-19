@@ -45,7 +45,7 @@ The binary is `pgdog/target/release/pgdog`. Building in PgDog's own checkout use
 (cd pgdog-mask && cargo build --release)
 ```
 
-The library is `pgdog-mask/target/release/libpgdog_mask.so` on Linux, or `libpgdog_mask.dylib` on macOS.
+The library is `pgdog-mask/target/release/libpgdog_mask.so` on Linux, or `libpgdog_mask.dylib` on macOS. The build also writes `pgdog-mask/target/release/pgdog-mask`, the command that [validates a configuration](../../operate/validate/) against a database.
 
 ## 4. Create a sample database
 

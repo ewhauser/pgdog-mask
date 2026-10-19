@@ -12,8 +12,6 @@
 //!
 //! Requires Postgres; set `PGDOG_MASK_TEST_URL` to override the default
 //! `host=127.0.0.1 user=pgdog password=pgdog dbname=pgdog`.
-mod support;
-
 use std::sync::{Arc, Mutex};
 
 use futures_util::{StreamExt as _, pin_mut, stream};
@@ -24,6 +22,7 @@ use pgdog_mask::catalog::Catalog;
 use pgdog_mask::config::Config;
 use pgdog_mask::profile::{Assignments, Policies, ProxyInstance};
 use pgdog_mask::proxy::Datum;
+use pgdog_mask::schema::load_catalog;
 use tokio_postgres::error::{DbError, ErrorPosition};
 use tokio_postgres::{AsyncMessage, Client, NoTls, Notification, SimpleQueryMessage};
 
@@ -935,7 +934,9 @@ async fn test_no_canary_leaks() {
     let conn = connect().await;
     let client = &conn.client;
     setup(client).await;
-    let catalog = support::load_catalog(client, &[SCHEMA], &[SCHEMA]).await;
+    let catalog = load_catalog(client, Some(&[SCHEMA]), &[SCHEMA])
+        .await
+        .unwrap();
 
     let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
     let assignments = Assignments::new(&policies, "pgdog", &catalog);
@@ -1073,7 +1074,9 @@ name = "users"
 column = "ssn"
 policy = "ssn"
 "#;
-    let catalog = support::load_catalog(client, &[schema], &[schema]).await;
+    let catalog = load_catalog(client, Some(&[schema]), &[schema])
+        .await
+        .unwrap();
     let policies = Policies::new(Config::from_toml(config).unwrap()).unwrap();
     let assignments = Assignments::new(&policies, "pgdog", &catalog);
     let profile = policies.profile("support", "pgdog");
@@ -3285,7 +3288,9 @@ fn proxy_config() -> Config {
 async fn proxy_fixture() -> (Connection, Catalog, Policies) {
     let conn = connect().await;
     setup_proxy(&conn.client).await;
-    let catalog = support::load_catalog(&conn.client, &[PROXY_SCHEMA], &[PROXY_SCHEMA]).await;
+    let catalog = load_catalog(&conn.client, Some(&[PROXY_SCHEMA]), &[PROXY_SCHEMA])
+        .await
+        .unwrap();
     let policies = Policies::new(proxy_config()).expect("valid policies");
     (conn, catalog, policies)
 }
@@ -3411,7 +3416,9 @@ async fn test_proxy_filters_find_rows() {
         ))
         .await
         .unwrap();
-    let catalog = support::load_catalog(&conn.client, &[schema], &[schema]).await;
+    let catalog = load_catalog(&conn.client, Some(&[schema]), &[schema])
+        .await
+        .unwrap();
     let policies = Policies::new(proxy_config()).unwrap();
     let assignments = Assignments::new(&policies, "pgdog", &catalog);
     let profile = policies.profile("anonymous", "pgdog");

@@ -61,6 +61,7 @@ export default defineConfig({
 					{ label: 'Error and notice redaction', slug: 'configure/errors' },
 				] },
 				{ label: 'Operate', collapsed: true, items: [
+					{ label: 'Validate a configuration', slug: 'operate/validate' },
 					{ label: 'Reload configuration', slug: 'operate/reload' },
 					{ label: 'Logs and maintenance', slug: 'operate/logs' },
 					{ label: 'Upgrade a deployment', slug: 'operate/upgrade' },

@@ -11,6 +11,7 @@ The plugin logs through PgDog's logger. Every message starts with `[pgdog_mask]`
 | --- | --- | --- |
 | Configuration loaded, at startup or by a reload | `info` | `loaded 3 policies, 5 masked columns (mode: Enforce)` |
 | Configuration rejected | `error` | `failed to reload masking.toml: policy "card": unknown proxy mask "ff2"` |
+| Configuration loaded with a [risky raw search](../validate/#warnings-when-the-plugin-loads) | `warn` | `policy "dob", rule 1 (roles support): search = "raw" with range operators (<, >, BETWEEN) lets these users recover a value by binary search, …` |
 | Statement blocked | `warn` | `blocked statement for user "support_app": <reason> [<statement>]` |
 | Statement rewritten (`enforce`) | `debug` | `rewrote statement for user "support_app", masked {"public.users.ssn"}: <statement>` |
 | Statement would be rewritten (`shadow`) | `info` | `(shadow) would rewrite statement for user "support_app", …` |
@@ -55,7 +56,7 @@ When the new file doesn't parse or validate, the plugin logs why and **keeps its
 
 Fix the file before PgDog next restarts: at startup, an invalid file makes PgDog refuse to start, with `required = true`.
 
-The plugin has no separate command to validate a file without loading it. To check a change before production, load it into a PgDog instance in a test environment.
+To check a file without loading it, run [`pgdog-mask validate`](../validate/) against the database. It also prepares every SQL mask, which loading the file doesn't.
 
 ## Rotate proxy mask keys
 
