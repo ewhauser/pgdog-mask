@@ -23,6 +23,7 @@ PgDog only loads plugins with the same plugin API version that were built by the
 ```bash
 cargo build --release
 # target/release/libpgdog_mask.so (Linux) or libpgdog_mask.dylib (macOS)
+# target/release/pgdog-mask, which validates a configuration (see below)
 ```
 
 Put the library where PgDog can `dlopen` it, such as `LD_LIBRARY_PATH` or a system library path, or give its full path as the plugin `name`.
@@ -160,6 +161,16 @@ To write your own, implement `pgdog_mask::proxy::ProxyMask` and build your own p
 
 `search = "raw"` lets a role find rows by a masked column's real value: `WHERE ssn = $1`, `IN`, `= ANY`, `IS NULL`, `IS DISTINCT FROM`, optionally wrapped in `lower`/`upper`/`trim`. Results are still masked. This deliberately allows guessing a value and confirming it. It does not allow extracting values: casts, arbitrary functions, and other expressions around the column remain masked. Range and `LIKE` operators are opt-in via `search_operators` because they let a value be recovered quickly. Every raw search is logged.
 
+### Validating
+
+The plugin checks the file when it loads it, without a database. `pgdog-mask validate` also checks it against the database, for local runs and CI:
+
+```bash
+pgdog-mask validate masking.toml --url "postgres://pgdog:pgdog@127.0.0.1:5432/app"
+```
+
+It prepares every SQL mask for the types it's applied to, as `SELECT (<mask>)::T FROM (SELECT NULL::T AS val) s LIMIT 0`, so type errors show up before a statement uses the mask. It warns about `[[masked_columns]]` and `[[classifiers]]` that match no column, tags that fail closed, and raw searches that allow range or pattern operators or apply to `date`, `boolean` or enum columns. It exits with 1 on errors (and warnings, with `--deny-warnings`). `--skip-proxy-masks` skips building proxy masks, which needs their keys. See [Validate a configuration](https://ewhauser.github.io/pgdog-mask/operate/validate/).
+
 ## What masked users can't do
 
 All of these fail closed with SQLSTATE `42501`:
@@ -186,7 +197,7 @@ Users with proxy masks also can't move proxy-masked values where PgDog can't mas
 Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database. Override these with the usual `PG*` variables.
 
 ```bash
-cargo test                       # unit tests + canary leak tests
+cargo test                       # unit tests, canary leak tests, pgdog-mask validate
 bash integration/run.sh          # end-to-end through PgDog
 bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, gorm) with every user masked
 bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin (see integration/bench/README.md)

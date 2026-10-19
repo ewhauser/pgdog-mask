@@ -18,7 +18,7 @@ use crate::catalog::{Catalog, parse_search_path};
 use crate::config::{Config, Error, Mode};
 use crate::profile::{Assignments, Policies, Profile, ProxyInstance};
 use crate::proxy::{self, MaskError, Registry};
-use crate::tags;
+use crate::{tags, validate};
 
 /// `cannot_connect_now`: the schema of the database isn't loaded yet.
 const CANNOT_CONNECT_NOW: &str = "57P03";
@@ -359,6 +359,9 @@ impl Engine {
             policies.config.masked_columns.len(),
             policies.config.general.mode,
         );
+        for warning in validate::config_warnings(&policies.config) {
+            warn!("[pgdog_mask] {warning}");
+        }
         self.settings
             .store(Arc::new(Settings::new(policies, epoch, proxy_base)));
         // Keys include the settings epoch, so old entries can't be hit; drop them anyway.
