@@ -45,6 +45,8 @@ tracing = "0.1"
 futures-util = "0.3"
 # PgDog's catalog row types, to load catalogs in tests the way PgDog does.
 pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "c8684da70d973af253efdd8af2f85b5571641aa8" }
+# Authentication for the wire-protocol client in tests/support/wire.rs.
+postgres-protocol = "0.6"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = "0.7"
 

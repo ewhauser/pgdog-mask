@@ -187,7 +187,7 @@ Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdo
 
 ```bash
 cargo test                       # unit tests + canary leak tests
-bash integration/run.sh          # end-to-end through PgDog
+bash integration/run.sh          # end-to-end and protocol matrix through PgDog
 bash integration/compat.sh       # Go drivers and ORMs (pgx, pq, gorm) with every user masked
 bash integration/bench/bench.sh  # pgbench: Postgres, PgDog, PgDog + plugin (see integration/bench/README.md)
 ```

@@ -1222,6 +1222,7 @@ dependencies = [
  "pg_raw_parse",
  "pgdog-plugin",
  "pgdog-stats",
+ "postgres-protocol",
  "regex",
  "serde",
  "serde_json",
