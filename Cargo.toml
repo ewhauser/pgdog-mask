@@ -9,11 +9,26 @@ publish = false
 name = "pgdog_mask"
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "pgdog-mask"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "canary"
+required-features = ["cli"]
+
+[[test]]
+name = "validate"
+required-features = ["cli"]
+
 [features]
-default = ["plugin"]
+default = ["plugin", "cli"]
 # Build the plugin itself. Crates that build their own plugin with custom proxy
 # masks (`masking_plugin!`) depend on pgdog-mask with default features off.
 plugin = []
+# The `pgdog-mask` command, and `schema`, which loads a catalog from Postgres.
+cli = ["dep:pgdog-stats", "dep:tokio", "dep:tokio-postgres"]
 # Masks for integration tests only.
 test-masks = []
 
@@ -40,11 +55,13 @@ sha2 = "0.11"
 thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
+# With `cli`. PgDog's catalog row types, to load catalogs the way PgDog does.
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "c8684da70d973af253efdd8af2f85b5571641aa8", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 futures-util = "0.3"
-# PgDog's catalog row types, to load catalogs in tests the way PgDog does.
-pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "c8684da70d973af253efdd8af2f85b5571641aa8" }
 # Authentication for the wire-protocol client in tests/support/wire.rs.
 postgres-protocol = "0.6"
 tokio = { version = "1", features = ["full"] }

@@ -1,35 +1,45 @@
 //! Load a database's catalog the way PgDog does for CATALOG plugins: with PgDog's
 //! own catalog queries, converted into the `Catalog` PgDog sends to plugins.
+//! Used by `pgdog-mask validate` and the tests, with the `cli` feature.
 use std::collections::HashMap;
 
-use pgdog_mask::catalog::Catalog;
 use pgdog_plugin::{CatalogParts, catalog as plugin};
 use pgdog_stats::{Column, Function, Operator, Relation, SecurityLabel};
+use thiserror::Error;
 use tokio_postgres::{Client, SimpleQueryMessage};
+
+use crate::catalog::Catalog;
 
 // PgDog's schema loader queries (pgdog/src/backend/schema/*.sql), copied from the
 // PgDog revision in Cargo.toml. Update them together.
-const QUERIES: &str = "tests/support/sql";
-const RELATIONS: &str = include_str!("sql/relations.sql");
-const COLUMNS: &str = include_str!("sql/columns_catalog.sql");
-const VIEWS: &str = include_str!("sql/views.sql");
-const FUNCTIONS: &str = include_str!("sql/functions.sql");
-const OPERATORS: &str = include_str!("sql/operators.sql");
+const RELATIONS: &str = include_str!("schema/relations.sql");
+const COLUMNS: &str = include_str!("schema/columns_catalog.sql");
+const VIEWS: &str = include_str!("schema/views.sql");
+const FUNCTIONS: &str = include_str!("schema/functions.sql");
+const OPERATORS: &str = include_str!("schema/operators.sql");
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("catalog query failed: {0}")]
+    Query(#[from] tokio_postgres::Error),
+
+    #[error("catalog row isn't valid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+}
 
 type Row = Vec<Option<String>>;
 
 /// Run a catalog query. Like PgDog, queries that print names run with an empty
 /// `search_path`, so names come back schema-qualified.
-async fn rows(client: &Client, query: &str, qualified: bool) -> Vec<Row> {
+async fn rows(client: &Client, query: &str, qualified: bool) -> Result<Vec<Row>, Error> {
     let sql = if qualified {
         format!("SET LOCAL search_path TO ''; {query}")
     } else {
         query.to_owned()
     };
-    client
+    Ok(client
         .simple_query(&sql)
-        .await
-        .unwrap_or_else(|err| panic!("catalog query from {QUERIES} failed: {err:?}"))
+        .await?
         .into_iter()
         .filter_map(|message| match message {
             SimpleQueryMessage::Row(row) => Some(
@@ -39,23 +49,28 @@ async fn rows(client: &Client, query: &str, qualified: bool) -> Vec<Row> {
             ),
             _ => None,
         })
-        .collect()
+        .collect())
 }
 
 fn text(row: &Row, i: usize) -> String {
     row.get(i).cloned().flatten().unwrap_or_default()
 }
 
-fn json<T: serde::de::DeserializeOwned>(row: &Row) -> T {
-    serde_json::from_str(&text(row, 0)).expect("catalog row is JSON")
+fn json<T: serde::de::DeserializeOwned>(row: &Row) -> Result<T, Error> {
+    Ok(serde_json::from_str(&text(row, 0))?)
 }
 
-/// The catalog of the given schemas, as the plugin receives it from PgDog.
-pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str]) -> Catalog {
-    let in_schemas = |schema: &str| schemas.contains(&schema);
+/// The catalog PgDog would send the plugin for the connected database, limited
+/// to `schemas` if given.
+pub async fn load_catalog(
+    client: &Client,
+    schemas: Option<&[&str]>,
+    search_path: &[&str],
+) -> Result<Catalog, Error> {
+    let in_schemas = |schema: &str| schemas.is_none_or(|schemas| schemas.contains(&schema));
 
     let mut relations: HashMap<(String, String), Relation> = HashMap::new();
-    for row in rows(client, RELATIONS, false).await {
+    for row in rows(client, RELATIONS, false).await? {
         let schema = text(&row, 0);
         if !in_schemas(&schema) {
             continue;
@@ -79,7 +94,7 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
         relations.insert((schema, relation.name.clone()), relation);
     }
 
-    for row in rows(client, COLUMNS, true).await {
+    for row in rows(client, COLUMNS, true).await? {
         let key = (text(&row, 1), text(&row, 2));
         let Some(relation) = relations.get_mut(&key) else {
             continue;
@@ -111,8 +126,8 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
         definition: Option<String>,
         options: Vec<String>,
     }
-    for row in rows(client, VIEWS, true).await {
-        let view: View = json(&row);
+    for row in rows(client, VIEWS, true).await? {
+        let view: View = json(&row)?;
         if let Some(relation) = relations.get_mut(&(view.schema, view.name)) {
             relation.definition = view.definition;
             relation.options = view.options;
@@ -122,15 +137,19 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
     let functions_sql =
         FUNCTIONS.replace("{sql_body}", "pg_catalog.pg_get_function_sqlbody(p.oid)");
     let functions: Vec<Function> = rows(client, &functions_sql, true)
-        .await
+        .await?
         .iter()
         .map(json::<Function>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|function| in_schemas(&function.schema))
         .collect();
     let operators: Vec<Operator> = rows(client, OPERATORS, true)
-        .await
+        .await?
         .iter()
         .map(json::<Operator>)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|operator| in_schemas(&operator.schema))
         .collect();
     let system_functions = rows(
@@ -138,7 +157,7 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
         "SELECT DISTINCT proname::text FROM pg_catalog.pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace ORDER BY 1",
         false,
     )
-    .await
+    .await?
     .iter()
     .map(|row| text(row, 0))
     .collect();
@@ -152,7 +171,7 @@ pub async fn load_catalog(client: &Client, schemas: &[&str], search_path: &[&str
     catalog.functions = functions.into_iter().map(function).collect();
     catalog.system_functions = system_functions;
     catalog.operators = operators.into_iter().map(operator).collect();
-    Catalog::from_plugin(&catalog)
+    Ok(Catalog::from_plugin(&catalog))
 }
 
 fn relation(relation: Relation) -> plugin::Relation {

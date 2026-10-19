@@ -15,6 +15,8 @@ kill -HUP $(pidof pgdog)
   [pgdog_mask] failed to reload masking.toml: policy "card": unknown proxy mask "ff2"
   ```
 
+  Run [`pgdog-mask validate`](../validate/) on the new file first: it reports the same errors without reloading, and mask type errors that loading the file doesn't catch. Proxy mask names it doesn't know, such as `ff2`, are only a note there, since they could come from [your own plugin](../../develop/proxy-masks/).
+
 - **New decisions apply to the next statement**, including in open sessions: the next statement each client sends is analyzed with the new policies.
 - **Prepared statements are checked again** at their next execution. Some must be prepared again by the client; see [below](#prepared-statements).
 - **Statements already running** finish with the masks they started with.

@@ -20,7 +20,10 @@ pub mod mask;
 pub mod plugin;
 pub mod profile;
 pub mod proxy;
+#[cfg(feature = "cli")]
+pub mod schema;
 pub mod tags;
+pub mod validate;
 
 /// The plugin API this crate is built against. Plugins built with
 /// [`masking_plugin!`] use it through this re-export, so their version matches.
