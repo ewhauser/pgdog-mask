@@ -37,7 +37,7 @@ test-masks = []
 # it's upstream. PgDog must be built from the same commit: plugins are only loaded
 # when the plugin API version and the Rust compiler version match. The
 # integration scripts read this revision to build PgDog.
-pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "c8684da70d973af253efdd8af2f85b5571641aa8" }
+pgdog-plugin = { git = "https://github.com/ewhauser/pgdog", rev = "d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be" }
 # Must match the pg_raw_parse PgDog uses at that revision.
 pg_raw_parse = { git = "https://github.com/pgdogdev/pg_raw_parse.git", rev = "89937b1" }
 aes = "0.8"
@@ -56,7 +56,7 @@ thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
 # With `cli`. PgDog's catalog row types, to load catalogs the way PgDog does.
-pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "c8684da70d973af253efdd8af2f85b5571641aa8", optional = true }
+pgdog-stats = { git = "https://github.com/ewhauser/pgdog", rev = "d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be", optional = true }
 tokio = { version = "1", features = ["rt"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 
