@@ -1,0 +1,1 @@
+SELECT enumtypid::int8, count(*) FROM pg_catalog.pg_enum GROUP BY 1

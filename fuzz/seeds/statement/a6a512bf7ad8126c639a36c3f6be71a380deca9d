@@ -1,0 +1,1 @@
+WITH u AS (SELECT * FROM masking_e2e.users) SELECT u.* FROM u

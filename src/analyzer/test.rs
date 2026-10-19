@@ -1184,6 +1184,46 @@ fn test_copy_options_deparser_can_print() {
     assert!(sql.ends_with("TO STDOUT CSV FORCE QUOTE id"), "{sql}");
 }
 
+/// The deparser prints `OPERATOR(db.schema.op)` as `OPERATOR()`. Postgres
+/// accepts the name for the current database; rewritten, it wouldn't parse.
+#[test]
+fn test_operator_names_deparser_can_print() {
+    for sql in [
+        // Found by fuzzing.
+        "SELECT i#>d FROM users WHERE ssn OPERATOR(p.bilc.=) 'x$$$$$$$ser_id__pgdog_lit_$$$'",
+        "SELECT id FROM users WHERE ssn OPERATOR(db.public.=) 'x'",
+        "SELECT ssn FROM users WHERE id OPERATOR(db.public.=) 1",
+        "SELECT ssn FROM users WHERE OPERATOR(db.public.-) id = 1",
+        "SELECT ssn FROM users WHERE id OPERATOR(db.public.=) ANY (ARRAY[1])",
+        "SELECT ssn FROM users WHERE id OPERATOR(db.public.=) ANY (SELECT 1)",
+        "SELECT ssn FROM users ORDER BY id USING OPERATOR(db.public.<)",
+        // Unchanged statements are deparsed when another one is rewritten.
+        "SELECT 1 OPERATOR(db.public.+) 1; SELECT ssn FROM users",
+        "SELECT ssn FROM users; CREATE TABLE t (c int CHECK (c OPERATOR(db.public.>) 0))",
+        "SELECT ssn FROM users; CREATE TABLE t (c int, EXCLUDE USING gist (c WITH OPERATOR(db.public.=)))",
+        "SELECT ssn FROM users; DROP OPERATOR db.public.=(int, int)",
+    ] {
+        let reason = blocked("anonymous", sql);
+        assert!(
+            reason.contains("qualified with a database"),
+            "{sql}: {reason}"
+        );
+    }
+
+    // Statements that aren't rewritten are sent as they are.
+    unchanged(
+        "anonymous",
+        "SELECT id FROM users WHERE id OPERATOR(db.public.=) 1",
+    );
+    assert_eq!(
+        rewritten(
+            "anonymous",
+            "SELECT ssn FROM users WHERE id OPERATOR(public.=) 1"
+        ),
+        format!("SELECT {SSN} AS ssn FROM users WHERE id OPERATOR(public.=) 1")
+    );
+}
+
 #[test]
 fn test_wrapped_statements() {
     for sql in [

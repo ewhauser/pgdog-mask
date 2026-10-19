@@ -1,0 +1,1 @@
+SELECT upper(card), tax_id || '', balance + 0, lower(ssn) FROM masking_e2e.users

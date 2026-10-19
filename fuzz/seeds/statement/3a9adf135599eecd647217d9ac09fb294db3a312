@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE id OPERATOR(pgdog.masking_canary.===) 'CANARYSSN-1111'

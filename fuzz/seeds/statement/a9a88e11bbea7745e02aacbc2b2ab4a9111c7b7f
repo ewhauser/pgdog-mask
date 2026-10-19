@@ -1,0 +1,1 @@
+SELECT DISTINCT proname::text FROM pg_catalog.pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace ORDER BY 1

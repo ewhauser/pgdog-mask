@@ -1,0 +1,1 @@
+PREPARE r AS SELECT card, tax_id, balance FROM masking_e2e.users

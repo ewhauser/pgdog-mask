@@ -1,0 +1,1 @@
+SELECT to_date(card, 'YYYY') FROM masking_e2e.users

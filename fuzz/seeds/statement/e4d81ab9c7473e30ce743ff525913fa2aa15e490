@@ -1,0 +1,1 @@
+PREPARE q AS SELECT id, ssn, email, phone FROM masking_e2e.users WHERE id = $1

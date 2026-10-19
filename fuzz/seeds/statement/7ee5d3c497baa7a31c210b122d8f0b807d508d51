@@ -1,0 +1,1 @@
+SELECT current_database(), current_user, current_setting('search_path')

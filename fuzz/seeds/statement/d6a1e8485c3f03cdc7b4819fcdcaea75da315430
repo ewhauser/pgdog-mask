@@ -1,0 +1,1 @@
+SELECT attname, most_common_vals::text, histogram_bounds::text FROM pg_stats WHERE schemaname = 'masking_e2e'

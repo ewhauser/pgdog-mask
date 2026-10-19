@@ -1,0 +1,1 @@
+SELECT ssn FROM users; CREATE TABLE t (c int, EXCLUDE USING gist (c WITH OPERATOR(db.public.=)))

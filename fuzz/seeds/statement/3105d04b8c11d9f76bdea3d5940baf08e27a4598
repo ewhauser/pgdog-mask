@@ -1,0 +1,1 @@
+SELECT jsonb_build_object('k', ssn)::text::int FROM masking_e2e.users

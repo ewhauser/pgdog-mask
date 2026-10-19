@@ -227,6 +227,9 @@ pub(super) struct Masker<'c, 'mem> {
     depth: usize,
     memo: Rc<RefCell<Memo>>,
     pub(super) blocked: Option<String>,
+    /// Why the deparser can't print the statement: it's blocked if it's
+    /// rewritten, and sent as is otherwise.
+    pub(super) undeparsable: Option<String>,
     pub(super) changed: bool,
     /// SQL masks changed what the statement computes, not only its text.
     masked_sql: bool,
@@ -330,6 +333,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             depth: 0,
             memo: Rc::default(),
             blocked: None,
+            undeparsable: None,
             changed: false,
             masked_sql: false,
             masked: BTreeSet::new(),
@@ -1298,6 +1302,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
             node.sub_link_type,
             SubLinkType::ANY_SUBLINK | SubLinkType::ALL_SUBLINK | SubLinkType::ROWCOMPARE_SUBLINK
         );
+        self.check_operator_name(node.oper_name());
         let operator = compares.then(|| {
             functions::qualified_name(node.oper_name())
                 .map(|(schema, name)| (schema.map(str::to_owned), name.to_owned()))
@@ -1349,6 +1354,7 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
 
     fn transform_sort_by<'mutref>(&mut self, node: nodes::SortByMut<'mem, 'mutref>) {
         // `ORDER BY x USING op` compares values of `x` with `op`.
+        self.check_operator_name(node.use_op());
         let operator = functions::qualified_name(node.use_op())
             .map(|(schema, name)| (schema.map(str::to_owned), name.to_owned()));
         let Some((schema, name)) = operator else {
@@ -1360,6 +1366,18 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
         if check.needs_post_check() {
             self.call_post_check(&check, &CallArgs::operands(operands), &name);
         }
+    }
+
+    fn transform_constraint<'mutref>(&mut self, node: nodes::ConstraintMut<'mem, 'mutref>) {
+        // `EXCLUDE (x WITH op)`: each exclusion is an element and an operator.
+        for exclusion in node.exclusions().iter() {
+            if let Node::NodeList(exclusion) = exclusion
+                && let Some(Node::NodeList(operator)) = exclusion.iter().nth(1)
+            {
+                self.check_operator_name(operator);
+            }
+        }
+        transform::transform_constraint(node, self);
     }
 
     fn transform_json_array_query_constructor<'mutref>(

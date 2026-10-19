@@ -1,0 +1,1 @@
+SELECT ssn FROM users ORDER BY id USING OPERATOR(db.public.<)

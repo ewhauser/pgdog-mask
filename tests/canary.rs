@@ -755,6 +755,20 @@ const CORPUS: &[(&str, Expect)] = &[
         "SELECT id FROM users WHERE id === 'CANARYSSN-1111'",
         Expect::Runs,
     ),
+    // Operator names qualified with the database: the deparser can't print
+    // them, so they're only sent unchanged.
+    (
+        "SELECT id FROM users WHERE id OPERATOR(pgdog.masking_canary.===) 'CANARYSSN-1111'",
+        Expect::Blocked,
+    ),
+    (
+        "SELECT id FROM users WHERE ssn OPERATOR(pgdog.pg_catalog.=) 'CANARYSSN-1111'",
+        Expect::Blocked,
+    ),
+    (
+        "SELECT id FROM users WHERE id OPERATOR(pgdog.pg_catalog.=) 1",
+        Expect::NoLeak,
+    ),
     ("SELECT get_ssn_definer(1)", Expect::Blocked),
     ("SELECT get_ssn_volatile(1)", Expect::Blocked),
     ("SELECT leak_plpgsql()", Expect::Blocked),

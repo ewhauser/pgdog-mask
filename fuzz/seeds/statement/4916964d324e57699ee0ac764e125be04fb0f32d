@@ -1,0 +1,1 @@
+DO $$ BEGIN RAISE NOTICE '%', (SELECT string_agg(ssn || card, ',') FROM masking_e2e.users); END $$

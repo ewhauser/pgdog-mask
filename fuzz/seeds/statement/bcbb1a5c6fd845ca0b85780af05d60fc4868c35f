@@ -1,0 +1,1 @@
+SELECT i#>d FROM users WHERE ssn OPERATOR(p.bilc.=) 'x$$$$$$$ser_id__pgdog_lit_$$$'

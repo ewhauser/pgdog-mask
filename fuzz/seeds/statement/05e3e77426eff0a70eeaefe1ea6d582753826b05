@@ -1,0 +1,1 @@
+SELECT id, ssn, email, phone, secret_note, tax_id, card, balance FROM masking_e2e.users WHERE id = $1

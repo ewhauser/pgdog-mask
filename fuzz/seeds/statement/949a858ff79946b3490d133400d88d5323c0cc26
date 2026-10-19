@@ -1,0 +1,1 @@
+PREPARE p AS SELECT id, ssn, email, phone FROM masking_e2e.users WHERE id = $1; EXECUTE p(1); DEALLOCATE p

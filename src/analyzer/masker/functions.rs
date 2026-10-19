@@ -1011,6 +1011,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
     /// What to do with an operator, and what's left to check once its operands
     /// are transformed.
     fn operator_use(&mut self, expr: &nodes::A_Expr) -> (CallUse<'mem>, CallCheck<'c>) {
+        self.check_operator_name(expr.name());
         let names = operator_names(expr);
         let (count, target, substitutes) = match self.user_operators(&names) {
             Ok(Some(found)) => found,
@@ -1162,6 +1163,18 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             }
         }
         substitutes
+    }
+
+    /// Notes an operator name the deparser can't print. It prints names of
+    /// one or two parts, and `OPERATOR(db.schema.op)`, which Postgres accepts
+    /// for the current database, as `OPERATOR()`: the statement wouldn't
+    /// parse once rewritten, or deparsed with another statement that is.
+    pub(super) fn check_operator_name(&mut self, list: &pg_raw_parse::list::NodeList) {
+        if list.len() > 2 {
+            self.undeparsable.get_or_insert_with(|| {
+                "operator names qualified with a database can't be rewritten".to_owned()
+            });
+        }
     }
 
     /// Is this an operator defined outside `pg_catalog`?

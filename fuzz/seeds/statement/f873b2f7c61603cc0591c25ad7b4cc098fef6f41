@@ -1,0 +1,1 @@
+SELECT (left(val, 2))::text FROM (SELECT NULL::text AS val) s LIMIT 0

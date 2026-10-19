@@ -133,6 +133,14 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             | ObjectType::OBJECT_MATVIEW
             | ObjectType::OBJECT_FOREIGN_TABLE
             | ObjectType::OBJECT_SEQUENCE => (),
+            ObjectType::OBJECT_OPERATOR => {
+                for object in drop.objects().iter() {
+                    if let Node::ObjectWithArgs(operator) = object {
+                        self.check_operator_name(operator.objname());
+                    }
+                }
+                return;
+            }
             _ => return,
         }
         for object in drop.objects().iter() {
