@@ -108,6 +108,7 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         }
         result = Some((
             masker.blocked,
+            masker.undeparsable,
             masker.changed,
             masker.masked,
             masker.raw,
@@ -126,7 +127,8 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
         }
     };
 
-    let Some((blocked, changed, masked, raw, touches_masked, results)) = result else {
+    let Some((blocked, undeparsable, changed, masked, raw, touches_masked, results)) = result
+    else {
         return Outcome::Blocked {
             reason: "statement could not be analyzed".into(),
         };
@@ -142,6 +144,10 @@ pub fn analyze(sql: &str, ctx: &Context<'_>) -> Outcome {
             touches_masked,
             results,
         };
+    }
+
+    if let Some(reason) = undeparsable {
+        return Outcome::Blocked { reason };
     }
 
     match pg_raw_parse::deparse_stmts(parsed.iter()) {
