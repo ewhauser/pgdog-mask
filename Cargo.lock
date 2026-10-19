@@ -1188,7 +1188,7 @@ dependencies = [
 [[package]]
 name = "pgdog-config"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
+source = "git+https://github.com/ewhauser/pgdog?rev=d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be#d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be"
 dependencies = [
  "derive_more",
  "indexmap 2.14.2",
@@ -1222,6 +1222,7 @@ dependencies = [
  "pg_raw_parse",
  "pgdog-plugin",
  "pgdog-stats",
+ "postgres-protocol",
  "regex",
  "serde",
  "serde_json",
@@ -1236,7 +1237,7 @@ dependencies = [
 [[package]]
 name = "pgdog-plugin"
 version = "0.8.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
+source = "git+https://github.com/ewhauser/pgdog?rev=d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be#d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be"
 dependencies = [
  "bindgen 0.71.1",
  "libloading",
@@ -1249,7 +1250,7 @@ dependencies = [
 [[package]]
 name = "pgdog-postgres-types"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
+source = "git+https://github.com/ewhauser/pgdog?rev=d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be#d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be"
 dependencies = [
  "bytes",
  "chrono",
@@ -1265,7 +1266,7 @@ dependencies = [
 [[package]]
 name = "pgdog-stats"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
+source = "git+https://github.com/ewhauser/pgdog?rev=d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be#d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be"
 dependencies = [
  "bytes",
  "derive_more",
@@ -1280,7 +1281,7 @@ dependencies = [
 [[package]]
 name = "pgdog-vector"
 version = "0.1.0"
-source = "git+https://github.com/ewhauser/pgdog?rev=c8684da70d973af253efdd8af2f85b5571641aa8#c8684da70d973af253efdd8af2f85b5571641aa8"
+source = "git+https://github.com/ewhauser/pgdog?rev=d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be#d3dc39ff14ca4fdb0ceac25bf69977fce50ca2be"
 dependencies = [
  "schemars 1.2.3",
  "serde",

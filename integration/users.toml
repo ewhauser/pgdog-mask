@@ -26,3 +26,13 @@ database = "pgdog"
 password = "pgdog"
 server_user = "pgdog"
 server_password = "pgdog"
+
+# Like masked (not in masking.toml), with one server connection, so its
+# clients share it in a known order.
+[[users]]
+name = "pooled"
+database = "pgdog"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
+pool_size = 1

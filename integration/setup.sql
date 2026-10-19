@@ -28,6 +28,8 @@ INSERT INTO masking_e2e.users VALUES
      'TAX-1111', '4111-1111-1111-1111', 1000, 'ally', 'red', 'al'),
     (2, 'bob', 'CANARYSSN-2222', 'canaryemail-bob@example.com', 'CANARYPHONE-22', 'CANARYNOTE-2',
      'TAX-2222', '5500-0000-0000-0004', 2000, 'bobby', 'blue', 'bo');
+-- pg_stats then holds the raw values: statements reading it must be blocked.
+ANALYZE masking_e2e.users;
 
 -- Inlined with masks applied.
 CREATE VIEW masking_e2e.user_ssns AS SELECT id, ssn FROM masking_e2e.users;

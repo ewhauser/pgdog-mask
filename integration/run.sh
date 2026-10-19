@@ -17,4 +17,4 @@ export PGDOG_MASK_E2E_FF1_KEY=2b7e151628aed2a6abf7158809cf4f3c
 # columns whose tags fail closed on purpose.
 "${ROOT}/target/debug/pgdog-mask" validate "${SCRIPT_DIR}/masking.toml"
 start_pgdog integration debug
-PGDOG_MASK_E2E=1 cargo test --test e2e
+PGDOG_MASK_E2E=1 cargo test --test e2e --test protocol
