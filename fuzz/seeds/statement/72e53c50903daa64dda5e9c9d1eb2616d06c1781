@@ -1,0 +1,1 @@
+SELECT ssn FROM users WHERE id OPERATOR(db.public.=) ANY (ARRAY[1])

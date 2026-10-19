@@ -1,0 +1,1 @@
+SELECT tax_id::int FROM masking_e2e.users WHERE id = $1

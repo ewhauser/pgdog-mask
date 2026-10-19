@@ -1,0 +1,1 @@
+SELECT ('****')::character varying FROM (SELECT NULL::character varying AS val) s LIMIT 0

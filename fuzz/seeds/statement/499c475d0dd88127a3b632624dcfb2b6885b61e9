@@ -1,0 +1,1 @@
+SELECT id FROM users WHERE ssn OPERATOR(pgdog.pg_catalog.=) 'CANARYSSN-1111'

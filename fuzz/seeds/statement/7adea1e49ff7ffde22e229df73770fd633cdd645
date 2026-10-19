@@ -1,0 +1,1 @@
+SELECT ssn, card FROM masking_e2e.users

@@ -1,0 +1,1 @@
+BEGIN; DECLARE ok CURSOR FOR SELECT id, ssn FROM masking_e2e.users; FETCH ALL FROM ok; ROLLBACK

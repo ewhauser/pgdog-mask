@@ -1,0 +1,1 @@
+SELECT ('****')::text FROM (SELECT NULL::text AS val) s LIMIT 0

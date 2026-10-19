@@ -1,0 +1,1 @@
+SELECT ssn FROM users; CREATE TABLE t (c int CHECK (c OPERATOR(db.public.>) 0))

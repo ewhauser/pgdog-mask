@@ -1,0 +1,1 @@
+SELECT (CASE WHEN opted_in THEN val END)::text FROM (SELECT NULL::text AS val, NULL::boolean AS "opted_in") s LIMIT 0
