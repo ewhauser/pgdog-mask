@@ -60,3 +60,8 @@ jobs:
 
       - name: End-to-end tests through PgDog
         run: bash integration/run.sh
+
+      # The same schema split across two shards: cross-shard sorting,
+      # aggregation and COPY of masked values.
+      - name: Sharded end-to-end tests through PgDog
+        run: bash integration/sharded/run.sh

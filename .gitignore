@@ -3,3 +3,4 @@ integration/bench/pgdog.log
 integration/pgdog.log
 /.pgdog
 /example/custom-mask/target
+integration/sharded/pgdog.log

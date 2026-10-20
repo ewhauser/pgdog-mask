@@ -1,0 +1,21 @@
+# The users share one Postgres role; masking depends on the PgDog user.
+[[users]]
+name = "masked"
+database = "pgdog"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
+
+[[users]]
+name = "admin"
+database = "pgdog"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
+
+[[users]]
+name = "analyst"
+database = "pgdog"
+password = "pgdog"
+server_user = "pgdog"
+server_password = "pgdog"
