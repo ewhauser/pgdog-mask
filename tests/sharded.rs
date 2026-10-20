@@ -312,13 +312,11 @@ async fn test_sharded() {
     assert_eq!(rows, vec![vec![None, None, None]; ROWS as usize]);
 }
 
-/// `ORDER BY ssn` is rewritten to `ORDER BY <mask of ssn>`. PgDog only
-/// merge-sorts results from several shards when `ORDER BY` names an output
-/// column or its position: with an expression, it returns the shards' rows
-/// one shard after the other, each sorted. So masked users get rows out of
-/// order, while `ORDER BY 1` works.
+/// PgDog only merge-sorts results from several shards when `ORDER BY` names
+/// an output column or its position: with an expression, it returns the
+/// shards' rows one shard after the other, each sorted. `ORDER BY ssn` is
+/// rewritten to the masked output's position, not to the mask.
 #[tokio::test]
-#[ignore = "ORDER BY a masked column isn't merge-sorted across shards"]
 async fn test_sharded_order_by_masked_column() {
     if !enabled() {
         return;

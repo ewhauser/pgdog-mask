@@ -1079,6 +1079,125 @@ fn test_set_operations() {
     assert_eq!(sql.matches("'XXX-XX-'").count(), 1, "{sql}");
 }
 
+/// ORDER BY a masked column in the select list sorts by its output's
+/// position: PgDog merge-sorts rows from several shards by output columns,
+/// not by expressions.
+#[test]
+fn test_order_by_masked_output_position() {
+    let sorted = |sql: &str| {
+        let sql = rewritten("anonymous", sql);
+        let order = sql.find(" ORDER BY ").map(|i| sql[i + 10..].to_owned());
+        order.unwrap_or_else(|| panic!("no ORDER BY in {sql}"))
+    };
+
+    assert_eq!(
+        rewritten("anonymous", "SELECT ssn FROM users ORDER BY ssn DESC"),
+        format!("SELECT {SSN} AS ssn FROM users ORDER BY 1 DESC")
+    );
+    assert_eq!(
+        sorted("SELECT id, ssn FROM users ORDER BY ssn NULLS FIRST, id"),
+        "2 NULLS FIRST, id"
+    );
+    assert_eq!(sorted("SELECT ssn AS s FROM users ORDER BY ssn"), "1");
+    assert_eq!(sorted("SELECT u.ssn FROM users u ORDER BY u.ssn"), "1");
+    // Written differently, reading the same column.
+    assert_eq!(sorted("SELECT ssn FROM users u ORDER BY u.ssn"), "1");
+    assert_eq!(
+        sorted("SELECT u.ssn FROM users u ORDER BY ssn DESC"),
+        "1 DESC"
+    );
+    assert_eq!(
+        sorted("SELECT ssn FROM users ORDER BY ssn USING <"),
+        "1 USING <"
+    );
+    // The first output computing the mask, as Postgres would match it.
+    assert_eq!(sorted("SELECT id, ssn, ssn FROM users ORDER BY ssn"), "2");
+    assert_eq!(
+        sorted("SELECT ssn, count(*) FROM users GROUP BY ssn ORDER BY ssn"),
+        "1"
+    );
+    assert_eq!(
+        sorted("SELECT * FROM users ORDER BY ssn LIMIT 1"),
+        "3 LIMIT 1"
+    );
+    // Several masked columns.
+    assert_eq!(
+        sorted("SELECT email, ssn FROM users ORDER BY ssn, email"),
+        "2, 1"
+    );
+    // DISTINCT ON keeps the mask, which Postgres matches to the same output.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT DISTINCT ON (ssn) ssn, id FROM users ORDER BY ssn, id",
+    );
+    assert!(sql.starts_with("SELECT DISTINCT ON (('XXX-XX-'"), "{sql}");
+    assert!(sql.ends_with(" ORDER BY 1, id"), "{sql}");
+    // In a subquery too.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT s.ssn FROM (SELECT ssn FROM users ORDER BY ssn LIMIT 3) s",
+    );
+    assert!(sql.contains(" ORDER BY 1 LIMIT 3)"), "{sql}");
+    // Users with another mask.
+    let sql = rewritten("support", "SELECT ssn FROM users ORDER BY ssn");
+    assert!(sql.ends_with(" ORDER BY 1"), "{sql}");
+    assert_eq!(sorted("SELECT id, salary FROM users ORDER BY salary"), "2");
+}
+
+/// Where no output provably computes the same mask, ORDER BY keeps the mask
+/// expression: a name could resolve to the input column, and sort by real
+/// values.
+#[test]
+fn test_order_by_masked_column_keeps_expression() {
+    let sorts_by_mask = |sql: &str| {
+        let rewritten = rewritten("anonymous", sql);
+        assert!(
+            rewritten.contains(" ORDER BY ('XXX-XX-'"),
+            "{sql}\n{rewritten}"
+        );
+    };
+    // Not in the select list.
+    sorts_by_mask("SELECT id FROM users ORDER BY ssn");
+    // An output named after it computes something else.
+    sorts_by_mask("SELECT email AS ssn FROM users ORDER BY ssn");
+    // A column merged by USING isn't the same as either side's.
+    sorts_by_mask("SELECT u.ssn FROM users u JOIN users v USING (ssn) ORDER BY ssn");
+    // Computed from it, or sorted with a collation.
+    sorts_by_mask("SELECT upper(ssn) FROM users ORDER BY ssn");
+    let sql = rewritten(
+        "anonymous",
+        r#"SELECT ssn FROM users ORDER BY ssn COLLATE "C""#,
+    );
+    assert!(sql.contains(" ORDER BY ('XXX-XX-'"), "{sql}");
+    // After a `*` that isn't expanded, positions are unknown.
+    sorts_by_mask("SELECT o.*, u.ssn FROM users u, orders o ORDER BY u.ssn");
+
+    // Window and aggregate ORDER BY take no positions.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT ssn, row_number() OVER (ORDER BY ssn) FROM users",
+    );
+    assert!(sql.contains("OVER (ORDER BY ('XXX-XX-'"), "{sql}");
+    let sql = rewritten(
+        "anonymous",
+        "SELECT ssn, string_agg(ssn, ',' ORDER BY ssn) FROM users GROUP BY ssn",
+    );
+    assert!(sql.contains("',' ORDER BY ('XXX-XX-'"), "{sql}");
+
+    // A set operation's ORDER BY names its outputs already.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT ssn FROM users UNION ALL SELECT ssn FROM users ORDER BY ssn",
+    );
+    assert!(sql.ends_with(" ORDER BY ssn"), "{sql}");
+    // An outer query's column, with an output of the same name.
+    let sql = rewritten(
+        "anonymous",
+        "SELECT (SELECT u.ssn FROM users v ORDER BY ssn LIMIT 1) FROM users u",
+    );
+    assert!(sql.contains(" ORDER BY ('XXX-XX-'"), "{sql}");
+}
+
 #[test]
 fn test_dml() {
     let sql = rewritten(
@@ -1733,6 +1852,9 @@ const SHAPE_CORPUS: &[&str] = &[
     "SELECT date_trunc('day', now()), ssn::text, '2020-01-01'::date FROM users",
     "SELECT interval '1 day', ssn FROM users LIMIT 10 OFFSET 5",
     "SELECT ssn FROM users ORDER BY 1 DESC LIMIT 1",
+    "SELECT ssn FROM users ORDER BY ssn DESC LIMIT 10",
+    "SELECT *, 'x' FROM users u ORDER BY u.ssn, 2 LIMIT 5",
+    "SELECT DISTINCT ON (ssn) ssn, 'k' FROM users ORDER BY ssn, id OFFSET 1",
     "SELECT ssn, count(*) FROM users GROUP BY 1 HAVING count(*) > 2",
     "SELECT CASE WHEN salary > 1000 THEN 'high' ELSE ssn END FROM users",
     "SELECT * FROM users WHERE id = 1",

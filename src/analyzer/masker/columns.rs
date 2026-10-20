@@ -12,7 +12,8 @@ use pg_raw_parse::{
 };
 
 use super::{
-    DerivedPolicy, MaskTarget, Masker, OutputRef, TargetKind, Verdict, address, fields, ident,
+    DerivedPolicy, MaskRead, MaskTarget, Masker, OutputRef, TargetKind, Verdict, address, fields,
+    ident, mask_address,
 };
 use crate::analyzer::Context;
 use crate::analyzer::scope::{
@@ -527,7 +528,13 @@ impl<'c, 'mem> Masker<'c, 'mem> {
                 if self.raw_refs.contains(&address) {
                     self.raw.insert(target.label);
                 } else {
-                    replacement = Some(self.masked_expr(column, &target)?);
+                    let mask = self.masked_expr(column, &target)?;
+                    if let Some(address) = mask_address(mask.as_ref())
+                        && let Some(read) = self.mask_read(&resolution, &target)
+                    {
+                        self.mask_reads.insert(address, read);
+                    }
+                    replacement = Some(mask);
                     self.masked_sql = true;
                     self.masked.insert(target.label);
                 }
@@ -561,6 +568,32 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         let (row, taint, forced) = self.reference_taint(&names, &resolution, attribute, true);
         self.note_from(taint, passthrough && !forced, source);
         replacement.or(row)
+    }
+
+    /// What the mask replacing a reference reads, if the reference reads one
+    /// column of one FROM item, the item `refname.column` reads too. Masks of
+    /// references written differently, as `ssn` and `u.ssn`, then compute the
+    /// same value. Not for columns merged by USING.
+    fn mask_read(&self, resolution: &Resolution<'c>, target: &MaskTarget<'c>) -> Option<MaskRead> {
+        let [resolved] = resolution.columns.as_slice() else {
+            return None;
+        };
+        if !resolution.certain || resolution.derived.is_some() {
+            return None;
+        }
+        let names = [resolved.refname.as_str(), resolved.column];
+        let qualified = resolve(&self.frames, &names, self.current_cte());
+        let [same] = qualified.columns.as_slice() else {
+            return None;
+        };
+        let same = std::ptr::eq(same.relation, resolved.relation)
+            && same.column == resolved.column
+            && same.refname == resolved.refname;
+        same.then(|| MaskRead {
+            policy: target.policy,
+            refname: resolved.refname.clone(),
+            column: resolved.column.to_owned(),
+        })
     }
 
     /// The taint of a resolved reference: proxy-masked columns pass their
