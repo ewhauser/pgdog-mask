@@ -23,7 +23,7 @@ use pgdog_mask::config::Config;
 use pgdog_mask::profile::{Assignments, Policies, ProxyInstance};
 use pgdog_mask::proxy::Datum;
 use pgdog_mask::schema::load_catalog;
-use tokio_postgres::error::{DbError, ErrorPosition};
+use tokio_postgres::error::{DbError, ErrorPosition, SqlState};
 use tokio_postgres::{AsyncMessage, Client, NoTls, Notification, SimpleQueryMessage};
 
 const SCHEMA: &str = "masking_canary";
@@ -116,12 +116,12 @@ async fn connect() -> Connection {
     }
 }
 
-async fn setup(client: &Client) {
+async fn setup(client: &Client, schema: &str) {
     client
         .batch_execute(&format!(
-            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE;
-             CREATE SCHEMA {SCHEMA};
-             SET search_path TO {SCHEMA};
+            "DROP SCHEMA IF EXISTS {schema} CASCADE;
+             CREATE SCHEMA {schema};
+             SET search_path TO {schema};
              CREATE TABLE users (
                 id BIGINT PRIMARY KEY,
                 name TEXT NOT NULL CHECK (name <> 'forbidden'),
@@ -157,10 +157,10 @@ async fn setup(client: &Client) {
              CREATE MATERIALIZED VIEW ssn_mv AS SELECT id, ssn, salary FROM users;
              -- Notifications on this schema's channel reach this connection.
              -- Channels are per database: the proxy canaries use others.
-             LISTEN {SCHEMA};
+             LISTEN {schema};
              -- Reading any of its columns notifies listeners of every ssn.
              CREATE VIEW notify_sb WITH (security_barrier) AS
-                SELECT id, pg_notify('{SCHEMA}', ssn)::text AS n FROM users;
+                SELECT id, pg_notify('{schema}', ssn)::text AS n FROM users;
              -- Reading it fails with an ssn in the message: the definition
              -- casts real values, also when read through a view or a
              -- function. Inlined, it casts the mask.
@@ -176,7 +176,7 @@ async fn setup(client: &Client) {
              CREATE FUNCTION get_ssn(uid BIGINT) RETURNS TEXT LANGUAGE sql STABLE
                 AS $$ SELECT ssn FROM users WHERE id = uid $$;
              CREATE FUNCTION get_ssn_atomic(uid BIGINT) RETURNS TEXT LANGUAGE sql STABLE
-                BEGIN ATOMIC SELECT ssn FROM masking_canary.users WHERE id = uid; END;
+                BEGIN ATOMIC SELECT ssn FROM {schema}.users WHERE id = uid; END;
              CREATE FUNCTION get_ssn_positional(BIGINT) RETURNS TEXT LANGUAGE sql STABLE
                 AS $$ SELECT ssn FROM users WHERE id = $1 $$;
              CREATE FUNCTION all_ssns() RETURNS TABLE (id BIGINT, ssn TEXT) LANGUAGE sql STABLE
@@ -207,7 +207,7 @@ async fn setup(client: &Client) {
              CREATE VIEW fn_from_sb WITH (security_barrier) AS
                 SELECT id, ssn AS v FROM all_ssns();
              CREATE MATERIALIZED VIEW xml_mv AS
-                SELECT id, query_to_xml('SELECT ssn FROM {SCHEMA}.users', true, false, '') AS x
+                SELECT id, query_to_xml('SELECT ssn FROM {schema}.users', true, false, '') AS x
                 FROM users;
              CREATE MATERIALIZED VIEW loud_mv AS SELECT id, upper(ssn) AS loud FROM users;
              CREATE VIEW loud_sb WITH (security_barrier) AS SELECT id, loud FROM loud_mv;
@@ -947,7 +947,7 @@ async fn check_corpus(
 async fn test_no_canary_leaks() {
     let conn = connect().await;
     let client = &conn.client;
-    setup(client).await;
+    setup(client, SCHEMA).await;
     let catalog = load_catalog(client, Some(&[SCHEMA]), &[SCHEMA])
         .await
         .unwrap();
@@ -1048,6 +1048,185 @@ async fn test_no_canary_leaks() {
         .expect("cleanup");
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+/// Rewrites change values, never the shape of results: each statement of
+/// the corpus that a masked user may run describes the same columns, with
+/// the same names and types, as the original statement. Statements whose
+/// row counts can't depend on the values return as many rows, too.
+#[tokio::test]
+async fn test_rewrites_keep_result_shape() {
+    // Separate schema so tests can run in parallel.
+    let schema = "masking_canary_shape";
+    let conn = connect().await;
+    let client = &conn.client;
+    setup(client, schema).await;
+    let catalog = load_catalog(client, Some(&[schema]), &[schema])
+        .await
+        .unwrap();
+    let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+    let assignments = Assignments::new(&policies, "pgdog", &catalog);
+    let profile = policies.profile("anonymous", "pgdog");
+    let ctx = Context {
+        catalog: &catalog,
+        assignments: &assignments,
+        policies: &policies,
+        profile: &profile,
+        search_path: vec![schema.into()],
+    };
+
+    // Control: a mask that isn't cast back to the column's type, or loses
+    // the column's name, changes the result's shape.
+    for rewritten in [
+        "SELECT ssn::text AS ssn FROM users",
+        "SELECT ssn AS masked FROM users",
+    ] {
+        let compared = result_columns(client, "SELECT ssn FROM users", rewritten).await;
+        assert!(compared.is_err(), "{rewritten}: {compared:?}");
+    }
+
+    let mut failures = vec![];
+    let (mut described, mut counted) = (0, 0);
+    for (sql, expect) in CORPUS {
+        if *expect != Expect::Runs {
+            continue;
+        }
+        let sql = sql.replace(SCHEMA, schema);
+        for (path, outcome) in [
+            ("full", Some(analyze(&sql, &ctx))),
+            ("shape", analyze_shape(&sql, &ctx)),
+        ] {
+            let Some(Outcome::Rewritten { sql: rewritten, .. }) = outcome else {
+                continue;
+            };
+            match result_columns(client, &sql, &rewritten).await {
+                Ok(compared) => described += compared,
+                Err(why) => failures.push(format!("[{path}] {sql}\n  {why}\n  ran: {rewritten}")),
+            }
+            if count_depends_on_values(&sql) {
+                continue;
+            }
+            let original = row_counts(client, &sql).await;
+            let masked = row_counts(client, &rewritten).await;
+            counted += 1;
+            if original != masked {
+                failures.push(format!(
+                    "[{path}] {sql}\n  row counts {original:?}, masked {masked:?}\n  ran: {rewritten}"
+                ));
+            }
+        }
+    }
+    // The comparisons ran: a corpus that stopped rewriting would pass.
+    assert!(described > 100, "described {described} statements");
+    assert!(counted > 50, "counted rows of {counted} statements");
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .expect("cleanup");
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+/// Statements of `sql`, one by one.
+fn statements(sql: &str) -> Vec<String> {
+    pg_raw_parse::parse(sql)
+        .expect(sql)
+        .iter()
+        .map(|stmt| pg_raw_parse::deparse(stmt).expect(sql).as_str().to_owned())
+        .collect()
+}
+
+/// Compare the result columns of each statement of `original` and its
+/// `rewritten` form as `Describe` reports them, running the rewritten ones in
+/// order so later statements see what earlier ones did. Statements Postgres
+/// can't prepare (`FETCH`, utility statements) are skipped, and so is the
+/// rest of a transaction a failed `Parse` aborts. Returns how many statements
+/// were compared.
+async fn result_columns(client: &Client, original: &str, rewritten: &str) -> Result<usize, String> {
+    let (original, rewritten) = (statements(original), statements(rewritten));
+    if original.len() != rewritten.len() {
+        return Err(format!(
+            "{} statements rewritten as {}",
+            original.len(),
+            rewritten.len()
+        ));
+    }
+    let describe = async |sql: &str| {
+        client.prepare(sql).await.map(|statement| {
+            statement
+                .columns()
+                .iter()
+                .map(|column| (column.name().to_owned(), column.type_().clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut compared = 0;
+    let mut result = Ok(());
+    for (original, rewritten) in original.iter().zip(&rewritten) {
+        let Ok(expected) = describe(original).await else {
+            continue;
+        };
+        match describe(rewritten).await {
+            Ok(columns) if columns == expected => compared += 1,
+            Ok(columns) => {
+                result = Err(format!("columns {columns:?}, expected {expected:?}"));
+                break;
+            }
+            Err(err) => {
+                result = Err(format!("rewrite doesn't prepare: {err}"));
+                break;
+            }
+        }
+        if client.simple_query(rewritten).await.is_err() {
+            break;
+        }
+    }
+    let _ = client.batch_execute("ROLLBACK").await;
+    result.map(|()| compared)
+}
+
+/// Can masked values change how many rows a statement returns or changes, or
+/// whether it fails? They can through any condition, grouping or
+/// deduplication, so this only lets through statements without them.
+fn count_depends_on_values(sql: &str) -> bool {
+    let sql = sql.to_ascii_uppercase();
+    [
+        "WHERE",
+        " ON ",
+        "USING",
+        "GROUP BY",
+        "HAVING",
+        "DISTINCT",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "FILTER",
+        "WHEN",
+        "EXPLAIN",
+        "COPY",
+        "FETCH",
+        "EXECUTE",
+    ]
+    .iter()
+    .any(|clause| sql.contains(clause))
+}
+
+/// Rows each statement returns or changes, as `CommandComplete` reports them,
+/// or the SQLSTATE it fails with.
+async fn row_counts(client: &Client, sql: &str) -> Result<Vec<u64>, String> {
+    let result = client.simple_query(sql).await;
+    let _ = client.batch_execute("ROLLBACK").await;
+    match result {
+        Ok(messages) => Ok(messages
+            .iter()
+            .filter_map(|message| match message {
+                SimpleQueryMessage::CommandComplete(rows) => Some(*rows),
+                _ => None,
+            })
+            .collect()),
+        Err(err) => Err(err.code().map_or("?", SqlState::code).to_owned()),
+    }
 }
 
 /// `search = "raw"` lets support find rows by SSN, still masked in results.

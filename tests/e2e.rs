@@ -598,6 +598,96 @@ async fn test_proxy_plan_identity() {
     }
 }
 
+/// Postgres itself, without PgDog, as `integration/run.sh` reaches it.
+async fn connect_postgres() -> Client {
+    let var = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+    let (client, connection) = tokio_postgres::connect(
+        &format!(
+            "host={} port={} user={} password={} dbname={}",
+            var("PGHOST", "127.0.0.1"),
+            var("PGPORT", "5432"),
+            var("PGUSER", "pgdog"),
+            var("PGPASSWORD", "pgdog"),
+            var("PGDATABASE", "pgdog"),
+        ),
+        NoTls,
+    )
+    .await
+    .expect("connect to Postgres");
+    tokio::spawn(connection);
+    client
+}
+
+/// Names and types of a statement's result columns, as `Describe` reports
+/// them.
+async fn describe(client: &Client, sql: &str) -> Vec<(String, Type)> {
+    client
+        .prepare(sql)
+        .await
+        .expect(sql)
+        .columns()
+        .iter()
+        .map(|column| (column.name().to_owned(), column.type_().clone()))
+        .collect()
+}
+
+/// Statements over SQL-masked, proxy-masked and tagged columns, views and
+/// functions, without conditions on masked columns.
+const EQUIVALENCE: &[&str] = &[
+    "SELECT * FROM masking_e2e.users ORDER BY id",
+    "SELECT id, ssn, email, phone, secret_note, tax_id, card, balance FROM masking_e2e.users ORDER BY id",
+    "SELECT u.ssn, upper(u.email) AS e, length(u.card), u.balance + 1 FROM masking_e2e.users u ORDER BY u.id",
+    "SELECT max(ssn), min(email), sum(balance), count(card) FROM masking_e2e.users",
+    "SELECT s.ssn FROM (SELECT id, ssn FROM masking_e2e.users) s ORDER BY s.id",
+    "WITH x AS (SELECT * FROM masking_e2e.users) SELECT ssn, card FROM x ORDER BY id",
+    "SELECT * FROM masking_e2e.user_ssns ORDER BY id",
+    "SELECT masking_e2e.get_ssn(id) FROM masking_e2e.users ORDER BY id",
+    "SELECT ssn FROM masking_e2e.users UNION ALL SELECT email FROM masking_e2e.users",
+];
+
+/// The exempt user gets what Postgres returns. Masked users get the same
+/// columns, with the same names and types, and as many rows: masks change
+/// values, never the shape of results.
+#[tokio::test]
+async fn test_results_match_postgres() {
+    if !enabled() {
+        return;
+    }
+    let postgres = connect_postgres().await;
+    let admin = connect("admin").await;
+    for sql in EQUIVALENCE {
+        assert_eq!(
+            simple(&admin, sql).await,
+            simple(&postgres, sql).await,
+            "{sql}"
+        );
+        assert_eq!(
+            describe(&admin, sql).await,
+            describe(&postgres, sql).await,
+            "{sql}"
+        );
+    }
+
+    for user in ["masked", "support", "analyst"] {
+        let client = connect(user).await;
+        for sql in EQUIVALENCE {
+            let expected = describe(&postgres, sql).await;
+            assert_eq!(describe(&client, sql).await, expected, "{user}: {sql}");
+            let statement = client.prepare(sql).await.unwrap();
+            assert_eq!(
+                client.query(&statement, &[]).await.expect(sql).len(),
+                postgres.query(*sql, &[]).await.unwrap().len(),
+                "{user}: {sql}"
+            );
+            assert_eq!(
+                simple(&client, sql).await.len(),
+                simple(&postgres, sql).await.len(),
+                "{user}: {sql}"
+            );
+        }
+    }
+}
+
 /// Statements that would move proxy-masked values where PgDog can't mask
 /// them are blocked.
 #[tokio::test]

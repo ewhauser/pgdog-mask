@@ -1,0 +1,27 @@
+# Two shards of the pgdog database, on one Postgres. masking_e2e.users is
+# sharded by id, which isn't masked: masking runs before routing, so a
+# masked sharding key couldn't be routed (docs/DESIGN.md §10).
+[general]
+
+[[plugins]]
+name = "pgdog_mask"
+config = "integration/masking.toml"
+required = true
+
+[[databases]]
+name = "pgdog"
+host = "127.0.0.1"
+database_name = "pgdog_mask_shard_0"
+shard = 0
+
+[[databases]]
+name = "pgdog"
+host = "127.0.0.1"
+database_name = "pgdog_mask_shard_1"
+shard = 1
+
+[[sharded_tables]]
+database = "pgdog"
+name = "users"
+column = "id"
+data_type = "bigint"
