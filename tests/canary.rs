@@ -535,6 +535,31 @@ const CORPUS: &[(&str, Expect)] = &[
         Expect::Runs,
     ),
     ("SELECT ssn FROM users ORDER BY ssn LIMIT 1", Expect::Runs),
+    // ORDER BY a masked output sorts by its position.
+    (
+        "SELECT id, ssn FROM users u ORDER BY u.ssn DESC, id",
+        Expect::Runs,
+    ),
+    (
+        "SELECT * FROM users ORDER BY ssn, email LIMIT 2",
+        Expect::Runs,
+    ),
+    (
+        "SELECT DISTINCT ON (ssn) ssn, id FROM users ORDER BY ssn, id",
+        Expect::Runs,
+    ),
+    (
+        "SELECT name AS ssn, ssn AS real FROM users ORDER BY ssn",
+        Expect::Runs,
+    ),
+    (
+        "SELECT (SELECT u.ssn FROM users v ORDER BY ssn LIMIT 1) FROM users u",
+        Expect::Runs,
+    ),
+    (
+        "SELECT u.ssn FROM users u JOIN users v USING (ssn) ORDER BY ssn",
+        Expect::Runs,
+    ),
     ("SELECT ssn, count(*) FROM users GROUP BY ssn", Expect::Runs),
     ("SELECT (SELECT ssn FROM users LIMIT 1)", Expect::Runs),
     (
@@ -1297,6 +1322,101 @@ policy = "ssn"
         .unwrap();
 }
 
+/// ORDER BY a SQL-masked column in the select list sorts by the output's
+/// position, which PgDog can merge across shards. Rows come back in the
+/// masks' order, not the real values'.
+#[tokio::test]
+async fn test_order_by_masked_output_position() {
+    let conn = connect().await;
+    let client = &conn.client;
+    // Separate schema so tests can run in parallel.
+    let schema = "masking_canary_order";
+    // Real values sort by id; masks, which keep the last 4 characters, don't.
+    client
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE;
+             CREATE SCHEMA {schema};
+             SET search_path TO {schema};
+             CREATE TABLE users (
+                id BIGINT PRIMARY KEY, name TEXT, ssn VARCHAR(32), email TEXT, salary NUMERIC
+             );
+             INSERT INTO users VALUES
+                (1, 'a', 'A-4000', NULL, 1),
+                (2, 'b', 'B-1000', NULL, 2),
+                (3, 'c', 'C-3000', NULL, 3),
+                (4, 'd', 'D-2000', NULL, 4);"
+        ))
+        .await
+        .unwrap();
+    let catalog = load_catalog(client, Some(&[schema]), &[schema])
+        .await
+        .unwrap();
+    let policies = Policies::new(Config::from_toml(CONFIG).unwrap()).unwrap();
+    let assignments = Assignments::new(&policies, "pgdog", &catalog);
+    let profile = policies.profile("anonymous", "pgdog");
+    let ctx = Context {
+        catalog: &catalog,
+        assignments: &assignments,
+        policies: &policies,
+        profile: &profile,
+        search_path: vec![schema.into()],
+    };
+
+    let mut failures = vec![];
+    for (sql, ids) in [
+        ("SELECT id, ssn FROM users ORDER BY ssn", "2 4 3 1"),
+        ("SELECT ssn, id FROM users u ORDER BY u.ssn DESC", "1 3 4 2"),
+        ("SELECT * FROM users ORDER BY ssn LIMIT 3", "2 4 3"),
+        (
+            "SELECT DISTINCT ON (ssn) ssn, id FROM users ORDER BY ssn, id",
+            "2 4 3 1",
+        ),
+        (
+            "SELECT id, ssn, count(*) FROM users GROUP BY id, ssn ORDER BY ssn",
+            "2 4 3 1",
+        ),
+        (
+            "SELECT s.id FROM (SELECT id, ssn FROM users ORDER BY ssn LIMIT 2) s ORDER BY s.id",
+            "2 4",
+        ),
+    ] {
+        for (path, outcome) in [
+            ("full", Some(analyze(sql, &ctx))),
+            ("shape", analyze_shape(sql, &ctx)),
+        ] {
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let Outcome::Rewritten { sql: rewritten, .. } = outcome else {
+                failures.push(format!("[{path}] {sql}: {outcome:?}"));
+                continue;
+            };
+            let order = rewritten.rsplit(" ORDER BY ").next().unwrap_or("");
+            if order.contains("XXX") {
+                failures.push(format!("[{path}] {sql}\n  sorts by the mask: {rewritten}"));
+            }
+            let messages = client.simple_query(&rewritten).await.unwrap();
+            let got: Vec<&str> = messages
+                .iter()
+                .filter_map(|message| match message {
+                    SimpleQueryMessage::Row(row) => row.get("id"),
+                    _ => None,
+                })
+                .collect();
+            if got.join(" ") != ids {
+                failures.push(format!(
+                    "[{path}] {sql}\n  ids {got:?}, expected {ids}\n  ran: {rewritten}"
+                ));
+            }
+        }
+    }
+
+    client
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
 /// Schema of the proxy mask canaries.
 const PROXY_SCHEMA: &str = "masking_canary_proxy";
 
@@ -2078,6 +2198,16 @@ const PROXY_CORPUS: &[(&str, &str, Expect)] = &[
     (
         "F12",
         "SELECT upper(name) AS n, count(*) FROM users GROUP BY n",
+        Expect::Runs,
+    ),
+    (
+        "F13",
+        "SELECT * FROM users u ORDER BY u.ssn, email LIMIT 2",
+        Expect::Runs,
+    ),
+    (
+        "F14",
+        "SELECT DISTINCT ON (ssn) ssn, id FROM users ORDER BY ssn, id DESC",
         Expect::Runs,
     ),
     // Conditions.

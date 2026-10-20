@@ -14,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use pg_raw_parse::{
-    Node, NodeMut,
+    ConstValue, Node, NodeMut,
     make::{MemoryToken, Unique},
     nodes,
     raw::{JsonTableColumnType, ObjectType, ReturningOptionKind, SetOperation, SubLinkType},
@@ -77,6 +77,15 @@ impl MaskTarget<'_> {
             TargetKind::Sql { .. } => None,
         }
     }
+}
+
+/// What a mask replacing a column reference reads: masks reading the same
+/// column of the same FROM item with the same policy compute the same value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MaskRead {
+    policy: usize,
+    refname: String,
+    column: String,
 }
 
 /// How a table-like view's column computed from masked columns is masked.
@@ -243,6 +252,8 @@ pub(super) struct Masker<'c, 'mem> {
     passthrough: HashSet<usize>,
     /// ORDER BY, DISTINCT ON and GROUP BY names of output columns.
     output_refs: HashMap<usize, OutputRef>,
+    /// What masks replacing column references read, by `mask_address`.
+    mask_reads: HashMap<usize, MaskRead>,
     /// Outputs of the query level that finished last; its caller takes them.
     outputs: Option<Outputs>,
     /// `outputs` are a nested level's, and its caller hasn't taken them yet.
@@ -308,6 +319,35 @@ fn fields(column: &nodes::ColumnRef) -> (Vec<&str>, bool) {
     (fields, star)
 }
 
+/// Does a target stand for any number of outputs: `*`, `q.*` or `(x).*`?
+fn expands(val: Node<'_>) -> bool {
+    match val {
+        Node::ColumnRef(column) => fields(column).1,
+        Node::A_Indirection(indirection) => matches!(
+            indirection.indirection().iter().next_back(),
+            Some(Node::A_Star(_))
+        ),
+        _ => false,
+    }
+}
+
+/// The address of a mask's root, the cast to the policy's type.
+fn mask_address(expr: Node<'_>) -> Option<usize> {
+    match expr {
+        Node::TypeCast(cast) => Some(std::ptr::from_ref(cast) as usize),
+        _ => None,
+    }
+}
+
+/// An expression as the deparser writes it, to compare expressions.
+fn expr_sql<'mem>(mem: MemoryToken<'mem>, expr: Node<'_>) -> Option<String> {
+    let target = mem.make_res_target(None, mem.empty(), mem.make_unique(expr));
+    let mut select = mem.make_node::<nodes::SelectStmt>();
+    select.as_mut().set_target_list(mem.make_list(&[target]));
+    let sql = pg_raw_parse::deparse(select.as_ref()).ok()?;
+    Some(sql.as_str().to_owned())
+}
+
 fn address(column: &nodes::ColumnRef) -> usize {
     std::ptr::from_ref(column) as usize
 }
@@ -342,6 +382,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             taint: Taint::Clean,
             passthrough: HashSet::new(),
             output_refs: HashMap::new(),
+            mask_reads: HashMap::new(),
             outputs: None,
             unclaimed: false,
             state: StatementState::default(),
@@ -534,6 +575,7 @@ impl<'c, 'mem> Masker<'c, 'mem> {
         self.outputs = None;
         self.passthrough.clear();
         self.output_refs.clear();
+        self.mask_reads.clear();
         if let Err(reason) = rules::check_statement(node) {
             self.block(reason);
             return;
@@ -676,6 +718,63 @@ impl<'c, 'mem> Masker<'c, 'mem> {
             Node::A_Expr(expr) if self.is_user_operator(expr) => Some("?column?".into()),
             val => exact_name(val),
         }
+    }
+
+    /// Sort by an output's position where masking replaced a column named in
+    /// ORDER BY and an output computes the same mask. PgDog merge-sorts rows
+    /// from several shards only when ORDER BY names an output column or its
+    /// position, not an expression such as a mask.
+    ///
+    /// Postgres matches an ORDER BY expression to the first output with an
+    /// equal expression, so this sorts on the same values, and DISTINCT ON
+    /// still matches the same output. Outputs are equal if they're written
+    /// the same, or are masks reading the same column. A position, unlike a
+    /// name, can't fall back to an input column. Positions are only known
+    /// before any `*` left unexpanded. `columns` says which ORDER BY items
+    /// were column references before masking.
+    fn sort_by_outputs(&self, node: &mut nodes::SelectStmtMut<'mem, '_>, columns: &[bool]) {
+        let keys: Vec<Option<(Option<&MaskRead>, Option<String>)>> = node
+            .sort_clause()
+            .iter()
+            .zip(columns)
+            .map(|(sort, column)| {
+                let replaced = *column && !matches!(sort.node(), Node::ColumnRef(_));
+                replaced.then(|| self.output_key(sort.node()))
+            })
+            .collect();
+        if keys.iter().all(Option::is_none) {
+            return;
+        }
+        let mut outputs = vec![];
+        for target in node.target_list().iter() {
+            if expands(target.val()) {
+                break;
+            }
+            outputs.push(self.output_key(target.val()));
+        }
+        for (mut sort, key) in node.sort_clause_mut().into_iter().zip(keys) {
+            let Some((read, sql)) = key else {
+                continue;
+            };
+            let position = outputs
+                .iter()
+                .position(|(output_read, output_sql)| {
+                    (read.is_some() && *output_read == read)
+                        || (sql.is_some() && *output_sql == sql)
+                })
+                .and_then(|i| i32::try_from(i + 1).ok());
+            if let Some(position) = position {
+                let position = self.mem.make_a_const(ConstValue::Integer(position));
+                sort.set_node(position.uncast());
+            }
+        }
+    }
+
+    /// What a mask replacing a column reference reads, and the SQL of an
+    /// expression, to compare ORDER BY items with outputs.
+    fn output_key(&self, expr: Node<'_>) -> (Option<&MaskRead>, Option<String>) {
+        let read = mask_address(expr).and_then(|address| self.mask_reads.get(&address));
+        (read, expr_sql(self.mem, expr))
     }
 
     /// What to do with a generic node, decided while it's borrowed.
@@ -1596,7 +1695,15 @@ impl<'c, 'mem> Transform<'mem> for Masker<'c, 'mem> {
                 having_clause_mut,
                 set_having_clause
             );
+            let columns: Vec<bool> = node
+                .sort_clause()
+                .iter()
+                .map(|sort| matches!(sort.node(), Node::ColumnRef(_)))
+                .collect();
             masker.transform_sort_by_list(node.sort_clause_mut());
+            if node.values_lists().is_empty() {
+                masker.sort_by_outputs(&mut node, &columns);
+            }
             clause!(
                 masker,
                 node,
