@@ -78,6 +78,7 @@ Not redacted:
 Not supported:
 
 - A proxy mask on a column whose type is a domain over another domain. PgDog's catalog gives the inner domain's type, while results carry the base type, so PgDog refuses the mask and closes the connection with a `FATAL` error. Nothing leaks. Use a domain over a base type, or mask the column with a SQL mask.
+- `ORDER BY` a SQL-masked column, for masked users, when the statement reads several shards. The plugin rewrites the column to its mask, and PgDog only merge-sorts rows from several shards when `ORDER BY` names an output column or its position. Rows come back one shard after another, each shard's sorted. Nothing leaks. Sort by the column's position instead, as in `ORDER BY 1`.
 
 ## Not covered
 
