@@ -7,7 +7,7 @@ description: The PgDog, Rust and Postgres versions pgdog-mask works with.
 
 pgdog-mask needs PgDog's plugin API **0.8**: statement verdicts, column masks (including `NULL` masks), error redaction (for every error, and per statement) and the typed catalog. It's only on the [`masking/plugin-api`](https://github.com/ewhauser/pgdog/tree/masking/plugin-api) branch of the `ewhauser/pgdog` fork. It has been proposed upstream in [pgdogdev/pgdog#1835](https://github.com/pgdogdev/pgdog/issues/1835), but there's no guarantee it will be accepted, or accepted in this form: the API, and pgdog-mask with it, may have to change.
 
-`Cargo.toml` pins the exact commit, currently `ebfa85d6`. Build PgDog from that commit. PgDog checks the plugin API version (major and minor) when it loads a plugin, and skips plugins built for another one.
+`Cargo.toml` pins the exact commit: the `rev` of `pgdog-plugin`. Build PgDog from that commit. PgDog checks the plugin API version (major and minor) when it loads a plugin, and skips plugins built for another one.
 
 Besides the API, pgdog-mask relies on PgDog behavior at that commit:
 
