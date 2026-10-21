@@ -194,7 +194,7 @@ Users with proxy masks also can't move proxy-masked values where PgDog can't mas
 
 ## Tests
 
-Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database. Override these with the usual `PG*` variables.
+Tests need Postgres on `127.0.0.1:5432` with a `pgdog` superuser (password `pgdog`) and a `pgdog` database. `cargo test` connects with `PGDOG_MASK_TEST_URL`, a libpq connection string (default `host=127.0.0.1 user=pgdog password=pgdog dbname=pgdog`); it doesn't read the `PG*` variables. The `integration/` scripts use the usual `PG*` variables, with the same defaults.
 
 ```bash
 cargo test                       # unit tests, canary leak tests, pgdog-mask validate
@@ -227,9 +227,12 @@ End to end, `integration/bench/bench.sh` runs pgbench against Postgres directly,
 
 ## Upgrading PgDog
 
-1. Point both `pgdog-plugin` and `pgdog-stats` in `Cargo.toml` at the new commit.
-2. Copy PgDog's schema loader queries (`pgdog/src/backend/schema/{relations,columns_catalog,views,functions,operators}.sql`) into `tests/support/sql`.
-3. Run the tests and `integration/run.sh`.
+1. Point both `pgdog-plugin` and `pgdog-stats` in `Cargo.toml` at the new commit, and run `cargo update -p pgdog-plugin -p pgdog-stats` here, in `example/custom-mask` and in `fuzz`, which have lockfiles of their own.
+2. If PgDog moved to another `pg_raw_parse` revision, pin it in both `Cargo.toml` and `fuzz/Cargo.toml`. Check that `rust-toolchain.toml` matches PgDog's toolchain.
+3. Copy PgDog's schema loader queries (`pgdog/src/backend/schema/{relations,columns_catalog,views,functions,operators}.sql`) into `src/schema/`.
+4. Run the tests, `integration/run.sh` and `integration/sharded/run.sh`.
+
+See [Maintain the PgDog dependency](https://ewhauser.github.io/pgdog-mask/develop/pgdog-dependency/).
 
 ## Error details
 

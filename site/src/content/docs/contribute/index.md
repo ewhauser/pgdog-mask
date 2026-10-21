@@ -15,6 +15,8 @@ description: Build pgdog-mask, run its test suites, and work on this documentati
 | `src/schema.rs` | Loads a catalog from Postgres with PgDog's own queries, for the command and the tests. |
 | `tests` | Canary leak tests, `pgdog-mask validate` tests, end-to-end tests, the protocol matrix and sharded tests. |
 | `integration` | Scripts that build PgDog and run the plugin in it. |
+| `fuzz` | cargo-fuzz targets for every plugin hook, run nightly in CI; see `fuzz/README.md`. |
+| `benches` | `cargo bench` measurements of the plugin's per-statement overhead. |
 | `example/custom-mask` | A plugin with a custom proxy mask. |
 | `docs/DESIGN.md` | The [design notes](design/). |
 | `site` | This documentation. |
@@ -44,7 +46,7 @@ The integration scripts build PgDog from the commit `Cargo.toml` pins, in `.pgdo
 - **`compat.sh`** needs PgDog's integration databases (`integration/setup.sh` in PgDog's repository). Its results should match `integration/go/run.sh` there, which runs without the plugin.
 - **`bench.sh`** is the [performance test](../../operate/performance/#run-the-benchmark): it loads its own data and writes a report to `integration/bench/results/`.
 
-CI runs formatting, clippy, the tests, the custom-mask example, and the end-to-end and sharded suites on every push.
+CI runs formatting, clippy, the tests, the custom-mask example, and the end-to-end and sharded suites on pull requests and on pushes to `main`. Every fuzz target also runs nightly, through `.github/workflows/fuzz.yml`; see `fuzz/README.md`.
 
 ## Documentation
 
